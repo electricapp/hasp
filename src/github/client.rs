@@ -606,11 +606,19 @@ impl Client {
             // "phantom SHA" so the caller can report it cleanly instead of
             // hard-bailing on 422.
             Err(ureq::Error::Status(404 | 422, _)) => return Ok(None),
-            Err(ureq::Error::Status(401 | 403, _)) => {
-                bail!("GitHub API authentication failed — check your GITHUB_TOKEN")
+            Err(ureq::Error::Status(code @ (401 | 403), resp)) => {
+                let remaining = resp.header("x-ratelimit-remaining").map(str::to_string);
+                let body = resp.into_string().unwrap_or_default();
+                if remaining.as_deref() == Some("0") || body.contains("rate limit") {
+                    bail!(
+                        "GitHub API rate limit exceeded ({code}) — try again later: {body}"
+                    )
+                }
+                bail!("GitHub API authentication failed ({code}) — check your GITHUB_TOKEN: {body}")
             }
-            Err(ureq::Error::Status(429, _)) => {
-                bail!("GitHub API rate limit exceeded — try again later")
+            Err(ureq::Error::Status(429, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                bail!("GitHub API rate limit exceeded (429) — try again later: {body}")
             }
             Err(e) => bail!("GitHub API error for {owner}/{repo}@{sha}: {e}"),
         };
