@@ -1,8 +1,8 @@
 # hasp
 
-> **Pre-release**: No tagged release yet. The tool is functional and tested
-> but has not been through a public release cycle. Pin to a specific commit
-> if you use it before v0.1.0. 
+> **Alpha — do not use in production.** APIs, CLI flags, policy schema,
+> and binary format may change without notice. Pin to a specific commit
+> SHA if you experiment with it. 
 
 A paranoid security scanner and sandboxed step runner for GitHub Actions.
 
