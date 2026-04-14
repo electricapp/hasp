@@ -160,6 +160,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
             --title "hasp ${{ github.ref_name }}" \
             --generate-notes \
             hasp-* *.sha256 *.sig *.pem *.spdx.json
