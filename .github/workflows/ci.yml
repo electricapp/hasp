@@ -67,16 +67,15 @@ jobs:
         env:
           PROPTEST_CASES: "2000"
 
-      # Tests marked `#[ignore]` hit the live GitHub API. Every workflow run
-      # is auto-provisioned a read-only GITHUB_TOKEN — exactly what hasp
-      # needs — so no secret setup is required. ubuntu-latest runners have
-      # kernel 6.x with Landlock/seccomp/BPF available, so integrity_check
-      # is also run here.
-      - name: Token-gated tests (GitHub API + sandbox)
-        run: cargo test -- --ignored
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PROPTEST_CASES: "2000"
+      # Token-gated tests temporarily disabled: GITHUB_TOKEN rate-limit
+      # contention across CI/security/release workflows was causing
+      # spurious failures. Re-enable once we move expensive verification
+      # to a scheduled workflow or use a higher-quota token.
+      # - name: Token-gated tests (GitHub API + sandbox)
+      #   run: cargo test -- --ignored
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #     PROPTEST_CASES: "2000"
 
       # TODO(fuzz): add a libFuzzer-based fuzz job. Blocked on cargo-fuzz
       # requiring nightly for coverage/sanitizer instrumentation. Options:
