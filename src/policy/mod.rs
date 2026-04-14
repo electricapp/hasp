@@ -593,11 +593,15 @@ impl Policy {
         !self.suppressions.is_empty()
     }
 
-    /// Returns true if any suppression uses a wildcard-all pattern.
+    /// Returns true if any suppression uses a wildcard-all action pattern
+    /// without also being scoped by a `file:` filter. A wildcard `match:` is
+    /// fine when the suppression already targets a specific check + file —
+    /// many findings (permissions, github-env-writes, etc.) carry no action
+    /// context and can only be matched by `*`.
     pub(crate) fn has_broad_suppressions(&self) -> bool {
-        self.suppressions
-            .iter()
-            .any(|s| s.pattern == "*" || s.pattern == "*/*")
+        self.suppressions.iter().any(|s| {
+            (s.pattern == "*" || s.pattern == "*/*") && s.file.is_none()
+        })
     }
 
     /// Parse a policy from text content (for drift comparison against base branch).
