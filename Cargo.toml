@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Verifies GitHub Actions workflow files for unpinned or phantom action references"
 license = "MIT"
-repository = "https://github.com/OWNER/hasp"
+repository = "https://github.com/electricapp/hasp"
 keywords = ["github-actions", "security", "supply-chain", "ci"]
 categories = ["command-line-utilities", "development-tools"]
 

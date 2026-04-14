@@ -13,7 +13,7 @@ Only the latest release receives security updates.
 **Do not open a public issue for security vulnerabilities.**
 
 Please report vulnerabilities through
-[GitHub Security Advisories](https://github.com/OWNER/hasp/security/advisories/new).
+[GitHub Security Advisories](https://github.com/electricapp/hasp/security/advisories/new).
 
 ### What to include
 

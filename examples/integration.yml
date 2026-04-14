@@ -24,7 +24,7 @@ jobs:
           # ── Configuration ────────────────────────────────────────────────
           VERSION="v0.1.0"
           EXPECTED_HASH="REPLACE_WITH_ACTUAL_SHA256_AFTER_FIRST_RELEASE"
-          REPO="OWNER/hasp"
+          REPO="electricapp/hasp"
           # ────────────────────────────────────────────────────────────────
 
           BINARY_URL="https://github.com/${REPO}/releases/download/${VERSION}/hasp-linux-amd64"
@@ -43,7 +43,7 @@ jobs:
       # - name: Verify Sigstore signature
       #   run: |
       #     VERSION="v0.1.0"
-      #     REPO="OWNER/hasp"
+      #     REPO="electricapp/hasp"
       #     ARTIFACT="hasp-linux-amd64"
       #     cosign verify-blob \
       #       --signature "https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}.sig" \
@@ -59,7 +59,7 @@ jobs:
       #   env:
       #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       #   run: |
-      #     REPO="OWNER/hasp"
+      #     REPO="electricapp/hasp"
       #     gh attestation verify hasp --repo "${REPO}"
 
       - name: Scan workflows for supply chain issues

@@ -13,7 +13,7 @@
 ARG RUST_VERSION=1.94.0
 ARG TARGET=x86_64-unknown-linux-musl
 ARG SOURCE_DATE_EPOCH=0
-ARG GITHUB_REPO=OWNER/hasp
+ARG GITHUB_REPO=electricapp/hasp
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 

@@ -15,7 +15,7 @@ FROM rust:${RUST_VERSION}-bookworm
 WORKDIR /src
 COPY . .
 
-ENV GITHUB_REPO=OWNER/hasp
+ENV GITHUB_REPO=electricapp/hasp
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target,sharing=locked \
