@@ -64,12 +64,17 @@ pub(crate) enum SandboxMode {
 }
 
 impl SandboxMode {
-    /// Exec-related modes try `sudo` to load BPF when unprivileged BPF
-    /// is unavailable. Scanner modes do not — they have their own fallback
-    /// via `--allow-unsandboxed`.
+    /// All sandboxed processes try `sudo` when unprivileged BPF/cgroup
+    /// setup fails. On GitHub-hosted runners and many CI envs, sudo is
+    /// passwordless and the helper can engage the egress sandbox even
+    /// for the scanner path. Without sudo, callers may still opt to
+    /// continue via `--allow-unsandboxed`.
     #[cfg(target_os = "linux")]
     const fn use_sudo_fallback(self) -> bool {
-        matches!(self, Self::StepRunner | Self::SecretProxy)
+        matches!(
+            self,
+            Self::Proxy | Self::Verifier | Self::StepRunner | Self::SecretProxy
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -133,7 +138,10 @@ pub(crate) fn maybe_prepare(
             }
             Err(err) => {
                 // If BPF failed (EPERM) and this mode supports sudo, try elevated helper
-                if mode.use_sudo_fallback() && err.msg().contains("BPF") {
+                if mode.use_sudo_fallback()
+                    && (err.msg().contains("BPF")
+                        || err.msg().contains("Failed to create cgroup"))
+                {
                     eprintln!("hasp: note: unprivileged BPF unavailable, trying sudo helper...");
                     match prepare_linux_via_sudo(mode, allowlist) {
                         Ok(handle) => {
