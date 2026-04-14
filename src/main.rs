@@ -38,7 +38,7 @@ fn scrubbed_subprocess_vars() -> &'static [&'static str] {
 }
 
 fn main() {
-    rustls::crypto::aws_lc_rs::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .expect("rustls CryptoProvider already installed");
 
