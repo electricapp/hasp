@@ -1,0 +1,43 @@
+[package]
+name = "hasp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+yaml-rust2 = "0.9"
+
+[dependencies.hasp]
+path = ".."
+features = ["fuzz-exports"]
+
+[[bin]]
+name = "yaml_scan"
+path = "fuzz_targets/yaml_scan.rs"
+doc = false
+
+[[bin]]
+name = "ipc_scan_payload"
+path = "fuzz_targets/ipc_scan_payload.rs"
+doc = false
+
+[[bin]]
+name = "ipc_verifier_input"
+path = "fuzz_targets/ipc_verifier_input.rs"
+doc = false
+
+[[bin]]
+name = "ipc_action_refs"
+path = "fuzz_targets/ipc_action_refs.rs"
+doc = false
+
+[[bin]]
+name = "ipc_percent_decode"
+path = "fuzz_targets/ipc_percent_decode.rs"
+doc = false
+
+[workspace]

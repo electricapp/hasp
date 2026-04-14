@@ -1,0 +1,107 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component clippy
+          rustup default 1.94.0
+
+      - name: Clippy (including test code)
+        run: cargo clippy --tests -- -D warnings
+
+  test:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sandbox: true
+          - os: macos-latest
+            sandbox: false
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup default 1.94.0
+
+      - name: Build
+        run: cargo build --release
+
+      # Proptest cases: bumped from the 256 default to 2000 to give
+      # parser/encoder properties a more meaningful run per CI execution.
+      - name: Unit + integration tests
+        run: cargo test
+        env:
+          PROPTEST_CASES: "2000"
+
+      # Tests marked `#[ignore]` hit the live GitHub API. Every workflow run
+      # is auto-provisioned a read-only GITHUB_TOKEN — exactly what hasp
+      # needs — so no secret setup is required. ubuntu-latest runners have
+      # kernel 6.x with Landlock/seccomp/BPF available, so integrity_check
+      # is also run here.
+      - name: Token-gated tests (GitHub API + sandbox)
+        run: cargo test -- --ignored
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROPTEST_CASES: "2000"
+
+      # TODO(fuzz): add a libFuzzer-based fuzz job. Blocked on cargo-fuzz
+      # requiring nightly for coverage/sanitizer instrumentation. Options:
+      #   1. Scheduled workflow (cron) that runs `cargo +nightly fuzz run`
+      #      for each target in `fuzz/fuzz_targets/` for ~30 min.
+      #   2. Submit to OSS-Fuzz for continuous deep fuzzing.
+      # Until then, `PROPTEST_CASES=2000` above gives ~20k random inputs
+      # per PR across the parser/encoder properties — shallower than
+      # libFuzzer but caught on stable Rust every run.
+
+      # On Linux, verify the binary runs with the real OS sandbox (no
+      # --allow-unsandboxed). This exercises Landlock + seccomp.  The
+      # egress sandbox (cgroup/BPF) requires CAP_BPF which CI runners
+      # may lack, so the binary is expected to fail gracefully there.
+      - name: Sandboxed smoke test (Linux only)
+        if: matrix.sandbox
+        run: |
+          # --no-verify avoids needing GITHUB_TOKEN
+          # Exit 0 or 1 are both acceptable (findings vs. clean);
+          # exit 2 = usage error, >128 = signal (crash) — those fail CI.
+          set +e
+          ./target/release/hasp --no-verify --no-policy --dir tests/fixtures/workflows
+          code=$?
+          if [ "$code" -ge 2 ]; then
+            echo "::error::hasp exited $code (expected 0 or 1)"
+            exit 1
+          fi
+

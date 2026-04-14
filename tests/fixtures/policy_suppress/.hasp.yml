@@ -1,0 +1,8 @@
+version: 1
+checks:
+  expression-injection: off
+  permissions: warn
+ignore:
+  - check: typosquatting
+    match: "*"
+    reason: "testing"

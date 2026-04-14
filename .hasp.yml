@@ -1,0 +1,52 @@
+version: 1
+
+# ─── hasp's own policy ────────────────────────────────────────────────────────
+#
+# This policy governs hasp's own CI/CD workflows. It is intentionally strict.
+# The self-scan job in security.yml runs `hasp --paranoid` against
+# .github/workflows/ — this policy must make that pass clean.
+
+pin: deny
+min-sha-age: 48h
+security-action-min-sha-age: 30d
+
+checks:
+  expression-injection: deny
+  permissions: deny
+  secret-exposure: deny
+  privileged-triggers: deny
+  github-env-writes: deny
+  secrets-inherit: deny
+  contains-bypass: deny
+  persist-credentials: deny
+  typosquatting: deny
+  untrusted-sources: off     # all actions used are from trusted owners
+  provenance:
+    reachability: deny
+    signatures: warn
+    fresh-commit: warn
+    tag-age-gap: deny
+    repo-reputation: warn
+    recent-repo: deny
+    transitive: deny
+    hidden-execution: deny
+
+# ─── Necessary permissions for release pipeline ──────────────────────────────
+ignore:
+  - check: permissions
+    match: "*"
+    file: "release.yml"
+    reason: >
+      release.yml requires contents:write to create GitHub Releases,
+      id-token:write for Sigstore OIDC signing, and attestations:write
+      for SLSA provenance. These are the minimum scopes for the release
+      pipeline and are scoped to individual jobs.
+
+  - check: github-env-writes
+    match: "*"
+    file: "release.yml"
+    reason: >
+      The aarch64 cross-compilation step writes CARGO_TARGET_*_LINKER and
+      CC_* to $GITHUB_ENV so the subsequent cargo build step picks them
+      up. Inputs are static literals — no untrusted data flows into the
+      write.

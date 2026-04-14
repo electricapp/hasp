@@ -1,0 +1,6 @@
+name: Reusable
+on: [push]
+permissions: {}
+jobs:
+  call:
+    uses: octo-org/some-repo/.github/workflows/reusable.yml@main

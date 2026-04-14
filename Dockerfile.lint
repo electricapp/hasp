@@ -1,0 +1,26 @@
+# Mirrors the CI `lint` job so you can reproduce CI failures locally
+# without a CI roundtrip. Same toolchain, same command.
+#
+# Usage (from repo root):
+#   docker build -f Dockerfile.lint -t hasp-lint .
+#
+# Or with BuildKit cache mounts (recommended; reuses target/ and registry):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.lint -t hasp-lint .
+#
+# The build fails with the same clippy diagnostics CI would print.
+
+# syntax=docker/dockerfile:1.7
+ARG RUST_VERSION=1.94.0
+FROM rust:${RUST_VERSION}-bookworm
+
+RUN rustup component add clippy
+
+WORKDIR /src
+COPY . .
+
+# Cache the cargo registry, git index, and target/ across rebuilds so the
+# loop is fast after the first run.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo clippy --tests -- -D warnings

@@ -1,0 +1,15 @@
+name: Insecure
+on:
+  pull_request_target:
+    types: [opened]
+jobs:
+  exploit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: echo "${{ github.event.pull_request.title }}"
+      - run: |
+          echo "value" >> $GITHUB_ENV
+      - uses: gitub/cli@11bd71901bbe5b1630ceea73d27597364c9af683

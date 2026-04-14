@@ -1,0 +1,50 @@
+# ─── Test fixture: intentionally vulnerable workflow ──────────────────────────
+#
+# This file is NOT a real CI workflow. It lives in tests/fixtures/ and is used
+# by hasp's self-scan tests to verify that audit checks detect known-bad
+# patterns. Every line is a deliberate anti-pattern.
+#
+# Do not move this to .github/workflows/.
+
+name: Vulnerable Example
+on:
+  pull_request_target:
+    types: [opened, edited]
+  issues:
+    types: [opened]
+
+# NO permissions block — defaults to read+write on everything!
+
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # CRITICAL: Script injection via PR title
+      - name: Echo PR info
+        run: |
+          echo "PR Title: ${{ github.event.pull_request.title }}"
+          echo "PR Body: ${{ github.event.pull_request.body }}"
+          echo "Branch: ${{ github.head_ref }}"
+
+      # CRITICAL: Script injection via issue body
+      - name: Process issue
+        run: |
+          echo "${{ github.event.issue.body }}" > /tmp/issue.txt
+
+      # HIGH: User-controlled input passed to action
+      - name: Create comment
+        uses: some-org/comment-action@main
+        with:
+          body: "Thanks for your PR: ${{ github.event.pull_request.title }}"
+
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: echo "deploying"

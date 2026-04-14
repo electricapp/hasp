@@ -1,0 +1,134 @@
+[package]
+name = "hasp"
+version = "0.1.0"
+edition = "2024"
+description = "Verifies GitHub Actions workflow files for unpinned or phantom action references"
+license = "MIT"
+repository = "https://github.com/OWNER/hasp"
+keywords = ["github-actions", "security", "supply-chain", "ci"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "hasp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hasp"
+path = "src/main.rs"
+
+[features]
+# Re-exports internal parsers through `hasp::fuzz_api` for the fuzz harness
+# in `fuzz/`. Never enabled by the bin or regular tests.
+fuzz-exports = []
+
+# ─── Workspace-level lint configuration (maximum pedantry) ───────────────────
+[lints.rust]
+unsafe_code = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+dead_code = "deny"
+unreachable_pub = "deny"
+elided_lifetimes_in_paths = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_qualifications = "deny"
+variant_size_differences = "deny"
+# missing_docs = "warn"        # enable when ready for doc coverage
+
+[lints.clippy]
+# ── Deny every group ──
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# ── Restriction: deny the high-value ones individually ──
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+todo = "deny"
+dbg_macro = "deny"
+clone_on_ref_ptr = "deny"
+create_dir = "deny"
+deref_by_slicing = "deny"
+empty_drop = "deny"
+empty_structs_with_brackets = "deny"
+filetype_is_file = "deny"
+float_cmp_const = "deny"
+fn_to_numeric_cast_any = "deny"
+format_push_string = "deny"
+get_unwrap = "deny"
+infinite_loop = "deny"
+lossy_float_literal = "deny"
+mem_forget = "deny"
+mixed_read_write_in_expression = "deny"
+mutex_atomic = "deny"
+needless_raw_strings = "deny"
+rc_buffer = "deny"
+rc_mutex = "deny"
+redundant_type_annotations = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+same_name_method = "deny"
+semicolon_inside_block = "deny"
+string_add = "deny"
+tests_outside_test_module = "deny"
+try_err = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_self_imports = "deny"
+verbose_file_reads = "deny"
+# Additional restriction lints for security-sensitive code
+as_underscore = "deny"
+assertions_on_result_states = "deny"
+# default_numeric_fallback — too noisy for calendar/bitshift arithmetic
+large_include_file = "deny"
+missing_assert_message = "deny"
+multiple_inherent_impl = "deny"
+panic_in_result_fn = "deny"
+string_lit_chars_any = "deny"
+implicit_clone = "deny"  # replaces removed string_to_string
+unseparated_literal_suffix = "deny"
+unwrap_used = "deny"
+wildcard_enum_match_arm = "deny"
+# ── Pedantic overrides for acceptable patterns ──
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+multiple_crate_versions = "allow"
+redundant_pub_crate = "allow"   # conflicts with rust::unreachable_pub
+
+# ─── Dependencies: minimal by design, with one intentional C dependency ──────
+#
+# yaml-rust2:  YAML parsing (pure Rust, no serde)
+# ureq:        Blocking HTTP client (no tokio, no hyper)
+#   + tls:     rustls (pure Rust TLS) + webpki-roots (compiled-in Mozilla CAs)
+# rustls:      Direct TLS config for custom certificate pinning
+# mimalloc:    Hardened allocator (secure mode)
+#
+# One intentional C dependency (mimalloc). Zero proc macros. Zero async runtimes.
+[dependencies]
+base64 = "0.22"
+mimalloc = { version = "0.1", features = ["secure"] }
+rustls = "0.23"
+webpki-roots = "1.0"
+yaml-rust2 = "0.11"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+sha1 = "0.11"                  # SHA-1 for git blob hash (workflow integrity check)
+sha2 = "0.11"                  # SHA-256 for --self-check binary verification
+
+# Landlock filesystem sandboxing — Linux-only, thin wrapper over syscalls
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+libc = "0.2"
+
+# ─── Dev / test dependencies ──────────────────────────────────────────────────
+[dev-dependencies]
+proptest = "1"
+
+# ─── Release hardening ────────────────────────────────────────────────────────
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+overflow-checks = true

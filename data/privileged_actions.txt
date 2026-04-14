@@ -1,0 +1,14 @@
+github/codeql-action
+aquasecurity/trivy-action
+actions/dependency-review-action
+actions/attest-build-provenance
+sigstore/cosign-installer
+aws-actions/configure-aws-credentials
+google-github-actions/auth
+azure/login
+docker/login-action
+docker/build-push-action
+hashicorp/vault-action
+pypa/gh-action-pypi-publish
+softprops/action-gh-release
+slsa-framework/slsa-github-generator

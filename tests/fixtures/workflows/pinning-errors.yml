@@ -1,0 +1,32 @@
+# ─── Test fixture: intentional pinning errors ────────────────────────────────
+#
+# This file is NOT a real CI workflow. It lives in tests/fixtures/ and is used
+# by hasp's self-scan tests to verify pin-checking and comment-mismatch
+# detection. Every pinning pattern here is a deliberate error.
+#
+# Do not move this to .github/workflows/.
+
+name: Pinning Errors
+on: [push, pull_request]
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2 — correct
+      - uses: actions/setup-node@v4                                       # mutable ref
+      - uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a       # v4.1.2 — correct version comment
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v3.0.0 — WRONG version (mismatch)
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v999.0.0 — nonexistent tag (mismatch)
+
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # same pin, deduped
+      - uses: my-org/nonexistent-action@deadbeef00000000000000000000000000000000  # phantom

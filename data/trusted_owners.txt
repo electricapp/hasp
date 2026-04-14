@@ -1,0 +1,14 @@
+actions
+github
+azure
+docker
+aws-actions
+google-github-actions
+hashicorp
+gradle
+ruby
+rust-lang
+pypa
+slsa-framework
+ossf
+codecov

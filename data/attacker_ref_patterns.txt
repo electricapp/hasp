@@ -1,0 +1,6 @@
+github.event.pull_request.head.sha
+github.event.pull_request.head.ref
+github.event.pull_request.head.label
+github.event.workflow_run.head_sha
+github.event.workflow_run.head_branch
+github.event.workflow_run.head_commit

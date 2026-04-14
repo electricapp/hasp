@@ -1,0 +1,10 @@
+name: Transitive
+on: [push]
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: ./.github/actions/composite

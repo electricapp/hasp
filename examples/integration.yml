@@ -1,0 +1,68 @@
+# ─── Zero-Trust CI Integration ────────────────────────────────────────────────
+#
+# Comprehensive template for integrating hasp into your CI pipeline.
+# Includes SHA256 verification, with optional Sigstore and SLSA verification.
+#
+# See docs/TRUST.md for the full verification ladder.
+
+name: Verify Actions
+on: [pull_request]
+
+# ── Top-level: deny all permissions by default ────────────────────────────────
+permissions: {}
+
+jobs:
+  verify-actions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download and verify hasp integrity
+        run: |
+          # ── Configuration ────────────────────────────────────────────────
+          VERSION="v0.1.0"
+          EXPECTED_HASH="REPLACE_WITH_ACTUAL_SHA256_AFTER_FIRST_RELEASE"
+          REPO="OWNER/hasp"
+          # ────────────────────────────────────────────────────────────────
+
+          BINARY_URL="https://github.com/${REPO}/releases/download/${VERSION}/hasp-linux-amd64"
+
+          curl -fsSL "${BINARY_URL}" -o hasp
+
+          # Level 1: SHA256 — math doesn't lie
+          echo "${EXPECTED_HASH}  hasp" | sha256sum --check --strict -
+
+          chmod +x hasp
+
+      # ── Optional: Sigstore verification (Level 2) ──────────────────────
+      # Uncomment to verify the binary was signed by the hasp CI workflow.
+      # Requires cosign: https://docs.sigstore.dev/cosign/system_config/installation/
+      #
+      # - name: Verify Sigstore signature
+      #   run: |
+      #     VERSION="v0.1.0"
+      #     REPO="OWNER/hasp"
+      #     ARTIFACT="hasp-linux-amd64"
+      #     cosign verify-blob \
+      #       --signature "https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}.sig" \
+      #       --certificate "https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}.pem" \
+      #       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #       hasp
+
+      # ── Optional: SLSA provenance verification (Level 3) ───────────────
+      # Uncomment to verify build provenance attestation (commit, workflow, inputs).
+      # Requires gh CLI with attestation support.
+      #
+      # - name: Verify SLSA provenance
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: |
+      #     REPO="OWNER/hasp"
+      #     gh attestation verify hasp --repo "${REPO}"
+
+      - name: Scan workflows for supply chain issues
+        run: ./hasp --strict --paranoid
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

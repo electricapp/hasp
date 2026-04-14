@@ -1,0 +1,24 @@
+# Mirrors the CI `self-scan` job so you can reproduce proxy/token failures
+# locally without a CI roundtrip. Same toolchain, same command.
+#
+# Usage (from repo root):
+#   docker build -f Dockerfile.selfscan -t hasp-selfscan .
+#   docker run --rm -e GITHUB_TOKEN="$(gh auth token)" hasp-selfscan
+#
+# Or with BuildKit cache mounts (reuses target/ and registry):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.selfscan -t hasp-selfscan .
+
+# syntax=docker/dockerfile:1.7
+ARG RUST_VERSION=1.94.0
+FROM rust:${RUST_VERSION}-bookworm
+
+WORKDIR /src
+COPY . .
+
+ENV GITHUB_REPO=OWNER/hasp
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release && cp target/release/hasp /usr/local/bin/hasp
+
+ENTRYPOINT ["/usr/local/bin/hasp", "--paranoid", "--allow-unsandboxed"]

@@ -1,0 +1,56 @@
+# Reproducible build for hasp.
+#
+# Produces byte-identical binaries so source builders can verify their
+# build matches the published release hash.
+#
+# Usage:
+#   docker build -f Dockerfile.reproduce \
+#     --build-arg TARGET=x86_64-unknown-linux-musl \
+#     --output=. .
+#
+# The binary is exported to ./hasp in the current directory.
+
+ARG RUST_VERSION=1.94.0
+ARG TARGET=x86_64-unknown-linux-musl
+ARG SOURCE_DATE_EPOCH=0
+ARG GITHUB_REPO=OWNER/hasp
+
+FROM rust:${RUST_VERSION}-bookworm AS builder
+
+ARG TARGET
+ARG SOURCE_DATE_EPOCH
+ARG GITHUB_REPO
+
+# Propagate reproducibility env vars so build.rs picks them up
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+ENV GITHUB_REPO=${GITHUB_REPO}
+
+# Deterministic debug paths: remap /build to . so different build machines
+# produce identical binaries regardless of absolute workspace path
+ENV RUSTFLAGS="--remap-path-prefix=/build=."
+
+RUN apt-get update && apt-get install -y musl-tools gcc-aarch64-linux-gnu && rm -rf /var/lib/apt/lists/*
+
+# Set cross-compilation linker for aarch64
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+
+RUN rustup target add ${TARGET}
+
+WORKDIR /build
+
+# Cache dependency build layer
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && echo '' > build.rs \
+    && cargo build --release --target ${TARGET} \
+    && rm -rf src build.rs
+
+# Build actual project
+COPY . .
+# Touch main.rs to force rebuild with real source
+RUN touch src/main.rs \
+    && cargo build --release --target ${TARGET} \
+    && cp target/${TARGET}/release/hasp /hasp
+
+FROM scratch
+COPY --from=builder /hasp /hasp

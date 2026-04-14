@@ -1,0 +1,103 @@
+name: Upstream Action Diff
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+
+permissions: {}
+
+jobs:
+  upstream-diff:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Post upstream diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Extract changed action refs from the PR diff.
+          # Dependabot bumps look like:
+          #   -    uses: owner/repo@old_sha  # vX.Y.Z
+          #   +    uses: owner/repo@new_sha  # vX.Y.Z
+          body=""
+
+          while IFS= read -r line; do
+            old_ref=$(echo "$line" | cut -d'|' -f1)
+            new_ref=$(echo "$line" | cut -d'|' -f2)
+
+            old_action=$(echo "$old_ref" | sed 's/@.*//')
+            new_action=$(echo "$new_ref" | sed 's/@.*//')
+            old_sha=$(echo "$old_ref" | sed 's/.*@//')
+            new_sha=$(echo "$new_ref" | sed 's/.*@//')
+
+            # Skip if the action name changed (not a simple bump)
+            [ "$old_action" != "$new_action" ] && continue
+            # Skip if SHAs are identical
+            [ "$old_sha" = "$new_sha" ] && continue
+
+            owner=$(echo "$old_action" | cut -d'/' -f1)
+            repo=$(echo "$old_action" | cut -d'/' -f2)
+
+            echo "::group::${owner}/${repo} ${old_sha:0:7}..${new_sha:0:7}"
+
+            compare_url="https://github.com/${owner}/${repo}/compare/${old_sha}...${new_sha}"
+
+            # Fetch commit log between old and new SHA
+            commits=$(gh api "repos/${owner}/${repo}/compare/${old_sha}...${new_sha}" \
+              --jq '.commits | .[:20] | .[] | "- [`\(.sha[0:7])`](\(.html_url)) \(.commit.message | split("\n") | .[0])"' \
+              2>/dev/null) || commits="*(could not fetch commit log — repository may be private)*"
+
+            file_summary=$(gh api "repos/${owner}/${repo}/compare/${old_sha}...${new_sha}" \
+              --jq '"**\(.files | length)** files changed, **\(.ahead_by)** commits ahead"' \
+              2>/dev/null) || file_summary=""
+
+            body="${body}
+          ### [\`${owner}/${repo}\`](https://github.com/${owner}/${repo}) — ${old_sha:0:7}...${new_sha:0:7}
+
+          ${file_summary}
+          [Full diff](${compare_url})
+
+          <details><summary>Commits</summary>
+
+          ${commits}
+
+          </details>
+          "
+            echo "::endgroup::"
+
+          done < <(
+            git diff HEAD~1..HEAD -- '.github/workflows/*.yml' \
+            | grep -E '^[-+]\s+uses:' \
+            | sed 's/^[-+]\s*uses:\s*//' \
+            | sed 's/\s*#.*//' \
+            | paste -d'|' - -
+          )
+
+          if [ -z "$body" ]; then
+            echo "No action ref changes detected."
+            exit 0
+          fi
+
+          comment="## Upstream changes
+
+          This Dependabot PR bumps the following GitHub Action(s). Here's what changed upstream:
+          ${body}
+          ---
+          *Posted by [action-diff](../actions/workflows/action-diff.yml)*"
+
+          # Dedent the heredoc-style indentation
+          comment=$(echo "$comment" | sed 's/^          //')
+
+          gh pr comment "$PR_NUMBER" --body "$comment"

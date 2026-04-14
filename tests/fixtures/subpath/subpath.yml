@@ -1,0 +1,10 @@
+name: Subpath
+on: [push]
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: docker/build-push-action/subdir@0123456789012345678901234567890123456789

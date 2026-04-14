@@ -1,0 +1,351 @@
+# ─── hasp GitHub Action ────────────────────────────────────────────────────────
+#
+# Scans your GitHub Actions workflows for supply-chain risks.
+#
+# SECURITY NOTICE — READ BEFORE USING:
+#
+#   This action downloads and executes a binary from GitHub Releases.
+#   That means you are trusting:
+#     1. This repository's release pipeline
+#     2. GitHub's release artifact hosting
+#     3. The SHA256 hash embedded in this action.yml
+#
+#   For maximum safety, do NOT use this action. Instead:
+#     - Build hasp from source (see docs/REPRODUCE.md)
+#     - Download the binary yourself and verify it (see docs/TRUST.md)
+#     - Use examples/integration.yml as a template
+#
+#   If you choose to use this action anyway, you MUST:
+#     - Pin to a full commit SHA, never a mutable tag
+#     - Grant only `contents: read` permission (+ id-token: write for SLSA)
+#     - Scope GITHUB_TOKEN to read-only
+#     - Review this file at the pinned SHA before trusting it
+#
+#   GitHub-hosted Ubuntu runners (22.04+, kernel 6.8+) support Landlock,
+#   seccomp-BPF, and cgroup v2. hasp uses a sudo BPF helper to load
+#   cgroup-BPF programs when unprivileged BPF is unavailable. Full
+#   OS-level confinement is active without --allow-unsandboxed.
+#
+# Usage:
+#
+#   - uses: OWNER/hasp@<full-40-char-sha>  # NEVER use @v1 or @main
+#     with:
+#       mode: paranoid
+#       verify: slsa            # sha256 | sigstore | slsa (default: slsa)
+#     env:
+#       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: hasp
+description: Scan GitHub Actions workflows for unpinned dependencies, phantom commits, and supply-chain risks
+author: OWNER
+
+inputs:
+  version:
+    description: >
+      hasp release version to download (e.g. v0.1.0).
+      Changing this does NOT change the expected hash — you must update
+      `expected-hash` to match.
+    required: false
+    default: "v0.1.0"
+
+  expected-hash:
+    description: >
+      SHA256 hash of the hasp binary. The action will fail if the
+      downloaded binary does not match. Update this when changing
+      `version`. Get the hash from the release's .sha256 file.
+    required: false
+    default: "REPLACE_WITH_ACTUAL_SHA256_AFTER_FIRST_RELEASE"
+
+  verify:
+    description: >
+      Binary verification level. Each level includes all levels below it.
+        sha256:   checksum only (fast, no extra tools)
+        sigstore: + Sigstore cosign signature (proves CI provenance)
+        slsa:     + SLSA build provenance attestation (proves exact commit)
+    required: false
+    default: "slsa"
+
+  mode:
+    description: >
+      Scan mode: "default", "paranoid", or "strict".
+      - default:  pin verification only
+      - paranoid: all security audits enabled
+      - strict:   mutable refs are failures + token required
+    required: false
+    default: "paranoid"
+
+  policy:
+    description: >
+      Path to a .hasp.yml policy file. Leave empty to auto-detect
+      from repository root. Set to "none" to disable policy loading.
+    required: false
+    default: ""
+
+  args:
+    description: >
+      Additional CLI arguments passed directly to hasp.
+      Example: "--min-sha-age 48h --no-verify"
+    required: false
+    default: ""
+
+  dir:
+    description: >
+      Workflow directory to scan.
+    required: false
+    default: ".github/workflows"
+
+  cosign-version:
+    description: >
+      Cosign version to install for Sigstore verification.
+      Only used when verify is "sigstore" or "slsa".
+    required: false
+    default: "v2.4.3"
+
+  cosign-hash:
+    description: >
+      SHA256 of the cosign binary. Verified before execution.
+      Update when changing cosign-version.
+    required: false
+    default: "caaad125acef1cb81d58dcdc454a1e429d09a750d1e9e2b3ed1aed8964454708"
+
+outputs:
+  exit-code:
+    description: "hasp exit code (0 = pass, 1 = findings, 2 = error)"
+    value: ${{ steps.scan.outputs.exit-code }}
+
+  sha256:
+    description: "SHA256 hash of the verified hasp binary"
+    value: ${{ steps.sha256.outputs.hash }}
+
+  sigstore-verified:
+    description: "Whether Sigstore signature was verified (true/false/skipped)"
+    value: ${{ steps.sigstore.outputs.verified }}
+
+  slsa-verified:
+    description: "Whether SLSA provenance was verified (true/false/skipped)"
+    value: ${{ steps.slsa.outputs.verified }}
+
+runs:
+  using: composite
+  steps:
+    # ── Download all release artifacts ──────────────────────────────────
+    - name: Download hasp binary and verification artifacts
+      shell: bash
+      env:
+        HASP_VERSION: ${{ inputs.version }}
+        HASP_VERIFY: ${{ inputs.verify }}
+      run: |
+        REPO="OWNER/hasp"
+        ARTIFACT="hasp-linux-amd64"
+        BASE_URL="https://github.com/${REPO}/releases/download/${HASP_VERSION}"
+        TEMP="${{ runner.temp }}/hasp-verify"
+        mkdir -p "${TEMP}"
+
+        echo "Downloading hasp ${HASP_VERSION}..."
+        curl -fsSL --retry 3 --retry-delay 2 "${BASE_URL}/${ARTIFACT}" -o "${TEMP}/hasp"
+
+        # Always download the published checksum for comparison
+        curl -fsSL --retry 3 --retry-delay 2 "${BASE_URL}/${ARTIFACT}.sha256" -o "${TEMP}/hasp.sha256" || true
+
+        # Download Sigstore artifacts if needed
+        if [ "${HASP_VERIFY}" = "sigstore" ] || [ "${HASP_VERIFY}" = "slsa" ]; then
+          echo "Downloading Sigstore signature and certificate..."
+          curl -fsSL --retry 3 --retry-delay 2 "${BASE_URL}/${ARTIFACT}.sig" -o "${TEMP}/hasp.sig"
+          curl -fsSL --retry 3 --retry-delay 2 "${BASE_URL}/${ARTIFACT}.pem" -o "${TEMP}/hasp.pem"
+        fi
+
+    # ── Level 1: SHA256 checksum ────────────────────────────────────────
+    - name: "Verify: SHA256 checksum"
+      id: sha256
+      shell: bash
+      env:
+        HASP_EXPECTED_HASH: ${{ inputs.expected-hash }}
+      run: |
+        TEMP="${{ runner.temp }}/hasp-verify"
+        ACTUAL_HASH=$(sha256sum "${TEMP}/hasp" | cut -d' ' -f1)
+        echo "hash=${ACTUAL_HASH}" >> "${GITHUB_OUTPUT}"
+
+        # Check against the hash embedded in this action
+        if [ "${ACTUAL_HASH}" != "${HASP_EXPECTED_HASH}" ]; then
+          echo "::error::SHA256 MISMATCH"
+          echo "::error::  Expected: ${HASP_EXPECTED_HASH}"
+          echo "::error::  Got:      ${ACTUAL_HASH}"
+          echo "::error::The downloaded binary does not match the expected hash."
+          echo "::error::This could indicate a tampered release or a version/hash mismatch."
+          exit 2
+        fi
+        echo "  [PASS] SHA256 verified: ${ACTUAL_HASH}"
+
+        # Cross-check against the published .sha256 file if available
+        if [ -f "${TEMP}/hasp.sha256" ]; then
+          PUBLISHED_HASH=$(cut -d' ' -f1 "${TEMP}/hasp.sha256")
+          if [ "${ACTUAL_HASH}" != "${PUBLISHED_HASH}" ]; then
+            echo "::error::Binary hash does not match published .sha256 file"
+            echo "::error::  Binary:    ${ACTUAL_HASH}"
+            echo "::error::  Published: ${PUBLISHED_HASH}"
+            exit 2
+          fi
+          echo "  [PASS] Matches published .sha256 file"
+        fi
+
+        chmod +x "${TEMP}/hasp"
+
+    # ── Level 2: Sigstore cosign signature ──────────────────────────────
+    - name: "Verify: Sigstore signature"
+      id: sigstore
+      if: inputs.verify == 'sigstore' || inputs.verify == 'slsa'
+      shell: bash
+      env:
+        COSIGN_VERSION: ${{ inputs.cosign-version }}
+        COSIGN_EXPECTED_HASH: ${{ inputs.cosign-hash }}
+      run: |
+        TEMP="${{ runner.temp }}/hasp-verify"
+
+        # Install cosign with its own SHA256 verification
+        echo "Installing cosign ${COSIGN_VERSION}..."
+        curl -fsSL --retry 3 "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+          -o "${TEMP}/cosign"
+        COSIGN_ACTUAL=$(sha256sum "${TEMP}/cosign" | cut -d' ' -f1)
+        if [ "${COSIGN_ACTUAL}" != "${COSIGN_EXPECTED_HASH}" ]; then
+          echo "::error::cosign SHA256 mismatch! Expected ${COSIGN_EXPECTED_HASH}, got ${COSIGN_ACTUAL}"
+          echo "::error::Cannot verify Sigstore signature with untrusted cosign binary."
+          echo "verified=false" >> "${GITHUB_OUTPUT}"
+          exit 2
+        fi
+        chmod +x "${TEMP}/cosign"
+
+        # Verify the hasp binary signature
+        echo "Verifying Sigstore signature..."
+        "${TEMP}/cosign" verify-blob \
+          --signature "${TEMP}/hasp.sig" \
+          --certificate "${TEMP}/hasp.pem" \
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          "${TEMP}/hasp"
+
+        echo "  [PASS] Sigstore signature verified"
+        echo "  Certificate subject:"
+        openssl x509 -in "${TEMP}/hasp.pem" -noout -text 2>/dev/null \
+          | grep -A1 "Subject Alternative Name" \
+          | tail -1 \
+          | sed 's/^/    /' || true
+        echo "verified=true" >> "${GITHUB_OUTPUT}"
+
+    - name: "Skip: Sigstore signature (not requested)"
+      id: sigstore-skip
+      if: inputs.verify == 'sha256'
+      shell: bash
+      run: echo "verified=skipped" >> "${GITHUB_OUTPUT}"
+
+    # ── Level 3: SLSA build provenance ──────────────────────────────────
+    - name: "Verify: SLSA build provenance"
+      id: slsa
+      if: inputs.verify == 'slsa'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        HASP_VERSION: ${{ inputs.version }}
+      run: |
+        TEMP="${{ runner.temp }}/hasp-verify"
+        REPO="OWNER/hasp"
+
+        echo "Verifying SLSA build provenance..."
+        if ! command -v gh &>/dev/null; then
+          echo "::warning::gh CLI not available, skipping SLSA verification"
+          echo "verified=false" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+
+        if gh attestation verify "${TEMP}/hasp" --repo "${REPO}" 2>&1; then
+          echo "  [PASS] SLSA build provenance verified"
+          echo "verified=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "::error::SLSA provenance verification failed."
+          echo "::error::The binary's build provenance could not be verified against"
+          echo "::error::GitHub's attestation ledger. This may indicate the binary"
+          echo "::error::was not produced by the expected CI workflow."
+          echo "verified=false" >> "${GITHUB_OUTPUT}"
+          exit 2
+        fi
+
+    - name: "Skip: SLSA provenance (not requested)"
+      id: slsa-skip
+      if: inputs.verify != 'slsa'
+      shell: bash
+      run: echo "verified=skipped" >> "${GITHUB_OUTPUT}"
+
+    # ── Verification summary ────────────────────────────────────────────
+    - name: Verification summary
+      shell: bash
+      env:
+        HASP_VERIFY: ${{ inputs.verify }}
+        HASP_HASH: ${{ steps.sha256.outputs.hash }}
+      run: |
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════╗"
+        echo "║  hasp binary verification complete                     ║"
+        echo "╠══════════════════════════════════════════════════════════╣"
+        echo "║  SHA256:   ${HASP_HASH:0:16}...  PASS                 ║"
+        if [ "${HASP_VERIFY}" = "sigstore" ] || [ "${HASP_VERIFY}" = "slsa" ]; then
+        echo "║  Sigstore: cosign signature           PASS             ║"
+        else
+        echo "║  Sigstore:                             SKIP             ║"
+        fi
+        if [ "${HASP_VERIFY}" = "slsa" ]; then
+        echo "║  SLSA:     build provenance            PASS             ║"
+        else
+        echo "║  SLSA:                                 SKIP             ║"
+        fi
+        echo "╚══════════════════════════════════════════════════════════╝"
+        echo ""
+
+    # ── Run scan ────────────────────────────────────────────────────────
+    - name: Scan workflows
+      id: scan
+      shell: bash
+      env:
+        HASP_MODE: ${{ inputs.mode }}
+        HASP_POLICY: ${{ inputs.policy }}
+        HASP_ARGS: ${{ inputs.args }}
+        HASP_DIR: ${{ inputs.dir }}
+      run: |
+        HASP="${{ runner.temp }}/hasp-verify/hasp"
+        CMD="${HASP} --dir ${HASP_DIR}"
+
+        case "${HASP_MODE}" in
+          paranoid) CMD="${CMD} --paranoid" ;;
+          strict)   CMD="${CMD} --strict --paranoid" ;;
+          default)  ;;
+          *)
+            echo "::error::Unknown mode '${HASP_MODE}'. Use: default, paranoid, or strict."
+            exit 2
+            ;;
+        esac
+
+        if [ "${HASP_POLICY}" = "none" ]; then
+          CMD="${CMD} --no-policy"
+        elif [ -n "${HASP_POLICY}" ]; then
+          CMD="${CMD} --policy ${HASP_POLICY}"
+        fi
+
+        if [ -n "${HASP_ARGS}" ]; then
+          CMD="${CMD} ${HASP_ARGS}"
+        fi
+
+        echo "Running: ${CMD}"
+        EXIT_CODE=0
+        ${CMD} || EXIT_CODE=$?
+        echo "exit-code=${EXIT_CODE}" >> "${GITHUB_OUTPUT}"
+
+        if [ "${EXIT_CODE}" -eq 2 ]; then
+          echo "::error::hasp encountered an internal error (exit code 2)"
+          exit 2
+        fi
+        exit "${EXIT_CODE}"
+
+    # ── Clean up ────────────────────────────────────────────────────────
+    - name: Clean up
+      if: always()
+      shell: bash
+      run: rm -rf "${{ runner.temp }}/hasp-verify"
