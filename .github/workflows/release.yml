@@ -39,20 +39,32 @@ jobs:
           rustup default ${{ env.RUST_VERSION }}
           rustup target add ${{ matrix.target }}
 
-      - name: Install zig (for cargo-zigbuild musl cross-link)
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
-        with:
-          version: 0.13.0
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+      - name: Install aarch64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc"
+            # gcc on Ubuntu enables _FORTIFY_SOURCE by default, which expands
+            # to __memcpy_chk/__memset_chk — glibc-only symbols missing from
+            # musl. Disable fortify so mimalloc's C build links cleanly.
+            echo "CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+          } >> "$GITHUB_ENV"
+
+      - name: Disable fortify-source for x86_64 musl
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: echo "CFLAGS_x86_64_unknown_linux_musl=-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" >> "$GITHUB_ENV"
 
       - name: Build release binary
         env:
           GITHUB_REPO: electricapp/hasp
           SOURCE_DATE_EPOCH: "0"
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=."
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/hasp ${{ matrix.artifact }}
