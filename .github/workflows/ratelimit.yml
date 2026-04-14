@@ -1,0 +1,29 @@
+name: Rate Limit Check
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query rate_limit endpoint
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          echo "==== /rate_limit ===="
+          gh api rate_limit | jq '.resources | to_entries[] | {
+            resource: .key,
+            limit: .value.limit,
+            remaining: .value.remaining,
+            used: .value.used,
+            reset_utc: (.value.reset | strftime("%Y-%m-%d %H:%M:%S UTC")),
+            reset_in_seconds: (.value.reset - now | floor)
+          }'
+          echo
+          echo "==== now ===="
+          date -u
