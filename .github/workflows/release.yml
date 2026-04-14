@@ -39,23 +39,20 @@ jobs:
           rustup default ${{ env.RUST_VERSION }}
           rustup target add ${{ matrix.target }}
 
-      - name: Install musl tools (Linux only)
-        if: contains(matrix.target, 'linux')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install zig (for cargo-zigbuild musl cross-link)
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2.2.1
+        with:
+          version: 0.13.0
 
-      - name: Install cross-compilation linker (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
 
       - name: Build release binary
         env:
           GITHUB_REPO: electricapp/hasp
           SOURCE_DATE_EPOCH: "0"
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=."
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/hasp ${{ matrix.artifact }}
