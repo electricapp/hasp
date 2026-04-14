@@ -60,7 +60,7 @@ inputs:
       downloaded binary does not match. Update this when changing
       `version`. Get the hash from the release's .sha256 file.
     required: false
-    default: "REPLACE_WITH_ACTUAL_SHA256_AFTER_FIRST_RELEASE"
+    default: "4b2e4a075d0e89673122246ddf202b596fc909649158d8d1ff6d79561210d590"
 
   verify:
     description: >
