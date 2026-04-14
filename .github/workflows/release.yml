@@ -52,7 +52,7 @@ jobs:
 
       - name: Build release binary
         env:
-          GITHUB_REPO: OWNER/hasp
+          GITHUB_REPO: electricapp/hasp
           SOURCE_DATE_EPOCH: "0"
           RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=."
         run: cargo build --release --target ${{ matrix.target }}

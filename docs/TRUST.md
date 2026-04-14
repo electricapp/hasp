@@ -20,8 +20,8 @@ source code.
 ```bash
 # Download binary + checksum
 VERSION="v0.1.0"
-curl -fsSL "https://github.com/OWNER/hasp/releases/download/${VERSION}/hasp-linux-amd64" -o hasp
-curl -fsSL "https://github.com/OWNER/hasp/releases/download/${VERSION}/hasp-linux-amd64.sha256" -o hasp.sha256
+curl -fsSL "https://github.com/electricapp/hasp/releases/download/${VERSION}/hasp-linux-amd64" -o hasp
+curl -fsSL "https://github.com/electricapp/hasp/releases/download/${VERSION}/hasp-linux-amd64.sha256" -o hasp.sha256
 
 # Verify
 sha256sum --check --strict hasp.sha256
@@ -37,7 +37,7 @@ certificate pinning):
 ### Level 2: Sigstore Cosign Signature
 
 **What it proves**: The binary was produced by a specific GitHub Actions workflow
-in the `OWNER/hasp` repository, using GitHub's OIDC identity. No private
+in the `electricapp/hasp` repository, using GitHub's OIDC identity. No private
 keys are involved — the signature is tied to the CI workflow identity.
 
 **What it doesn't prove**: Which source commit was used, or that the workflow
@@ -46,8 +46,8 @@ wasn't modified.
 ```bash
 # Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/
 cosign verify-blob \
-  --signature "https://github.com/OWNER/hasp/releases/download/${VERSION}/hasp-linux-amd64.sig" \
-  --certificate "https://github.com/OWNER/hasp/releases/download/${VERSION}/hasp-linux-amd64.pem" \
+  --signature "https://github.com/electricapp/hasp/releases/download/${VERSION}/hasp-linux-amd64.sig" \
+  --certificate "https://github.com/electricapp/hasp/releases/download/${VERSION}/hasp-linux-amd64.pem" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   hasp
 ```
@@ -63,7 +63,7 @@ it).
 
 ```bash
 # Requires gh CLI with attestation extension
-gh attestation verify hasp-linux-amd64 --repo OWNER/hasp
+gh attestation verify hasp-linux-amd64 --repo electricapp/hasp
 ```
 
 ### Level 4: Reproducible Build
@@ -73,14 +73,14 @@ published source code. You build from source in an identical environment and
 compare hashes.
 
 ```bash
-git clone https://github.com/OWNER/hasp.git
+git clone https://github.com/electricapp/hasp.git
 cd hasp
 git checkout "${VERSION}"
 
 # Build using the reproducible Dockerfile (pinned Rust version, SOURCE_DATE_EPOCH,
 # deterministic path remapping)
 docker build -f Dockerfile.reproduce \
-  --build-arg GITHUB_REPO=OWNER/hasp \
+  --build-arg GITHUB_REPO=electricapp/hasp \
   --output=. .
 
 # Compare with published hash
@@ -144,5 +144,5 @@ Every release includes an SPDX SBOM (`*.spdx.json`) listing all transitive
 dependencies. Download it from the GitHub Release assets:
 
 ```bash
-curl -fsSL "https://github.com/OWNER/hasp/releases/download/${VERSION}/hasp-linux-amd64.spdx.json" | jq .
+curl -fsSL "https://github.com/electricapp/hasp/releases/download/${VERSION}/hasp-linux-amd64.spdx.json" | jq .
 ```

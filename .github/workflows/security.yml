@@ -55,7 +55,7 @@ jobs:
 
       - name: Build hasp
         env:
-          GITHUB_REPO: OWNER/hasp
+          GITHUB_REPO: electricapp/hasp
         run: cargo build --release
 
       - name: Scan own workflows (must pass clean)

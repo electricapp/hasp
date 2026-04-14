@@ -97,7 +97,7 @@ Use hasp (`--strict`) to enforce this in CI.
 
 Add hasp to your `pull_request` workflow:
 ```yaml
-- uses: OWNER/hasp@<SHA>
+- uses: electricapp/hasp@<SHA>
   with:
     paranoid: true
 ```
@@ -128,7 +128,7 @@ Do not grant `contents: write`, `actions: write`, or `packages: write` unless st
 
 If you use pre-built binaries in CI (like hasp itself), verify the SHA256:
 ```bash
-curl -fsSL https://github.com/OWNER/hasp/releases/download/v1.0/hasp > hasp
+curl -fsSL https://github.com/electricapp/hasp/releases/download/v1.0/hasp > hasp
 echo "abc123...  hasp" | sha256sum --check
 chmod +x hasp && ./hasp
 ```

@@ -15,7 +15,7 @@ binary, reproducing a release, and integrating into CI.
 ## 1. Build from Source
 
 ```bash
-git clone https://github.com/OWNER/hasp.git
+git clone https://github.com/electricapp/hasp.git
 cd hasp
 
 # Development build
@@ -51,7 +51,7 @@ Proves the binary matches what was published. Takes 10 seconds.
 
 ```bash
 VERSION="v0.1.0"
-REPO="OWNER/hasp"
+REPO="electricapp/hasp"
 
 curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/hasp-linux-amd64" -o hasp
 curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/hasp-linux-amd64.sha256" -o hasp.sha256
@@ -110,19 +110,19 @@ byte-identical binary.
 
 ```bash
 # Clone at the exact release tag
-git clone https://github.com/OWNER/hasp.git
+git clone https://github.com/electricapp/hasp.git
 cd hasp
 git checkout v0.1.0
 
 # Build using the reproducible Dockerfile
 # This pins: Rust version, SOURCE_DATE_EPOCH, path remapping, musl target
 docker build -f Dockerfile.reproduce \
-  --build-arg GITHUB_REPO=OWNER/hasp \
+  --build-arg GITHUB_REPO=electricapp/hasp \
   --output=. .
 
 # Compare your build against the published hash
 sha256sum hasp
-curl -fsSL "https://github.com/OWNER/hasp/releases/download/v0.1.0/hasp-linux-amd64.sha256"
+curl -fsSL "https://github.com/electricapp/hasp/releases/download/v0.1.0/hasp-linux-amd64.sha256"
 ```
 
 If the hashes match, the binary is a faithful product of the source code at
@@ -143,7 +143,7 @@ that tag. If they don't, something is wrong -- file an issue.
 ```bash
 docker build -f Dockerfile.reproduce \
   --build-arg TARGET=aarch64-unknown-linux-musl \
-  --build-arg GITHUB_REPO=OWNER/hasp \
+  --build-arg GITHUB_REPO=electricapp/hasp \
   --output=. .
 ```
 
@@ -168,7 +168,7 @@ If you just want to add hasp to an existing workflow:
 - name: Install hasp
   run: |
     VERSION="v0.1.0"
-    curl -fsSL "https://github.com/OWNER/hasp/releases/download/${VERSION}/hasp-linux-amd64" -o hasp
+    curl -fsSL "https://github.com/electricapp/hasp/releases/download/${VERSION}/hasp-linux-amd64" -o hasp
     chmod +x hasp
 
 - name: Scan workflows
@@ -211,7 +211,7 @@ ignore:
 Every release includes an SPDX SBOM listing all transitive dependencies:
 
 ```bash
-curl -fsSL "https://github.com/OWNER/hasp/releases/download/v0.1.0/hasp-linux-amd64.spdx.json" | jq .
+curl -fsSL "https://github.com/electricapp/hasp/releases/download/v0.1.0/hasp-linux-amd64.spdx.json" | jq .
 ```
 
 ## Troubleshooting

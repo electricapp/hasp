@@ -28,7 +28,7 @@
 #
 # Usage:
 #
-#   - uses: OWNER/hasp@<full-40-char-sha>  # NEVER use @v1 or @main
+#   - uses: electricapp/hasp@<full-40-char-sha>  # NEVER use @v1 or @main
 #     with:
 #       mode: paranoid
 #       verify: slsa            # sha256 | sigstore | slsa (default: slsa)
@@ -137,7 +137,7 @@ runs:
         HASP_VERSION: ${{ inputs.version }}
         HASP_VERIFY: ${{ inputs.verify }}
       run: |
-        REPO="OWNER/hasp"
+        REPO="electricapp/hasp"
         ARTIFACT="hasp-linux-amd64"
         BASE_URL="https://github.com/${REPO}/releases/download/${HASP_VERSION}"
         TEMP="${{ runner.temp }}/hasp-verify"
@@ -248,7 +248,7 @@ runs:
         HASP_VERSION: ${{ inputs.version }}
       run: |
         TEMP="${{ runner.temp }}/hasp-verify"
-        REPO="OWNER/hasp"
+        REPO="electricapp/hasp"
 
         echo "Verifying SLSA build provenance..."
         if ! command -v gh &>/dev/null; then
