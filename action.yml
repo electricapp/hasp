@@ -39,7 +39,11 @@
 
 name: hasp
 description: Scan GitHub Actions workflows for unpinned dependencies, phantom commits, and supply-chain risks
-author: OWNER
+author: electricapp
+
+branding:
+  icon: shield
+  color: red
 
 inputs:
   version:
