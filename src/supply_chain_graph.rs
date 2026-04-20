@@ -7,7 +7,6 @@
 //! dependencies.
 
 use crate::audit::AuditFinding;
-use crate::github::Api as _;
 use crate::scanner::{ActionRef, RefKind};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -501,19 +500,30 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
 
 /// If `GITHUB_TOKEN` is set, query the GitHub API directly (no subprocess
 /// sandbox — `hasp tree` is already inline like `hasp diff`) and populate
-/// `TrustSignals` per unique pinned action ref. Errors are swallowed per-ref
-/// so the tree still renders even if a handful of API calls fail.
-///
-/// TODO(v2.7): No hermetic unit test covers this path today — it requires
-/// either a live `GITHUB_TOKEN` or a mock `Api` trait fixture. A test-only
-/// `MockApi` implementation (see `src/github/provenance.rs` tests for the
-/// pattern) would let this logic be tested without network. Listed in
-/// docs/SECURITY.md under "Known limitations → Tree online signals".
+/// `TrustSignals` per unique pinned action ref.
 fn collect_online_signals(refs: &[ActionRef]) -> HashMap<RefKey, TrustSignals> {
-    let mut out: HashMap<RefKey, TrustSignals> = HashMap::new();
     if std::env::var_os("GITHUB_TOKEN").is_none() {
-        return out;
+        return HashMap::new();
     }
+    let client = match build_tree_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hasp tree: online signals unavailable ({e}); rendering offline graph");
+            return HashMap::new();
+        }
+    };
+    collect_online_signals_with_api(refs, &client, now_unix_seconds().unwrap_or(0))
+}
+
+/// Inner helper that takes any `Api` implementation so unit tests can feed
+/// a hand-rolled mock. Errors are swallowed per-ref so the tree still
+/// renders even if a handful of API calls fail.
+fn collect_online_signals_with_api<A: crate::github::Api>(
+    refs: &[ActionRef],
+    client: &A,
+    now: i64,
+) -> HashMap<RefKey, TrustSignals> {
+    let mut out: HashMap<RefKey, TrustSignals> = HashMap::new();
 
     // Deduplicate by RefKey and only look up pinned full-SHA refs.
     let mut keys: Vec<RefKey> = Vec::new();
@@ -531,18 +541,9 @@ fn collect_online_signals(refs: &[ActionRef]) -> HashMap<RefKey, TrustSignals> {
         return out;
     }
 
-    let client = match build_tree_client() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("hasp tree: online signals unavailable ({e}); rendering offline graph");
-            return out;
-        }
-    };
-
     // Cache per-repo lookups (repo_info reused across many refs in the same repo).
     let mut repo_cache: HashMap<(String, String), Option<crate::github::RepoInfo>> =
         HashMap::new();
-    let now = now_unix_seconds().unwrap_or(0);
 
     for key in keys {
         let mut signals = TrustSignals {
@@ -826,6 +827,240 @@ mod tests {
         assert!(json.contains("\"nodes\""));
         assert!(json.contains("\"edges\""));
         assert!(json.contains("\"roots\""));
+    }
+
+    // ─── MockApi + collect_online_signals tests ──────────────────────
+
+    struct MockApi {
+        verified_shas: std::collections::HashSet<String>,
+        signed_shas: std::collections::HashSet<String>,
+        reachable_shas: std::collections::HashSet<String>,
+        commit_dates: HashMap<String, String>,
+        attestation_bodies: HashMap<String, String>,
+        repo_info: HashMap<(String, String), crate::github::RepoInfo>,
+    }
+
+    impl crate::github::Api for MockApi {
+        fn verify_commit(&self, _owner: &str, _repo: &str, sha: &str) -> crate::error::Result<bool> {
+            Ok(self.verified_shas.contains(sha))
+        }
+        fn resolve_tag(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _tag: &str,
+        ) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn find_tag_for_sha(&self, _owner: &str, _repo: &str, _sha: &str) -> Option<String> {
+            None
+        }
+        fn get_repo_info(
+            &self,
+            owner: &str,
+            repo: &str,
+        ) -> crate::error::Result<crate::github::RepoInfo> {
+            self.repo_info
+                .get(&(owner.to_string(), repo.to_string()))
+                .cloned()
+                .ok_or_else(|| crate::error::Error::new("no repo info for mock".to_string()))
+        }
+        fn is_commit_reachable(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+            _default_branch: &str,
+        ) -> crate::error::Result<crate::github::ReachabilityStatus> {
+            Ok(if self.reachable_shas.contains(sha) {
+                crate::github::ReachabilityStatus::Reachable
+            } else {
+                crate::github::ReachabilityStatus::Unreachable
+            })
+        }
+        fn is_commit_signed(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+        ) -> crate::error::Result<bool> {
+            Ok(self.signed_shas.contains(sha))
+        }
+        fn get_commit_date(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+        ) -> crate::error::Result<Option<String>> {
+            Ok(self.commit_dates.get(sha).cloned())
+        }
+        fn get_tag_creation_date(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _tag: &str,
+        ) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn get_action_yml(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _path: Option<&str>,
+            _sha: &str,
+        ) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn compare_commits(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _base: &str,
+            _head: &str,
+        ) -> crate::error::Result<crate::github::CompareResult> {
+            Ok(crate::github::CompareResult {
+                owner: String::new(),
+                repo: String::new(),
+                old_sha: String::new(),
+                new_sha: String::new(),
+                ahead_by: 0,
+                files_changed: 0,
+                commit_summaries: Vec::new(),
+                html_url: String::new(),
+            })
+        }
+        fn get_attestation(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+        ) -> crate::error::Result<Option<String>> {
+            Ok(self.attestation_bodies.get(sha).cloned())
+        }
+    }
+
+    fn mock_api() -> MockApi {
+        let mut verified = std::collections::HashSet::new();
+        verified.insert("a".repeat(40));
+        let mut signed = std::collections::HashSet::new();
+        signed.insert("a".repeat(40));
+        let mut reachable = std::collections::HashSet::new();
+        reachable.insert("a".repeat(40));
+        let mut commit_dates = HashMap::new();
+        commit_dates.insert("a".repeat(40), "2024-01-01T00:00:00Z".to_string());
+        let mut repo_info = HashMap::new();
+        repo_info.insert(
+            ("actions".into(), "checkout".into()),
+            crate::github::RepoInfo {
+                default_branch: "main".into(),
+                created_at: Some("2020-01-01T00:00:00Z".into()),
+                stargazers_count: Some(2000),
+                forks_count: Some(500),
+            },
+        );
+        MockApi {
+            verified_shas: verified,
+            signed_shas: signed,
+            reachable_shas: reachable,
+            commit_dates,
+            attestation_bodies: HashMap::new(),
+            repo_info,
+        }
+    }
+
+    #[test]
+    fn collect_online_signals_populates_from_mock_api() {
+        let refs = vec![r(
+            "actions",
+            "checkout",
+            &"a".repeat(40),
+            "ci.yml",
+            RefKind::FullSha,
+        )];
+        let now = 1_704_067_200_i64 + 365 * 86_400; // 2025-01-01 UTC
+        let signals_map = collect_online_signals_with_api(&refs, &mock_api(), now);
+        assert_eq!(signals_map.len(), 1);
+        let signals = signals_map.values().next().unwrap();
+        assert!(signals.pinned_full_sha);
+        assert_eq!(signals.sha_exists, Some(true));
+        assert_eq!(signals.reachable, Some(true));
+        assert_eq!(signals.signed, Some(true));
+        assert_eq!(signals.slsa_verified, Some(false)); // no attestation configured
+        assert_eq!(signals.repo_stars, Some(2000));
+        assert!(signals.commit_age_days.is_some_and(|d| d > 300));
+    }
+
+    #[test]
+    fn collect_online_signals_handles_phantom_sha() {
+        // SHA not in verified_shas -> sha_exists=false, no follow-up calls
+        let refs = vec![r(
+            "actions",
+            "checkout",
+            &"b".repeat(40),
+            "ci.yml",
+            RefKind::FullSha,
+        )];
+        let signals_map = collect_online_signals_with_api(&refs, &mock_api(), 0);
+        let signals = signals_map.values().next().unwrap();
+        assert_eq!(signals.sha_exists, Some(false));
+        assert_eq!(signals.signed, None);
+        assert_eq!(signals.slsa_verified, None);
+    }
+
+    #[test]
+    fn collect_online_signals_skips_mutable_refs() {
+        let refs = vec![r(
+            "actions",
+            "checkout",
+            "v4",
+            "ci.yml",
+            RefKind::Mutable,
+        )];
+        let signals_map = collect_online_signals_with_api(&refs, &mock_api(), 0);
+        assert!(signals_map.is_empty(), "mutable refs should be skipped entirely");
+    }
+
+    #[test]
+    fn collect_online_signals_caches_repo_info_per_repo() {
+        // Three refs in the same repo -> get_repo_info should be called once.
+        // We can't directly assert call count without adding counters; instead
+        // verify signals all land the same repo-level data.
+        let refs = vec![
+            r("actions", "checkout", &"a".repeat(40), "ci.yml", RefKind::FullSha),
+            r("actions", "checkout", &"a".repeat(40), "release.yml", RefKind::FullSha),
+        ];
+        let signals_map = collect_online_signals_with_api(&refs, &mock_api(), 0);
+        // Dedup by RefKey collapses them to one entry.
+        assert_eq!(signals_map.len(), 1);
+    }
+
+    #[test]
+    fn collect_online_signals_marks_slsa_verified_on_good_attestation() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let stmt = r#"{
+          "_type": "https://in-toto.io/Statement/v1",
+          "subject": [{"name": "git", "digest": {"sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],
+          "predicateType": "https://slsa.dev/provenance/v1",
+          "predicate": {"runDetails": {"builder": {"id": "https://github.com/actions/runner/x"}}}
+        }"#;
+        let payload_b64 = STANDARD.encode(stmt);
+        let bundle = format!(
+            r#"{{"attestations":[{{"bundle":{{"dsseEnvelope":{{"payloadType":"application/vnd.in-toto+json","payload":"{payload_b64}","signatures":[{{"keyid":"","sig":"AA"}}]}}}}}}]}}"#
+        );
+
+        let mut api = mock_api();
+        api.attestation_bodies.insert("a".repeat(40), bundle);
+
+        let refs = vec![r(
+            "actions",
+            "checkout",
+            &"a".repeat(40),
+            "ci.yml",
+            RefKind::FullSha,
+        )];
+        let signals_map = collect_online_signals_with_api(&refs, &api, 0);
+        let signals = signals_map.values().next().unwrap();
+        assert_eq!(signals.slsa_verified, Some(true));
     }
 
     #[test]

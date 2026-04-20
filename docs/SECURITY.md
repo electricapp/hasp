@@ -84,17 +84,6 @@ Both gaps are tracked with `TODO(v2.2)` comments in
 `rustls-webpki` as direct dependencies (both are already transitive via
 `rustls`) plus ~500 lines of cert-chain and DSSE-PAE plumbing.
 
-### Tree online signals (`hasp tree`)
-
-The `collect_online_signals` path in `src/supply_chain_graph.rs`
-calls the real GitHub API when `GITHUB_TOKEN` is set. It has unit tests
-for the scoring logic but no hermetic test for the API collection
-itself — that requires either a live token (non-reproducible in CI) or
-a mock `Api` trait fixture.
-
-Tracked with a `TODO(v2.7)` comment; the `MockApi` pattern in
-`src/github/provenance.rs` tests is the template for closing this.
-
 ### Sandboxed `hasp diff` sandbox assertion
 
 `hasp diff` spawns two `hasp --internal-scan` subprocesses, each of
