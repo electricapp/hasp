@@ -12,6 +12,22 @@ provenance, maps which secrets are visible to which actions, and audits
 workflows for injection vulnerabilities, excessive permissions, hidden
 execution paths, and supply-chain risks.
 
+**Beyond static scanning**, hasp also:
+
+- **Cross-workflow taint analysis** — catches `workflow_run` / artifact
+  chains (tj-actions / Ultralytics pattern)
+- **OIDC trust-policy linting** — cross-checks AWS/GCP/Azure trust
+  policies against the workflows that mint OIDC tokens
+- **SLSA provenance** — full cryptographic verification: DSSE signature +
+  leaf→intermediate→root chain against bundled Sigstore public-good Fulcio
+- **Cross-repo external artifacts** — flags `curl`/`wget`/`go install`
+  pulling unpinned third-party code in `run:` blocks
+- **`hasp diff`** — PR-delta mode surfaces new/fixed findings vs a base
+  ref, with markdown output for PR comments
+- **`hasp tree`** — scored supply-chain DAG with per-node trust signals
+- **`hasp replay`** — re-audits historical workflow states, catches
+  problems that slipped through before rules existed
+
 `hasp exec` wraps any executable subprocess (e.g. CI step) in a kernel sandbox
 where secrets are capabilities — mediated by per-secret localhost proxies with
 declarative domain allowlists, so a compromised dependency can never exfiltrate
@@ -319,6 +335,68 @@ can extend or replace built-in audit rules on a per-action basis.
 - Composite actions with internal shell `run:` steps are flagged
 - Nested execution inside pinned action metadata is surfaced for review
 
+### Cross-Workflow Taint (`--paranoid`)
+- `pull_request`-triggered workflow uploads an artifact that a privileged
+  `workflow_run`-triggered workflow downloads (tj-actions / Ultralytics
+  pattern) — CRIT
+- `workflow_run` trigger without an explicit `workflows:` allowlist or
+  `types: [completed]` guard in a privileged workflow — HIGH
+- Privileged `workflow_run` workflow reads
+  `github.event.workflow_run.*` fields that are attacker-controlled when
+  the upstream was PR-triggered — HIGH
+
+### OIDC Trust-Policy Linting (`--paranoid`)
+
+Pass trust policies alongside workflows (CLI flag `--oidc-policy aws:./trust.json`
+or `.hasp.yml` `oidc:` section) and hasp audits the whole handshake:
+
+- Trust policy accepts a wildcard repository pattern but the workflows
+  only mint OIDC tokens from a specific repo — HIGH
+- Trust policy accepts PR refs (`refs/pull/*`) but no PR-triggered
+  workflow declares `id-token: write` — HIGH (dead entry / latent exploit)
+- Trust policy has no `aud` pin — MED
+- Trust policy accepts environment wildcards while workflows declare
+  specific environments — MED
+
+Supports AWS IAM trust policies, GCP Workload Identity Federation, and
+Azure federated credentials.
+
+### Cross-Repo External Artifacts (`--paranoid`)
+- `run:` blocks invoking `curl` / `wget` / `gh release download` /
+  `pip install <url>` / `npm install <url>` / `go install` / `cargo
+  install --git` against unpinned third-party artifacts
+- Severity calibrates to context: CRIT for privileged + PR-triggered,
+  HIGH for privileged-or-PR, MED otherwise
+- SHA-pinned `raw.githubusercontent.com` URLs are exempt (equivalent
+  provenance to `uses:@<sha>`)
+
+### SLSA Attestation Verification (`--paranoid`)
+
+For every pinned `uses:` SHA that has a GitHub attestation, hasp runs
+full cryptographic verification:
+
+```
+Leaf cert (P-256 ECDSA_SHA256, fetched from attestation bundle)
+  │ DSSE signature verified against leaf's SubjectPublicKeyInfo
+  ▼
+Intermediate (P-384, bundled at data/fulcio/intermediate_v1.pem)
+  │ issuer DN byte-compared; ECDSA_P384_SHA384 signature verified
+  ▼
+Root (P-384 self-signed, bundled at data/fulcio/root_v1.pem)
+    Verified at first use via ECDSA_P384_SHA384
+```
+
+Findings (CRIT unless otherwise):
+- **SignatureInvalid** — DSSE envelope signature does not verify against
+  cert's public key (strongest tampering signal)
+- **ChainInvalid** — leaf cert does not chain to Sigstore public-good
+  Fulcio
+- **SubjectMismatch** — attestation's `subject.digest.sha1` does not
+  bind to the pinned SHA
+- **UntrustedBuilder** — HIGH; builder.id is not a GitHub Actions runner
+- **UnknownPredicate** — MED; predicateType is not SLSA v0.2 or v1
+- **Missing** — MED (warn); no attestation exists for this SHA
+
 ## Usage
 
 ```bash
@@ -356,12 +434,40 @@ hasp --paranoid --max-transitive-depth 5
 # Verify binary integrity against published release
 hasp --self-check
 
+# PR-delta mode: show only new/fixed findings vs a base ref
+hasp diff main
+hasp diff main --format markdown       # ready for `gh pr comment --body-file -`
+hasp diff main --format json
+
+# Supply-chain dependency graph with per-node trust scores
+hasp tree                              # ASCII, online signals if GITHUB_TOKEN set
+hasp tree --format json
+hasp tree --min-score 0.6              # CI gate: exit 1 if any root scores below
+
+# Re-audit historical workflow states to catch past-exploit-potential
+hasp replay                            # last 30 days
+hasp replay --since 2w --format markdown
+
+# OIDC trust-policy linting
+hasp --paranoid --oidc-policy aws:./infra/iam/deploy-role-trust.json
+
 # Run a command in a sandboxed environment with proxy-mediated secrets
 hasp exec --manifest .hasp/publish.yml -- npm publish
 
 # Run with explicit writable dirs (can be repeated)
 hasp exec --manifest .hasp/deploy.yml --writable ./dist --writable /tmp -- deploy.sh
 ```
+
+### Subcommands
+
+| Command       | What it does                                                                          |
+| ------------- | ------------------------------------------------------------------------------------- |
+| `hasp`        | Default scan: pin verification + API-backed provenance + `--paranoid` audits          |
+| `hasp diff`   | PR-delta — scan base worktree vs HEAD, emit new/fixed/unchanged finding delta         |
+| `hasp tree`   | Scored supply-chain DAG of workflows → pinned `uses:` dependencies                    |
+| `hasp replay` | Historical re-audit — walk `git log --since=<window>` and replay current rules        |
+| `hasp exec`   | Sandboxed step runner (kernel-confined, per-secret forward proxies)                   |
+| `hasp --self-check` | Verify the hasp binary against its own published hashes + Sigstore + SLSA       |
 
 ### Sandboxed Step Runner (`hasp exec`)
 
@@ -442,6 +548,9 @@ checks:
   persist-credentials: warn
   typosquatting: deny
   untrusted-sources: warn
+  cross-workflow: deny
+  oidc: deny
+  external-artifacts: deny
   provenance:
     reachability: deny
     signatures: warn
@@ -451,6 +560,14 @@ checks:
     recent-repo: deny
     transitive: deny
     hidden-execution: deny
+    slsa-attestation: warn
+
+# ── OIDC trust policies to cross-check against workflows ─────
+oidc:
+  - provider: aws
+    path: infra/iam/deploy-role-trust.json
+  - provider: gcp
+    path: infra/gcp/wif-provider.json
 
 # ── Trust lists ──────────────────────────────────────────────
 # mode: extend (add to built-in) or replace (use only these)
@@ -599,20 +716,33 @@ docker build -f Dockerfile.reproduce --output=. .
 
 ### Dependencies
 
-10 direct crate dependencies (8 cross-platform + 2 Linux-only). One intentional C dependency (`mimalloc` secure mode). Zero proc macros. Zero async runtimes.
+12 direct crate dependencies (10 cross-platform + 2 Linux-only). One
+intentional C dependency (`mimalloc` secure mode). Zero proc macros. Zero
+async runtimes.
 
-| Crate          | Purpose                                                       |
-| -------------- | ------------------------------------------------------------- |
-| `yaml-rust2`   | YAML parsing (pure Rust)                                      |
-| `mimalloc`     | Hardened allocator with guard pages and free-memory scrubbing |
-| `rustls`       | Custom TLS verifier for GitHub SPKI pinning                   |
-| `webpki-roots` | Mozilla root store bundled for rustls                         |
-| `ureq`         | Blocking HTTP client (rustls TLS)                             |
-| `sha1`         | Git blob hashing for workflow integrity checks                |
-| `sha2`         | SHA-256 for `--self-check`                                    |
-| `base64`       | Sigstore certificate parsing in `--self-check`                |
-| `landlock`     | Filesystem sandboxing (Linux)                                 |
-| `libc`         | Seccomp-BPF + cgroup-BPF syscalls (Linux)                     |
+| Crate            | Purpose                                                       |
+| ---------------- | ------------------------------------------------------------- |
+| `yaml-rust2`     | YAML parsing (pure Rust)                                      |
+| `mimalloc`       | Hardened allocator with guard pages and free-memory scrubbing |
+| `rustls`         | Custom TLS verifier for GitHub SPKI pinning                   |
+| `rustls-webpki`  | Staged for future full X.509 chain walks                      |
+| `webpki-roots`   | Mozilla root store bundled for rustls                         |
+| `ureq`           | Blocking HTTP client (rustls TLS)                             |
+| `ring`           | ECDSA P-256/P-384 for SLSA DSSE + Fulcio chain verification   |
+| `sha1`           | Git blob hashing for workflow integrity checks                |
+| `sha2`           | SHA-256 for `--self-check`                                    |
+| `base64`         | Sigstore certificate parsing in `--self-check`                |
+| `landlock`       | Filesystem sandboxing (Linux)                                 |
+| `libc`           | Seccomp-BPF + cgroup-BPF syscalls (Linux)                     |
+
+### Bundled trust material
+
+| File                                      | Purpose                                                        |
+| ----------------------------------------- | -------------------------------------------------------------- |
+| `data/fulcio/root_v1.pem`                 | Sigstore public-good Fulcio root (P-384 self-signed)           |
+| `data/fulcio/intermediate_v1.pem`         | Fulcio intermediate; verified against root at first use        |
+
+Both expire 2031-10-05. Rotation before then ships as a hasp release.
 
 ## IPC Protocol
 
@@ -635,8 +765,12 @@ Verifier <-> Proxy:    Loopback TCP, one request per connection
                        shared-secret authenticated
                        VERIFY, RESOLVE, FIND_TAG, REPO_INFO,
                        REACHABLE, SIGNED, COMMIT_DATE,
-                       TAG_DATE, GET_ACTION_YML commands
+                       TAG_DATE, GET_ACTION_YML, COMPARE,
+                       GET_ATTESTATION commands
 ```
+
+Regular commands cap responses at 4 KiB; `GET_ATTESTATION` opts into a
+256 KiB cap on the client side because SLSA bundles are multi-KB.
 
 ## Platform Support
 
@@ -648,6 +782,64 @@ Verifier <-> Proxy:    Loopback TCP, one request per connection
 | Windows       | None                                               | Untested                       |
 
 ## Comparison
+
+### `hasp` scanner vs [zizmor][zz]
+
+Both are static analyzers for GitHub Actions. zizmor ships a wider offline
+audit catalog; hasp goes deeper on commit provenance, cryptographic
+attestation verification, and cross-workflow / cross-repo / OIDC boundaries
+that zizmor doesn't cross.
+
+| Capability                                                  | hasp                       | zizmor         |
+| ----------------------------------------------------------- | -------------------------- | -------------- |
+| Unpinned `uses:` / mutable-ref detection                    | ✓                          | ✓              |
+| Template-injection in `run:` / `with:`                      | ✓                          | ✓              |
+| Excessive / missing permissions                             | ✓                          | ✓              |
+| `pull_request_target` + attacker checkout                   | ✓                          | ✓              |
+| `secrets: inherit` exposure                                 | ✓                          | ✓              |
+| Bypassable `contains()` on attacker contexts                | ✓                          | ✓              |
+| `actions/checkout` persist-credentials                      | ✓                          | ✓              |
+| Orphaned fork SHA detection                                 | ✓                          | ✓              |
+| Hash-comment / tag mismatch                                 | ✓                          | ✓              |
+| Docker container image pinning                              | ✓                          | ✓              |
+| Typosquatting (`action/checkout`)                           | ✓                          | ✗              |
+| Commit signature verification                               | ✓                          | ✗              |
+| Commit-age cooling-off periods                              | ✓                          | ✗              |
+| Tag-age-gap (retroactive tagging)                           | ✓                          | ✗              |
+| Repo reputation / age / newly-created-repo flags            | ✓                          | ✗              |
+| **Cross-workflow taint** (artifact / `workflow_run`)        | ✓                          | ✗              |
+| **OIDC trust-policy linting** (AWS/GCP/Azure)               | ✓                          | ✗              |
+| **Cross-repo external artifacts** (curl/wget in `run:`)     | ✓                          | ✗              |
+| **SLSA attestation — cryptographic verification**           | ✓ (DSSE + chain to Fulcio) | ✗              |
+| **PR-delta mode** (`hasp diff`)                             | ✓                          | ✗              |
+| **Supply-chain graph + scoring** (`hasp tree`)              | ✓                          | ✗              |
+| **Historical audit replay** (`hasp replay`)                 | ✓                          | ✗              |
+| **Kernel-sandboxed step runner** (`hasp exec`)              | ✓                          | ✗              |
+| **Scanner is itself kernel-sandboxed** (Landlock/seccomp)   | ✓                          | ✗              |
+| Known-vulnerable actions (CVE DB)                           | ✗                          | ✓              |
+| Archived-upstream-repo detection                            | ✗                          | ✓              |
+| Cache-poisoning in release workflows                        | ✗                          | ✓              |
+| Spoofable `bot` condition checks                            | ✗                          | ✓              |
+| Missing concurrency limits                                  | ✗                          | ✓              |
+| Dependabot cooldown / execution config                      | ✗                          | ✓              |
+| GitHub App token patterns                                   | ✗                          | ✓              |
+| `insecure-commands` opt-in detection                        | ✗                          | ✓              |
+| Obfuscated-expression detection                             | ✗                          | ✓              |
+| `secrets-outside-env` (no environment constraint)           | ✗                          | ✓              |
+| Self-hosted runner flagging                                 | ✗                          | ✓              |
+| SHA not pointing to a tag (`stale-action-refs`)             | ✗                          | ✓              |
+| Superfluous-actions / trusted-publishing advisories         | ✗                          | ✓              |
+| Undocumented-permissions comments                           | ✗                          | ✓              |
+| Unsound conditions / unredacted secrets                     | ✗                          | ✓              |
+
+Both tools call the GitHub API when they need to — this is not a
+"static vs online" split. The real difference is **depth on supply-chain
+evidence** (hasp has the trust-signal stack) vs **breadth of CI-config
+audits** (zizmor has the larger catalog). Running both is reasonable.
+
+[zz]: https://github.com/zizmorcore/zizmor
+
+### `hasp exec` vs runtime sandboxing tools
 
 How `hasp exec` compares to other CI/CD security tools:
 
@@ -679,13 +871,22 @@ requires rewriting your build in Dagger's SDK.
 **GitHub's 2026 roadmap** plans runner-level egress policies and branch-scoped
 secrets, but no per-step kernel sandboxing or proxy-mediated injection.
 
-## Deferred Work
+## Known limitations
 
-**Repository identity continuity.** The next hardening step is to pin
-trusted upstreams by stable GitHub owner / repository IDs and alert if a
-familiar `owner/repo` name resolves to a different numeric identity. That
-requires a local cache or explicit baseline file, so hasp does not claim to
-enforce it yet.
+See [docs/SECURITY.md](docs/SECURITY.md) for the full list. Summary:
+
+- **Sandbox assertion in `hasp diff`** — integration tests verify the
+  delta output is correct but don't assert the Landlock / seccomp / BPF
+  layers were actually applied.
+- **Private Fulcio instances** — attestations signed by a private
+  Fulcio will yield `ChainInvalid`. No current mechanism to extend the
+  trusted-issuer allowlist via `.hasp.yml`.
+- **Fulcio rotation** — bundled root + intermediate are valid through
+  2031-10-05. Unplanned Sigstore root rotation before then needs a hasp
+  release.
+- **Repository identity continuity** — pinning trusted upstreams by
+  stable GitHub owner / repository IDs would catch rename-squatting
+  attacks. Requires a local cache / baseline file; deferred.
 
 ## License
 
