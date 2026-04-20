@@ -54,17 +54,18 @@ const TRUSTED_BUILDER_PREFIXES: &[&str] =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttestationVerdict {
-    /// Attestation exists, subject binds to the pinned SHA, builder is trusted.
-    ///
-    /// `signer_identity` is populated when the bundle carries
-    /// verification-material with an x509 cert we can structurally parse.
-    /// This is *evidence* extracted from the cert -- hasp does not yet
-    /// cryptographically verify the DSSE signature over the payload or the
-    /// cert chain to the Fulcio root (see docs/SECURITY.md for the gap).
+    /// Attestation exists, subject binds to the pinned SHA, builder is trusted,
+    /// and (when crypto material is present) the DSSE signature verifies against
+    /// the cert's EC public key.
     Verified {
         workflow_ref: Option<String>,
         builder_id: String,
         signer_identity: Option<super::sigstore::SignerIdentity>,
+        /// `Some(true)`: DSSE ECDSA signature verified against the cert's
+        /// `SubjectPublicKeyInfo`. `Some(false)`: verification was attempted
+        /// but failed. `None`: no cert / no signature in the bundle, so
+        /// there was nothing to verify.
+        signature_verified: Option<bool>,
     },
     /// No attestation was present for this SHA.
     Missing,
@@ -83,6 +84,13 @@ pub(crate) enum AttestationVerdict {
         issuer_cn: String,
         subject_uri: Option<String>,
     },
+    /// Attestation's DSSE ECDSA signature does not verify against the
+    /// cert's public key. This is the strongest tampering signal.
+    SignatureInvalid { reason: String },
+    /// The attestation cert does not chain to the bundled Sigstore
+    /// public-good Fulcio intermediate. Either from a private Fulcio
+    /// instance (extend the trust list) or a forgery attempt.
+    ChainInvalid { reason: String },
     /// We couldn't parse the attestation bundle. Carries the parse error.
     MalformedAttestation(String),
 }
@@ -161,11 +169,11 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
     }
 
     // Evidence layer (v2.1): pull the signer identity from the cert if present.
-    let signer_identity = attestation
+    let bundle = attestation
         .as_hash()
         .and_then(|m| m.get(&Yaml::String("bundle".to_string())))
-        .and_then(Yaml::as_hash)
-        .and_then(super::sigstore::extract_identity_from_bundle);
+        .and_then(Yaml::as_hash);
+    let signer_identity = bundle.and_then(super::sigstore::extract_identity_from_bundle);
 
     // If we have a cert and its issuer clearly isn't Fulcio-shaped, treat
     // that as a distinct verdict rather than lumping it into `Verified`.
@@ -182,12 +190,147 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
         });
     }
 
+    // DSSE signature verification (v2.2a) runs before chain validation so a
+    // tampered payload is flagged even when the chain is also bogus. Either
+    // failure short-circuits with the most specific verdict.
+    let signature_verified = match verify_dsse_signature(bundle) {
+        DsseResult::Verified => Some(true),
+        DsseResult::NotAttempted => None,
+        DsseResult::Invalid(reason) => {
+            return Ok(AttestationVerdict::SignatureInvalid { reason });
+        }
+    };
+
+    // Chain validation (v2.2b): verify leaf was signed by bundled Fulcio intermediate.
+    if let Some(bundle_map) = bundle {
+        match super::sigstore::verify_chain_to_fulcio(bundle_map) {
+            super::sigstore::ChainVerdict::VerifiedAgainstFulcio
+            | super::sigstore::ChainVerdict::NoMaterial => {}
+            super::sigstore::ChainVerdict::IssuerMismatch => {
+                return Ok(AttestationVerdict::ChainInvalid {
+                    reason: "leaf cert issuer does not match bundled Sigstore \
+                             public-good Fulcio intermediate"
+                        .to_string(),
+                });
+            }
+            super::sigstore::ChainVerdict::SignatureInvalid => {
+                return Ok(AttestationVerdict::ChainInvalid {
+                    reason: "leaf cert's signature does not verify against bundled \
+                             Sigstore public-good Fulcio intermediate"
+                        .to_string(),
+                });
+            }
+            super::sigstore::ChainVerdict::Malformed(msg) => {
+                return Ok(AttestationVerdict::MalformedAttestation(msg));
+            }
+        }
+    }
+
     let workflow_ref = extract_workflow_ref(statement_map);
     Ok(AttestationVerdict::Verified {
         workflow_ref,
         builder_id,
         signer_identity,
+        signature_verified,
     })
+}
+
+#[derive(Debug)]
+enum DsseResult {
+    Verified,
+    /// Bundle lacks crypto material (e.g. legacy shape with no cert) so we
+    /// can't attempt verification. Signal to caller that this is a gap, not
+    /// a failure.
+    NotAttempted,
+    /// Signature was present but failed to verify against the cert's key.
+    Invalid(String),
+}
+
+/// Verify the DSSE envelope's `ECDSA_P256_SHA256` signature against the
+/// attestation cert's `SubjectPublicKeyInfo`. DSSE v1 PAE is:
+///   `"DSSEv1" SP LEN(payloadType) SP payloadType SP LEN(payload) SP payload`
+/// where SP = 0x20 and LEN is ASCII-decimal byte length.
+fn verify_dsse_signature(bundle: Option<&yaml_rust2::yaml::Hash>) -> DsseResult {
+    let Some(bundle) = bundle else {
+        return DsseResult::NotAttempted;
+    };
+    let Some(envelope) = bundle
+        .get(&Yaml::String("dsseEnvelope".to_string()))
+        .and_then(Yaml::as_hash)
+    else {
+        return DsseResult::NotAttempted;
+    };
+
+    let Some(payload_type) = envelope
+        .get(&Yaml::String("payloadType".to_string()))
+        .and_then(Yaml::as_str)
+    else {
+        return DsseResult::NotAttempted;
+    };
+    let Some(payload_b64) = envelope
+        .get(&Yaml::String("payload".to_string()))
+        .and_then(Yaml::as_str)
+    else {
+        return DsseResult::NotAttempted;
+    };
+    let Ok(payload_bytes) = sigstore_base64(payload_b64) else {
+        return DsseResult::Invalid("base64 decode failed for DSSE payload".into());
+    };
+
+    let Some(first_sig) = envelope
+        .get(&Yaml::String("signatures".to_string()))
+        .and_then(Yaml::as_vec)
+        .and_then(|arr| arr.first())
+        .and_then(Yaml::as_hash)
+    else {
+        return DsseResult::NotAttempted;
+    };
+    let Some(sig_b64) = first_sig
+        .get(&Yaml::String("sig".to_string()))
+        .and_then(Yaml::as_str)
+    else {
+        return DsseResult::NotAttempted;
+    };
+    let Ok(sig_bytes) = sigstore_base64(sig_b64) else {
+        return DsseResult::Invalid("base64 decode failed for DSSE signature".into());
+    };
+
+    let Some(pubkey) = super::sigstore::extract_spki_ec_point_from_bundle(bundle) else {
+        return DsseResult::NotAttempted;
+    };
+
+    // PAE computation.
+    let mut pae: Vec<u8> = Vec::with_capacity(32 + payload_type.len() + payload_bytes.len());
+    pae.extend_from_slice(b"DSSEv1 ");
+    pae.extend_from_slice(payload_type.len().to_string().as_bytes());
+    pae.push(b' ');
+    pae.extend_from_slice(payload_type.as_bytes());
+    pae.push(b' ');
+    pae.extend_from_slice(payload_bytes.len().to_string().as_bytes());
+    pae.push(b' ');
+    pae.extend_from_slice(&payload_bytes);
+
+    let verifier = ring::signature::UnparsedPublicKey::new(
+        &ring::signature::ECDSA_P256_SHA256_ASN1,
+        pubkey,
+    );
+    match verifier.verify(&pae, &sig_bytes) {
+        Ok(()) => DsseResult::Verified,
+        Err(_) => DsseResult::Invalid(
+            "ECDSA_P256_SHA256 verification failed for DSSE envelope".into(),
+        ),
+    }
+}
+
+fn sigstore_base64(s: &str) -> Result<Vec<u8>> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    STANDARD
+        .decode(s.trim())
+        .or_else(|_| {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            URL_SAFE_NO_PAD.decode(s.trim())
+        })
+        .map_err(|e| crate::error::Error::new(format!("base64 decode failed: {e}")))
 }
 
 /// Decode the DSSE payload into an in-toto Statement Yaml. The outer `Result`
@@ -380,10 +523,13 @@ mod tests {
             workflow_ref,
             builder_id,
             signer_identity: _,
+            signature_verified,
         } = verdict
         {
             assert!(builder_id.starts_with("https://github.com/actions/runner/"));
             assert_eq!(workflow_ref.as_deref(), Some("refs/tags/v4.2.2"));
+            // No cert material in this synthetic bundle -> NotAttempted -> None.
+            assert!(signature_verified.is_none());
         } else {
             panic!("expected Verified, got {verdict:?}");
         }
@@ -431,6 +577,248 @@ mod tests {
         let body = "{}";
         let verdict = verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
         assert!(matches!(verdict, AttestationVerdict::Missing));
+    }
+
+    #[test]
+    fn verifies_real_dsse_signature_end_to_end() {
+        // Generate a live ECDSA P-256 keypair with ring, sign a real DSSE
+        // PAE over the attestation payload, wrap the pubkey in a synthetic
+        // x509 cert. The synthetic cert can't pass chain-to-Fulcio
+        // validation (no real Fulcio private key at test time), so the
+        // top-level verdict is `ChainInvalid`. The DSSE signature itself
+        // *does* verify — we assert that by calling `verify_dsse_signature`
+        // directly against the same bundle.
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use ring::rand::SystemRandom;
+        use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let keypair = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let pubkey_sec1 = keypair.public_key().as_ref().to_vec();
+        assert_eq!(pubkey_sec1.len(), 65, "SEC1 uncompressed P-256 point is 65 bytes");
+        assert_eq!(pubkey_sec1[0], 0x04);
+
+        let statement = r#"{
+          "_type": "https://in-toto.io/Statement/v1",
+          "subject": [{"name": "git", "digest": {"sha1": "abcdef0000000000000000000000000000000000"}}],
+          "predicateType": "https://slsa.dev/provenance/v1",
+          "predicate": {"runDetails": {"builder": {"id": "https://github.com/actions/runner/x"}}}
+        }"#;
+        let payload_bytes = statement.as_bytes();
+        let payload_type = "application/vnd.in-toto+json";
+        let mut pae: Vec<u8> = Vec::new();
+        pae.extend_from_slice(b"DSSEv1 ");
+        pae.extend_from_slice(payload_type.len().to_string().as_bytes());
+        pae.push(b' ');
+        pae.extend_from_slice(payload_type.as_bytes());
+        pae.push(b' ');
+        pae.extend_from_slice(payload_bytes.len().to_string().as_bytes());
+        pae.push(b' ');
+        pae.extend_from_slice(payload_bytes);
+
+        let sig = keypair.sign(&rng, &pae).unwrap();
+        let sig_b64 = STANDARD.encode(sig.as_ref());
+        let payload_b64 = STANDARD.encode(payload_bytes);
+        let cert_der = build_cert_with_pubkey(&pubkey_sec1);
+        let cert_b64 = STANDARD.encode(&cert_der);
+
+        let bundle_text = format!(
+            r#"{{
+                "attestations": [{{
+                    "bundle": {{
+                        "dsseEnvelope": {{
+                            "payloadType": "{payload_type}",
+                            "payload": "{payload_b64}",
+                            "signatures": [{{"keyid": "", "sig": "{sig_b64}"}}]
+                        }},
+                        "verificationMaterial": {{
+                            "certificate": {{"rawBytes": "{cert_b64}"}}
+                        }}
+                    }}
+                }}]
+            }}"#
+        );
+
+        // Direct DSSE verification against the synthetic bundle (bypasses chain check).
+        let parsed = YamlLoader::load_from_str(&bundle_text).unwrap();
+        let root = &parsed[0];
+        let attestations = root
+            .as_hash()
+            .unwrap()
+            .get(&Yaml::String("attestations".to_string()))
+            .unwrap()
+            .as_vec()
+            .unwrap();
+        let bundle_hash = attestations[0]
+            .as_hash()
+            .unwrap()
+            .get(&Yaml::String("bundle".to_string()))
+            .unwrap()
+            .as_hash()
+            .unwrap();
+        assert!(
+            matches!(verify_dsse_signature(Some(bundle_hash)), DsseResult::Verified),
+            "DSSE verification should succeed on matching keypair"
+        );
+
+        // Top-level verdict: ChainInvalid because the synthetic cert doesn't
+        // chain to the bundled Fulcio intermediate. Chain validation is the
+        // v2.2b layer; it correctly rejects self-signed / non-Fulcio certs
+        // even when the DSSE signature is valid.
+        let verdict = verify_attestation_response(
+            &bundle_text,
+            "abcdef0000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert!(
+            matches!(verdict, AttestationVerdict::ChainInvalid { .. }),
+            "expected ChainInvalid for synthetic cert, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn flags_tampered_payload_as_signature_invalid() {
+        // Same keypair, same cert -- but swap the payload after signing. The
+        // signature should fail verification.
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use ring::rand::SystemRandom;
+        use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+
+        let rng = SystemRandom::new();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let keypair = EcdsaKeyPair::from_pkcs8(
+            &ECDSA_P256_SHA256_ASN1_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let pubkey_sec1 = keypair.public_key().as_ref().to_vec();
+
+        let original = br#"{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"x","digest":{"sha1":"abcdef0000000000000000000000000000000000"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"runDetails":{"builder":{"id":"https://github.com/actions/runner/x"}}}}"#;
+        let payload_type = "application/vnd.in-toto+json";
+
+        let mut pae: Vec<u8> = Vec::new();
+        pae.extend_from_slice(b"DSSEv1 ");
+        pae.extend_from_slice(payload_type.len().to_string().as_bytes());
+        pae.push(b' ');
+        pae.extend_from_slice(payload_type.as_bytes());
+        pae.push(b' ');
+        pae.extend_from_slice(original.len().to_string().as_bytes());
+        pae.push(b' ');
+        pae.extend_from_slice(original);
+        let sig = keypair.sign(&rng, &pae).unwrap();
+        let sig_b64 = STANDARD.encode(sig.as_ref());
+
+        // Tampered payload has the *same SHA binding* (so subject-mismatch
+        // doesn't fire) but a different byte somewhere -- flip the builder
+        // URL to force a signature mismatch without upsetting the structural
+        // checks that run before signature verification.
+        let tampered = br#"{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"x","digest":{"sha1":"abcdef0000000000000000000000000000000000"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"runDetails":{"builder":{"id":"https://github.com/actions/runner/y"}}}}"#;
+        let tampered_b64 = STANDARD.encode(tampered);
+        let cert_b64 = STANDARD.encode(build_cert_with_pubkey(&pubkey_sec1));
+
+        let bundle = format!(
+            r#"{{
+                "attestations": [{{
+                    "bundle": {{
+                        "dsseEnvelope": {{
+                            "payloadType": "{payload_type}",
+                            "payload": "{tampered_b64}",
+                            "signatures": [{{"keyid": "", "sig": "{sig_b64}"}}]
+                        }},
+                        "verificationMaterial": {{
+                            "certificate": {{"rawBytes": "{cert_b64}"}}
+                        }}
+                    }}
+                }}]
+            }}"#
+        );
+
+        let verdict = verify_attestation_response(
+            &bundle,
+            "abcdef0000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert!(
+            matches!(verdict, AttestationVerdict::SignatureInvalid { .. }),
+            "expected SignatureInvalid, got {verdict:?}"
+        );
+    }
+
+    /// Synthetic cert wrapping a caller-supplied EC P-256 SEC1 uncompressed
+    /// pubkey (65 bytes). Issuer CN and SAN URI are hardcoded to make the
+    /// cert look Fulcio-shaped so the verifier doesn't short-circuit on
+    /// `UntrustedIssuer` before reaching signature verification.
+    fn build_cert_with_pubkey(pubkey_sec1: &[u8]) -> Vec<u8> {
+        fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if value.len() < 0x80 {
+                out.push(u8::try_from(value.len()).unwrap());
+            } else if value.len() < 0x100 {
+                out.push(0x81);
+                out.push(u8::try_from(value.len()).unwrap());
+            } else {
+                out.push(0x82);
+                out.push(u8::try_from(value.len() >> 8).unwrap());
+                out.push(u8::try_from(value.len() & 0xff).unwrap());
+            }
+            out.extend_from_slice(value);
+            out
+        }
+        fn seq(children: &[&[u8]]) -> Vec<u8> {
+            let inner: Vec<u8> = children.iter().flat_map(|c| c.iter().copied()).collect();
+            tlv(0x30, &inner)
+        }
+        fn rdn_cn(cn: &str) -> Vec<u8> {
+            let oid = tlv(0x06, &[0x55, 0x04, 0x03]);
+            let value = tlv(0x13, cn.as_bytes());
+            let attr = seq(&[&oid, &value]);
+            let rdn = tlv(0x31, &attr);
+            seq(&[&rdn])
+        }
+
+        let issuer = rdn_cn("sigstore-intermediate");
+        let subject = rdn_cn("placeholder");
+        let utc1 = tlv(0x17, b"250101000000Z");
+        let utc2 = tlv(0x17, b"260101000000Z");
+        let validity = seq(&[&utc1, &utc2]);
+
+        // SPKI with the real pubkey: BIT STRING of the 65-byte point prefixed
+        // with unused-bits byte 0x00.
+        let alg_oid = tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]); // ecPublicKey
+        let alg_params = tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]); // P-256
+        let alg = seq(&[&alg_oid, &alg_params]);
+        let mut bit_string_bytes = vec![0_u8];
+        bit_string_bytes.extend_from_slice(pubkey_sec1);
+        let bitstr = tlv(0x03, &bit_string_bytes);
+        let spki = seq(&[&alg, &bitstr]);
+
+        let san_uri = "https://github.com/a/b/.github/workflows/x.yml@refs/heads/main";
+        let uri_name = tlv(0x86, san_uri.as_bytes());
+        let general_names = seq(&[&uri_name]);
+        let octet = tlv(0x04, &general_names);
+        let san_oid = tlv(0x06, &[0x55, 0x1D, 0x11]);
+        let san_ext = seq(&[&san_oid, &octet]);
+        let exts = seq(&[&san_ext]);
+        let exts_wrapper = tlv(0xA3, &exts);
+
+        let version = tlv(0xA0, &tlv(0x02, &[0x02]));
+        let serial = tlv(0x02, &[0x01]);
+        let sig_alg = seq(&[&alg_oid, &alg_params]);
+        let tbs = seq(&[
+            &version, &serial, &sig_alg, &issuer, &validity, &subject, &spki, &exts_wrapper,
+        ]);
+        let outer_sig_alg = seq(&[&alg_oid, &alg_params]);
+        let outer_sig_value = tlv(0x03, &[0x00, 0xAA]);
+        seq(&[&tbs, &outer_sig_alg, &outer_sig_value])
     }
 
     #[test]

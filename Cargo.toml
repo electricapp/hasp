@@ -108,7 +108,9 @@ redundant_pub_crate = "allow"   # conflicts with rust::unreachable_pub
 [dependencies]
 base64 = "0.22"
 mimalloc = { version = "0.1", features = ["secure"] }
+ring = "0.17"                  # ECDSA P-256 for DSSE attestation signature verification
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-webpki = "0.103"        # X.509 cert-chain validation for Sigstore/Fulcio
 webpki-roots = "1.0"
 yaml-rust2 = "0.11"
 ureq = { version = "2", default-features = false, features = ["tls"] }

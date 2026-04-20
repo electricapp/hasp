@@ -431,92 +431,178 @@ fn emit_slsa_finding(
 ) {
     use super::slsa::AttestationVerdict;
     let is_warning = level.is_warn();
+    let file = result.action_ref.file.clone();
     match verdict {
         AttestationVerdict::Verified { .. } | AttestationVerdict::Missing => {}
         AttestationVerdict::UntrustedIssuer {
             issuer_cn,
             subject_uri,
-        } => {
-            findings.push(AuditFinding {
-                file: result.action_ref.file.clone(),
-                severity: Severity::High,
-                title: format!(
-                    "SLSA attestation for {target} issued by non-Fulcio CA"
-                ),
-                detail: format!(
-                    "The attestation bundle's cert was issued by `{issuer_cn}`, which \
-                     does not match Sigstore's public Fulcio CA. Workflow identity in \
-                     the cert: {}. If this is intentional (private Fulcio instance), \
-                     extend hasp's trusted-issuer allowlist. Otherwise treat this as \
-                     a tampered or misissued attestation.",
-                    subject_uri.as_deref().unwrap_or("<not extracted>")
-                ),
-                is_warning,
-            });
-        }
-        AttestationVerdict::SubjectMismatch { observed, .. } => {
-            findings.push(AuditFinding {
-                file: result.action_ref.file.clone(),
-                severity: Severity::Critical,
-                title: format!(
-                    "SLSA attestation for {target} does not bind to pinned SHA"
-                ),
-                detail: format!(
-                    "The SLSA attestation on GitHub for {target} references \
-                     subjects {observed:?} but we asked for {short_sha}. This mismatch \
-                     could indicate a tampered bundle, an attestation moved from a \
-                     different SHA, or a bug in the publisher's release pipeline. \
-                     Investigate before trusting the pinned SHA."
-                ),
-                is_warning,
-            });
-        }
-        AttestationVerdict::UntrustedBuilder { builder_id } => {
-            findings.push(AuditFinding {
-                file: result.action_ref.file.clone(),
-                severity: Severity::High,
-                title: format!(
-                    "SLSA attestation for {target} signed by untrusted builder"
-                ),
-                detail: format!(
-                    "The SLSA attestation for {short_sha} in {target} was emitted by \
-                     `{builder_id}`, which is not a GitHub Actions runner identity. \
-                     This is unusual: GitHub-hosted runners produce attestations \
-                     rooted at `https://github.com/actions/...`. Verify the builder \
-                     matches what the upstream publisher claims."
-                ),
-                is_warning,
-            });
-        }
-        AttestationVerdict::UnknownPredicate { predicate_type } => {
-            findings.push(AuditFinding {
-                file: result.action_ref.file.clone(),
-                severity: Severity::Medium,
-                title: format!(
-                    "SLSA attestation for {target} uses unknown predicate type"
-                ),
-                detail: format!(
-                    "The attestation for {short_sha} uses predicateType \
-                     `{predicate_type}`, not a recognized SLSA provenance version. \
-                     hasp can only verify `https://slsa.dev/provenance/v0.2` and v1 \
-                     statements."
-                ),
-                is_warning,
-            });
-        }
-        AttestationVerdict::MalformedAttestation(msg) => {
-            findings.push(AuditFinding {
-                file: result.action_ref.file.clone(),
-                severity: Severity::Medium,
-                title: format!(
-                    "SLSA attestation for {target} is malformed"
-                ),
-                detail: format!(
-                    "Attestation bundle for {short_sha} could not be validated: {msg}."
-                ),
-                is_warning,
-            });
-        }
+        } => findings.push(slsa_untrusted_issuer_finding(
+            &file, target, issuer_cn, subject_uri.as_deref(), is_warning,
+        )),
+        AttestationVerdict::SignatureInvalid { reason } => findings.push(
+            slsa_signature_invalid_finding(&file, target, short_sha, reason, is_warning),
+        ),
+        AttestationVerdict::ChainInvalid { reason } => findings.push(
+            slsa_chain_invalid_finding(&file, target, short_sha, reason, is_warning),
+        ),
+        AttestationVerdict::SubjectMismatch { observed, .. } => findings.push(
+            slsa_subject_mismatch_finding(&file, target, short_sha, observed, is_warning),
+        ),
+        AttestationVerdict::UntrustedBuilder { builder_id } => findings.push(
+            slsa_untrusted_builder_finding(&file, target, short_sha, builder_id, is_warning),
+        ),
+        AttestationVerdict::UnknownPredicate { predicate_type } => findings.push(
+            slsa_unknown_predicate_finding(&file, target, short_sha, predicate_type, is_warning),
+        ),
+        AttestationVerdict::MalformedAttestation(msg) => findings.push(
+            slsa_malformed_finding(&file, target, short_sha, msg, is_warning),
+        ),
+    }
+}
+
+fn slsa_untrusted_issuer_finding(
+    file: &std::path::Path,
+    target: &str,
+    issuer_cn: &str,
+    subject_uri: Option<&str>,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::High,
+        title: format!("SLSA attestation for {target} issued by non-Fulcio CA"),
+        detail: format!(
+            "The attestation bundle's cert was issued by `{issuer_cn}`, which does not \
+             match Sigstore's public Fulcio CA. Workflow identity in the cert: {}. If \
+             this is intentional (private Fulcio instance), extend hasp's trusted-issuer \
+             allowlist. Otherwise treat this as a tampered or misissued attestation.",
+            subject_uri.unwrap_or("<not extracted>")
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_signature_invalid_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    reason: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::Critical,
+        title: format!("SLSA attestation for {target} has invalid DSSE signature"),
+        detail: format!(
+            "DSSE signature verification failed for {short_sha} in {target}: {reason}. \
+             This is the strongest tampering signal -- either the attestation body was \
+             modified after signing, or the cert in the bundle does not hold the private \
+             key that signed the envelope. Do not trust this attestation."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_chain_invalid_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    reason: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::Critical,
+        title: format!("SLSA attestation for {target} cert chain is invalid"),
+        detail: format!(
+            "Cert-chain validation failed for {short_sha} in {target}: {reason}. \
+             The attestation's leaf cert does not demonstrably originate from the \
+             Sigstore public-good Fulcio CA. If this is from a private Fulcio \
+             instance, extend hasp's bundled trust material (data/fulcio/). \
+             Otherwise treat as a misissued or forged attestation."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_subject_mismatch_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    observed: &[String],
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::Critical,
+        title: format!("SLSA attestation for {target} does not bind to pinned SHA"),
+        detail: format!(
+            "The SLSA attestation on GitHub for {target} references subjects {observed:?} \
+             but we asked for {short_sha}. This mismatch could indicate a tampered \
+             bundle, an attestation moved from a different SHA, or a bug in the \
+             publisher's release pipeline. Investigate before trusting the pinned SHA."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_untrusted_builder_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    builder_id: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::High,
+        title: format!("SLSA attestation for {target} signed by untrusted builder"),
+        detail: format!(
+            "The SLSA attestation for {short_sha} in {target} was emitted by `{builder_id}`, \
+             which is not a GitHub Actions runner identity. This is unusual: GitHub-hosted \
+             runners produce attestations rooted at `https://github.com/actions/...`. \
+             Verify the builder matches what the upstream publisher claims."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_unknown_predicate_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    predicate_type: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::Medium,
+        title: format!("SLSA attestation for {target} uses unknown predicate type"),
+        detail: format!(
+            "The attestation for {short_sha} uses predicateType `{predicate_type}`, not a \
+             recognized SLSA provenance version. hasp can only verify \
+             `https://slsa.dev/provenance/v0.2` and v1 statements."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_malformed_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    msg: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::Medium,
+        title: format!("SLSA attestation for {target} is malformed"),
+        detail: format!(
+            "Attestation bundle for {short_sha} could not be validated: {msg}."
+        ),
+        is_warning,
     }
 }
 
