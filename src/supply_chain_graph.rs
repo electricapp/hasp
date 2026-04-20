@@ -7,6 +7,7 @@
 //! dependencies.
 
 use crate::audit::AuditFinding;
+use crate::github::Api as _;
 use crate::scanner::{ActionRef, RefKind};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -471,10 +472,11 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
         .map(|(p, _)| p.clone())
         .collect();
 
-    // Offline variant: no per-ref online signals. The pinned_full_sha and
-    // findings_here signals drive the score. Users wanting online signals can
-    // chain `hasp --paranoid` -> `hasp tree` in the future.
-    let per_ref_signals: HashMap<RefKey, TrustSignals> = HashMap::new();
+    let per_ref_signals = if args.no_verify {
+        HashMap::new()
+    } else {
+        collect_online_signals(&scan.action_refs)
+    };
 
     let graph = build(&workflow_files, &scan.action_refs, &findings, &per_ref_signals);
 
@@ -495,6 +497,197 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
     }
 
     Ok(())
+}
+
+/// If `GITHUB_TOKEN` is set, query the GitHub API directly (no subprocess
+/// sandbox — `hasp tree` is already inline like `hasp diff`) and populate
+/// `TrustSignals` per unique pinned action ref. Errors are swallowed per-ref
+/// so the tree still renders even if a handful of API calls fail.
+fn collect_online_signals(refs: &[ActionRef]) -> HashMap<RefKey, TrustSignals> {
+    let mut out: HashMap<RefKey, TrustSignals> = HashMap::new();
+    if std::env::var_os("GITHUB_TOKEN").is_none() {
+        return out;
+    }
+
+    // Deduplicate by RefKey and only look up pinned full-SHA refs.
+    let mut keys: Vec<RefKey> = Vec::new();
+    let mut seen: std::collections::HashSet<RefKey> = std::collections::HashSet::new();
+    for r in refs {
+        if r.ref_kind != RefKind::FullSha {
+            continue;
+        }
+        let key = RefKey::from(r);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return out;
+    }
+
+    let client = match build_tree_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hasp tree: online signals unavailable ({e}); rendering offline graph");
+            return out;
+        }
+    };
+
+    // Cache per-repo lookups (repo_info reused across many refs in the same repo).
+    let mut repo_cache: HashMap<(String, String), Option<crate::github::RepoInfo>> =
+        HashMap::new();
+    let now = now_unix_seconds().unwrap_or(0);
+
+    for key in keys {
+        let mut signals = TrustSignals {
+            pinned_full_sha: true,
+            ..TrustSignals::default()
+        };
+
+        signals.sha_exists = client
+            .verify_commit(&key.owner, &key.repo, &key.sha)
+            .ok();
+
+        let repo_info = repo_cache
+            .entry((key.owner.clone(), key.repo.clone()))
+            .or_insert_with(|| client.get_repo_info(&key.owner, &key.repo).ok())
+            .clone();
+        if let Some(info) = repo_info.as_ref() {
+            signals.repo_stars = info.stargazers_count.and_then(|n| u32::try_from(n).ok());
+            if let Some(created_at) = info.created_at.as_deref()
+                && let Some(created_secs) = parse_iso8601_utc(created_at)
+                && now > 0
+            {
+                signals.repo_age_days = Some((now - created_secs) / 86_400);
+            }
+            if signals.sha_exists == Some(true) {
+                signals.reachable = client
+                    .is_commit_reachable(
+                        &key.owner,
+                        &key.repo,
+                        &key.sha,
+                        &info.default_branch,
+                    )
+                    .ok()
+                    .map(|status| matches!(status, crate::github::ReachabilityStatus::Reachable));
+            }
+        }
+
+        if signals.sha_exists == Some(true) {
+            signals.signed = client
+                .is_commit_signed(&key.owner, &key.repo, &key.sha)
+                .ok();
+            if let Ok(Some(date)) = client.get_commit_date(&key.owner, &key.repo, &key.sha)
+                && let Some(commit_secs) = parse_iso8601_utc(&date)
+                && now > 0
+            {
+                signals.commit_age_days = Some((now - commit_secs) / 86_400);
+            }
+            if let Ok(Some(body)) = client.get_attestation(&key.owner, &key.repo, &key.sha) {
+                match crate::github::slsa::verify_attestation_response(&body, &key.sha) {
+                    Ok(crate::github::slsa::AttestationVerdict::Verified { .. }) => {
+                        signals.slsa_verified = Some(true);
+                    }
+                    Ok(_) | Err(_) => {
+                        signals.slsa_verified = Some(false);
+                    }
+                }
+            } else {
+                signals.slsa_verified = Some(false);
+            }
+        }
+
+        out.insert(key, signals);
+    }
+
+    out
+}
+
+fn build_tree_client() -> crate::error::Result<crate::github::Client> {
+    use crate::error::Context as _;
+    use crate::token::SecureToken;
+    let token = SecureToken::from_env("GITHUB_TOKEN")
+        .context("GITHUB_TOKEN must be set for online tree signals")?;
+    let addrs = crate::github::pre_resolve_api()?;
+    crate::github::Client::new_with_call_budget(
+        token,
+        &addrs,
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        // Cap at 500 API calls for a single tree run — enough for ~80 unique
+        // refs (6 calls each) without letting a pathological repo spin.
+        500,
+    )
+}
+
+fn now_unix_seconds() -> crate::error::Result<i64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::error::Context as _;
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock before Unix epoch")?;
+    i64::try_from(dur.as_secs()).context("Unix timestamp overflowed i64")
+}
+
+/// Minimal ISO-8601 parser, re-used from provenance.rs where a richer copy lives.
+/// We don't share it because provenance.rs scopes its impl to `pub(super)`.
+fn parse_iso8601_utc(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || *bytes.last()? != b'Z'
+    {
+        return None;
+    }
+    if bytes[19] != b'Z' && bytes[19] != b'.' {
+        return None;
+    }
+    let year = parse_digits(bytes, 0, 4)?;
+    let month = parse_digits(bytes, 5, 2)?;
+    let day = parse_digits(bytes, 8, 2)?;
+    let hour = parse_digits(bytes, 11, 2)?;
+    let minute = parse_digits(bytes, 14, 2)?;
+    let second = parse_digits(bytes, 17, 2)?;
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn parse_digits(bytes: &[u8], start: usize, len: usize) -> Option<i64> {
+    let mut value = 0_i64;
+    for byte in bytes.get(start..start + len)? {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + i64::from(byte - b'0');
+    }
+    Some(value)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 {
+        return None;
+    }
+    let max_day = match month {
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day > max_day {
+        return None;
+    }
+    let year_adj = year - i64::from(month <= 2);
+    let era = if year_adj >= 0 { year_adj } else { year_adj - 399 } / 400;
+    let yoe = year_adj - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_prime + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
