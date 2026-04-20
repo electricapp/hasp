@@ -82,6 +82,9 @@ pub(super) fn parse_check_config(val: &Yaml) -> Result<CheckConfig> {
             "cross-workflow" => {
                 config.cross_workflow = CheckLevel::parse(yaml_str(value, key_str)?)?;
             }
+            "oidc" => {
+                config.oidc = CheckLevel::parse(yaml_str(value, key_str)?)?;
+            }
             "provenance" => {
                 config.provenance = parse_provenance_config(value)?;
             }
@@ -156,6 +159,9 @@ pub(super) fn parse_partial_checks(val: &Yaml) -> Result<PartialCheckConfig> {
             }
             "cross-workflow" => {
                 config.cross_workflow = Some(CheckLevel::parse(yaml_str(value, key_str)?)?);
+            }
+            "oidc" => {
+                config.oidc = Some(CheckLevel::parse(yaml_str(value, key_str)?)?);
             }
             "provenance" => {
                 config.provenance = Some(parse_partial_provenance(value)?);
