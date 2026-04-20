@@ -5,22 +5,19 @@
 //! findings, and unchanged findings. Output is terse-text, markdown (PR
 //! comment-friendly), or JSON (CI-consumable).
 //!
-//! Unlike the primary `hasp --paranoid` scan, delta mode runs the audit
-//! inline (no multi-process sandbox). The caller must acknowledge this by
-//! passing `--allow-unsandboxed`; otherwise we exit with a usage error and
-//! direct them at `hasp --paranoid`. The workflow integrity check still
-//! runs on both base and HEAD so a prior CI step can't have mutated the
-//! files we're about to compare.
+//! Each scan runs in a separate sandboxed `--internal-scan` subprocess
+//! (Landlock / seccomp / BPF where available), matching the threat model
+//! of the regular `hasp --paranoid` pass. The launcher orchestrates the
+//! two subprocesses, normalizes finding paths to scan-root-relative form
+//! so base/HEAD paths key identically, and computes the delta.
 
-use crate::audit::{self, AuditFinding, Severity};
+use crate::audit::{AuditFinding, Severity};
 use crate::error::{Context, Result, bail};
 use crate::git_util;
-use crate::integrity;
-use crate::policy::Policy;
-use crate::scanner;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffFormat {
@@ -110,27 +107,22 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
         return Ok(());
     }
 
-    // Policy (same policy for both scans).
-    let (policy, _) = Policy::resolve(args, &canonical_dir)?;
+    let exe =
+        std::env::current_exe().context("Cannot resolve current executable path")?;
 
-    // Integrity check on HEAD before we trust its workflow contents.
-    integrity::check_workflow_integrity(&canonical_dir)?;
-    // Both scans normalize finding `file` paths to be relative to the
-    // workflow directory they were scanned from, so identical files in
-    // base and head produce identical keys regardless of where the temp
-    // worktree happened to land.
-    let head_findings = scan_and_audit(&canonical_dir, &canonical_dir, &policy)?;
+    // HEAD scan in a sandboxed --internal-scan subprocess.
+    let mut head_findings = run_internal_scan(&exe, &canonical_dir, args)?.audit_findings;
+    strip_scan_root(&mut head_findings, &canonical_dir);
 
-    // Temp worktree for base. SIGINT/SIGTERM handler installed once.
+    // Base scan in a second sandboxed subprocess against the temp worktree.
     install_signal_cleanup_once();
     let worktree = BaseWorktree::create(&repo_root, &base_sha)?;
     register_cleanup_path(worktree.path(), &worktree.parent, &repo_root);
-    let base_scan_root = worktree.path().join(&relative_dir);
-    let base_findings = if base_scan_root.is_dir() {
-        // Integrity-check the base worktree too: catches files git couldn't
-        // restore (e.g. filesystem corruption) before we trust their content.
-        integrity::check_workflow_integrity(&base_scan_root)?;
-        scan_and_audit(&base_scan_root, &base_scan_root, &policy)?
+    let base_dir = worktree.path().join(&relative_dir);
+    let base_findings = if base_dir.is_dir() {
+        let mut findings = run_internal_scan(&exe, &base_dir, args)?.audit_findings;
+        strip_scan_root(&mut findings, &base_dir);
+        findings
     } else {
         // Base didn't have the workflow dir at all. All head findings are new.
         Vec::new()
@@ -158,41 +150,6 @@ fn emit(delta: &DeltaReport, format: DiffFormat) {
     }
 }
 
-/// Scan and audit `scan_dir`, then normalize every finding's `file` field to
-/// a path relative to `scan_root`. This is what makes diff-mode work: base
-/// and HEAD findings end up keyed on the same logical path even though
-/// they were physically scanned from different locations.
-fn scan_and_audit(scan_dir: &Path, scan_root: &Path, policy: &Policy) -> Result<Vec<AuditFinding>> {
-    let scan = scanner::scan_directory(scan_dir)?;
-    let mut findings = audit::run(&scan.workflow_docs, &scan.action_refs, &policy.checks);
-    if !policy.checks.untrusted_sources.is_off() {
-        let owners = Policy::effective_list(
-            policy.trust.owners.as_ref(),
-            audit::builtin_trusted_owners(),
-        );
-        audit::check_untrusted_sources(
-            &scan.action_refs,
-            &mut findings,
-            policy.checks.untrusted_sources,
-            &owners,
-        );
-    }
-    if !policy.checks.oidc.is_off() {
-        // Diff mode has no CLI `--oidc-policy` surface; acceptances come from
-        // `.hasp.yml` only.
-        let acceptances =
-            crate::oidc::load_policy_acceptances(&[], &policy.oidc_policies, scan_dir);
-        audit::oidc::run(
-            &scan.workflow_docs,
-            &acceptances,
-            &mut findings,
-            policy.checks.oidc,
-        );
-    }
-    strip_scan_root(&mut findings, scan_root);
-    Ok(findings)
-}
-
 /// Strip the (canonicalized) scan-root prefix from every place a path can
 /// hide in a finding — `file`, plus the user-facing `title` / `detail` strings
 /// because some audits (`cross_workflow`, `oidc`) embed `path.display()`
@@ -207,8 +164,6 @@ fn strip_scan_root(findings: &mut [AuditFinding], scan_root: &Path) {
     if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
         prefix.push(std::path::MAIN_SEPARATOR);
     }
-    // Skip text rewriting when the prefix is empty or just a bare separator —
-    // either means canonicalize failed in a way that would replace far too much.
     let strip_text = prefix.len() > 1;
     for f in findings {
         if let Ok(rel) = f.file.strip_prefix(&canonical_root) {
@@ -224,6 +179,7 @@ fn strip_scan_root(findings: &mut [AuditFinding], scan_root: &Path) {
         }
     }
 }
+
 
 fn compute_delta(
     base_ref: &str,
@@ -496,6 +452,55 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ─── Sandboxed scan subprocess ──────────────────────────────────────────────
+
+fn run_internal_scan(
+    exe: &Path,
+    dir: &Path,
+    args: &crate::cli::Args,
+) -> Result<crate::ipc::ScanPayload> {
+    let mut cmd = Command::new(exe);
+    if args.allow_unsandboxed {
+        cmd.arg("--allow-unsandboxed");
+    }
+    if args.paranoid {
+        cmd.arg("--paranoid");
+    }
+    if args.strict {
+        cmd.arg("--strict");
+    }
+    if args.no_policy {
+        cmd.arg("--no-policy");
+    }
+    if let Some(path) = &args.policy_path {
+        cmd.arg("--policy").arg(path);
+    }
+    if args.no_oidc {
+        cmd.arg("--no-oidc");
+    }
+    for (provider, path) in &args.oidc_policies {
+        cmd.arg("--oidc-policy")
+            .arg(format!("{provider}:{}", path.display()));
+    }
+    cmd.arg("--dir").arg(dir);
+    cmd.arg("--internal-scan");
+    cmd.env_clear();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let output = cmd
+        .output()
+        .context("Failed to launch scanner subprocess")?;
+    if !output.status.success() {
+        bail!(
+            "scanner subprocess failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+    crate::ipc::read_scan_payload(output.stdout.as_slice())
 }
 
 // ─── base worktree ──────────────────────────────────────────────────────────
