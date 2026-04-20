@@ -24,24 +24,21 @@
 //! of *what* built the artifact -- even though hasp itself doesn't yet
 //! cryptographically verify the DSSE signature over the payload.
 //!
-//! ## TODO(v2.2): Full cryptographic verification
+//! ## v2.2a (landed): DSSE signature verification
 //!
-//! Two gaps remain before this is *cryptographic* verification rather than
-//! evidence extraction.  Both are also listed in docs/SECURITY.md's
-//! "Known limitations" section.
+//! `verify_dsse_signature` in `slsa.rs` now cryptographically verifies the
+//! envelope's `ECDSA_P256_SHA256` signature against the cert's
+//! `SubjectPublicKeyInfo` via `ring`. A tampered payload or signature
+//! produces `AttestationVerdict::SignatureInvalid` (CRIT finding).
 //!
-//! 1. **DSSE signature verification.**  Parse the envelope's `signatures`
-//!    array, build DSSE v1 PAE (`"DSSEv1" SP len(payloadType) SP
-//!    payloadType SP len(payload) SP payload`), then verify with
-//!    `ring::signature::UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1,
-//!    spki)` using the EC public-key bytes extracted from the cert's
-//!    `SubjectPublicKeyInfo`. Adds `ring` as a direct dep (already
-//!    transitive via rustls).
-//! 2. **Cert-chain validation to Fulcio root.**  Bundle the Fulcio
-//!    production root CA as a PEM literal, use `rustls-webpki` (also
-//!    already transitive) to verify the attestation cert chains to it.
-//!    Without this, `looks_like_fulcio` is only a string match on the
-//!    issuer CN -- trivially spoofable by a crafted cert.
+//! ## TODO(v2.2b): Fulcio cert-chain validation
+//!
+//! `looks_like_fulcio` is still only a string match on the issuer CN --
+//! trivially spoofable by a self-signed cert naming itself
+//! `sigstore-intermediate`. Closing this gap needs `rustls-webpki`
+//! (already a direct dep) to verify the attestation cert chains to the
+//! bundled Fulcio production root. See docs/SECURITY.md for the full
+//! threat model.
 
 use yaml_rust2::Yaml;
 
@@ -75,6 +72,93 @@ pub(crate) fn extract_identity_from_bundle(bundle: &yaml_rust2::yaml::Hash) -> O
     let cert_b64 = first_cert_raw_bytes(material)?;
     let decoded = base64_decode(cert_b64).ok()?;
     parse_cert_identity(&decoded)
+}
+
+/// Extract the uncompressed SEC1-encoded ECDSA P-256 public-key point from
+/// the first cert's `SubjectPublicKeyInfo`. Returns a 65-byte slice starting
+/// with `0x04` (uncompressed marker) followed by X||Y (32+32 bytes).
+///
+/// Only supports ECDSA P-256 — which is what Fulcio issues for GitHub OIDC
+/// certs. Returns `None` for any other curve/algorithm.
+pub(crate) fn extract_spki_ec_point_from_bundle(
+    bundle: &yaml_rust2::yaml::Hash,
+) -> Option<Vec<u8>> {
+    let material = bundle
+        .get(&Yaml::String("verificationMaterial".to_string()))?
+        .as_hash()?;
+    let cert_b64 = first_cert_raw_bytes(material)?;
+    let decoded = base64_decode(cert_b64).ok()?;
+    extract_spki_ec_point(&decoded)
+}
+
+/// Pull `SubjectPublicKeyInfo.subjectPublicKey` bytes out of a cert's DER.
+/// Expects EC P-256 (ecPublicKey OID 1.2.840.10045.2.1 + prime256v1 OID
+/// 1.2.840.10045.3.1.7) and the uncompressed SEC1 form (prefix byte `0x04`).
+pub(crate) fn extract_spki_ec_point(der: &[u8]) -> Option<Vec<u8>> {
+    let outer = read_tlv(der)?;
+    if outer.tag != 0x30 {
+        return None;
+    }
+    let tbs = read_tlv(outer.value)?;
+    if tbs.tag != 0x30 {
+        return None;
+    }
+    let items = walk_sequence(tbs.value);
+    // After optional [0] version: serial, sigAlg, issuer, validity, subject,
+    // SPKI — so SPKI is at index 6 with version present, 5 without.
+    let version_present = items.first().is_some_and(|t| t.tag == 0xA0);
+    let spki_idx = if version_present { 6 } else { 5 };
+    let spki = items.get(spki_idx)?;
+    if spki.tag != 0x30 {
+        return None;
+    }
+    let spki_parts = walk_sequence(spki.value);
+    let alg = spki_parts.first()?;
+    let pubkey_bitstring = spki_parts.get(1)?;
+    if pubkey_bitstring.tag != 0x03 {
+        return None;
+    }
+    if !algorithm_is_ecdsa_p256(alg) {
+        return None;
+    }
+    // BIT STRING: first byte is unused-bits count (must be 0 for byte-aligned
+    // EC points), remainder is the raw SEC1 uncompressed point.
+    let bits = pubkey_bitstring.value;
+    if bits.len() < 2 || bits[0] != 0 {
+        return None;
+    }
+    let point = &bits[1..];
+    // Uncompressed P-256 point is 65 bytes starting with 0x04.
+    if point.len() != 65 || point[0] != 0x04 {
+        return None;
+    }
+    Some(point.to_vec())
+}
+
+/// Accepts the two well-formed DER shapes for an EC P-256 `AlgorithmIdentifier`:
+///   * `SEQUENCE { OID ecPublicKey, OID prime256v1 }`
+///   * `SEQUENCE { OID ecPublicKey }` (parameter elided — rare but valid)
+fn algorithm_is_ecdsa_p256(alg: &Tlv<'_>) -> bool {
+    if alg.tag != 0x30 {
+        return false;
+    }
+    let parts = walk_sequence(alg.value);
+    let Some(oid) = parts.first() else {
+        return false;
+    };
+    // ecPublicKey = 1.2.840.10045.2.1 -> 2A 86 48 CE 3D 02 01
+    if oid.tag != 0x06 || oid.value != [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01] {
+        return false;
+    }
+    if let Some(params) = parts.get(1) {
+        // prime256v1 = 1.2.840.10045.3.1.7 -> 2A 86 48 CE 3D 03 01 07
+        if params.tag != 0x06
+            || params.value != [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn first_cert_raw_bytes(material: &yaml_rust2::yaml::Hash) -> Option<&str> {
