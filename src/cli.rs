@@ -5,6 +5,7 @@ pub(crate) enum Mode {
     Launcher,
     Diff,
     Tree,
+    Replay,
     Exec,
     InternalScan,
     InternalVerify,
@@ -13,6 +14,7 @@ pub(crate) enum Mode {
     InternalBpfHelper,
 }
 
+#[derive(Clone)]
 pub(crate) struct ExecArgs {
     pub(crate) manifest: Option<PathBuf>,
     pub(crate) writable_dirs: Vec<PathBuf>,
@@ -20,6 +22,7 @@ pub(crate) struct ExecArgs {
 }
 
 #[allow(clippy::struct_excessive_bools)] // CLI flags are inherently boolean
+#[derive(Clone)]
 pub(crate) struct Args {
     pub(crate) dir: PathBuf,
     pub(crate) strict: bool,
@@ -38,6 +41,8 @@ pub(crate) struct Args {
     pub(crate) diff_format: Option<crate::diff::DiffFormat>,
     pub(crate) tree_format: Option<crate::supply_chain_graph::TreeFormat>,
     pub(crate) tree_min_score: Option<f32>,
+    pub(crate) replay_since: Option<String>,
+    pub(crate) replay_format: Option<crate::replay::ReplayFormat>,
     pub(crate) mode: Mode,
     pub(crate) exec: Option<ExecArgs>,
 }
@@ -62,6 +67,8 @@ impl Default for Args {
             diff_format: None,
             tree_format: None,
             tree_min_score: None,
+            replay_since: None,
+            replay_format: None,
             mode: Mode::Launcher,
             exec: None,
         }
@@ -89,6 +96,9 @@ pub(crate) fn parse() -> Args {
         }
         if first_arg == "tree" {
             return parse_tree(args, iter);
+        }
+        if first_arg == "replay" {
+            return parse_replay(args, iter);
         }
     }
     // If not a subcommand, re-process the first argument in the normal loop
@@ -407,6 +417,76 @@ fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
         }
     }
     args
+}
+
+fn parse_replay(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+    args.mode = Mode::Replay;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--since" => {
+                args.replay_since = Some(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp replay: --since requires a value (e.g. 30d, 2w)");
+                    std::process::exit(2);
+                }));
+            }
+            "--format" => {
+                let raw = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp replay: --format requires a value (terse|markdown|json)");
+                    std::process::exit(2);
+                });
+                args.replay_format = Some(crate::replay::ReplayFormat::parse(&raw).unwrap_or_else(
+                    |e| {
+                        eprintln!("hasp replay: {e}");
+                        std::process::exit(2);
+                    },
+                ));
+            }
+            "-d" | "--dir" => {
+                args.dir = PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp replay: --dir requires a value");
+                    std::process::exit(2);
+                }));
+            }
+            "-h" | "--help" => {
+                print_replay_help();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("hasp replay: unknown option: {other}");
+                eprintln!("Try 'hasp replay --help' for usage.");
+                std::process::exit(2);
+            }
+        }
+    }
+    args
+}
+
+fn print_replay_help() {
+    println!(
+        "\
+hasp replay {}
+Re-audit the historical states of workflow files over a time window.
+
+USAGE:
+    hasp replay [OPTIONS]
+
+OPTIONS:
+    --since <WINDOW>               How far back to walk [default: 30d]
+                                   Anything `git log --since=` accepts
+                                   (e.g. 30d, 2w, 6h, yesterday)
+    --format terse|markdown|json   Output format [default: terse]
+    -d, --dir <DIR>                Workflow directory [default: .github/workflows]
+    -h, --help                     Print this help
+
+EXIT CODES:
+    0   No past state would have produced a deny-level finding
+    1   At least one past state would have failed today's audit
+
+Uses `git log` to enumerate historical revisions of workflow files and
+re-runs the current audit rules against each past state. Answers:
+\"would today's rules have caught yesterday's problem?\".",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn print_tree_help() {

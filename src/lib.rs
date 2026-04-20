@@ -35,6 +35,7 @@ pub(crate) mod netguard;
 pub(crate) mod oidc;
 pub(crate) mod policy;
 pub(crate) mod proxy;
+pub(crate) mod replay;
 pub(crate) mod report;
 pub(crate) mod sandbox;
 pub(crate) mod scanner;
