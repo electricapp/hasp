@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub(crate) enum Mode {
     Launcher,
     Diff,
+    Tree,
     Exec,
     InternalScan,
     InternalVerify,
@@ -35,6 +36,8 @@ pub(crate) struct Args {
     pub(crate) oidc_policies: Vec<(String, PathBuf)>,
     pub(crate) no_oidc: bool,
     pub(crate) diff_format: Option<crate::diff::DiffFormat>,
+    pub(crate) tree_format: Option<crate::supply_chain_graph::TreeFormat>,
+    pub(crate) tree_min_score: Option<f32>,
     pub(crate) mode: Mode,
     pub(crate) exec: Option<ExecArgs>,
 }
@@ -57,6 +60,8 @@ impl Default for Args {
             oidc_policies: Vec::new(),
             no_oidc: false,
             diff_format: None,
+            tree_format: None,
+            tree_min_score: None,
             mode: Mode::Launcher,
             exec: None,
         }
@@ -81,6 +86,9 @@ pub(crate) fn parse() -> Args {
         }
         if first_arg == "diff" {
             return parse_diff(args, iter);
+        }
+        if first_arg == "tree" {
+            return parse_tree(args, iter);
         }
     }
     // If not a subcommand, re-process the first argument in the normal loop
@@ -347,6 +355,83 @@ fn parse_duration(raw: &str) -> Option<i64> {
         _ => return None,
     };
     value.checked_mul(multiplier)
+}
+
+fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+    args.mode = Mode::Tree;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--format" => {
+                let raw = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp tree: --format requires a value (ascii|json)");
+                    std::process::exit(2);
+                });
+                let format = crate::supply_chain_graph::TreeFormat::parse(&raw)
+                    .unwrap_or_else(|e| {
+                        eprintln!("hasp tree: {e}");
+                        std::process::exit(2);
+                    });
+                args.tree_format = Some(format);
+            }
+            "--min-score" => {
+                let raw = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp tree: --min-score requires a value (0.0-1.0)");
+                    std::process::exit(2);
+                });
+                let parsed: f32 = raw.parse().unwrap_or_else(|_| {
+                    eprintln!("hasp tree: --min-score must be a number between 0.0 and 1.0");
+                    std::process::exit(2);
+                });
+                if !(0.0..=1.0).contains(&parsed) {
+                    eprintln!("hasp tree: --min-score must be between 0.0 and 1.0");
+                    std::process::exit(2);
+                }
+                args.tree_min_score = Some(parsed);
+            }
+            "-d" | "--dir" => {
+                args.dir = PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp tree: --dir requires a value");
+                    std::process::exit(2);
+                }));
+            }
+            "--allow-unsandboxed" => args.allow_unsandboxed = true,
+            "-h" | "--help" => {
+                print_tree_help();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("hasp tree: unknown option: {other}");
+                eprintln!("Try 'hasp tree --help' for usage.");
+                std::process::exit(2);
+            }
+        }
+    }
+    args
+}
+
+fn print_tree_help() {
+    println!(
+        "\
+hasp tree {}
+Emit a scored supply-chain dependency graph for the repo's workflows.
+
+USAGE:
+    hasp tree [OPTIONS]
+
+OPTIONS:
+    --format ascii|json            Output format [default: ascii]
+    --min-score <SCORE>            Fail with exit 1 if any root score is
+                                   below this threshold (0.0-1.0)
+    -d, --dir <DIR>                Workflow directory [default: .github/workflows]
+        --allow-unsandboxed        Skip sandbox preflight (dev mode)
+    -h, --help                     Print this help
+
+EXAMPLE:
+    hasp tree
+    hasp tree --format json | jq '.nodes[] | select(.score < 0.5)'
+    hasp tree --min-score 0.6",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn print_diff_help() {
