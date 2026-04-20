@@ -503,6 +503,12 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
 /// sandbox — `hasp tree` is already inline like `hasp diff`) and populate
 /// `TrustSignals` per unique pinned action ref. Errors are swallowed per-ref
 /// so the tree still renders even if a handful of API calls fail.
+///
+/// TODO(v2.7): No hermetic unit test covers this path today — it requires
+/// either a live `GITHUB_TOKEN` or a mock `Api` trait fixture. A test-only
+/// `MockApi` implementation (see `src/github/provenance.rs` tests for the
+/// pattern) would let this logic be tested without network. Listed in
+/// docs/SECURITY.md under "Known limitations → Tree online signals".
 fn collect_online_signals(refs: &[ActionRef]) -> HashMap<RefKey, TrustSignals> {
     let mut out: HashMap<RefKey, TrustSignals> = HashMap::new();
     if std::env::var_os("GITHUB_TOKEN").is_none() {
