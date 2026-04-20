@@ -38,38 +38,91 @@
 //! (`data/fulcio/intermediate_v1.pem`). Issuer DN is matched
 //! byte-for-byte against the bundled intermediate's Subject DN, and the
 //! leaf's `ECDSA_P384_SHA384` signature is verified against the
-//! intermediate's public key. A forgery needs Sigstore's intermediate
-//! private key to pass -- string spoofing `sigstore-intermediate` as a
-//! CN no longer works. Chain verification is not extended to the Fulcio
-//! root: see docs/SECURITY.md for the full threat model.
+//! intermediate's public key.
+//!
+//! ## v2.2c (landed): Intermediate-to-root chain validation
+//!
+//! `load_verified_intermediate` runs once at first use and refuses to
+//! trust the bundled intermediate unless its signature verifies against
+//! the bundled Fulcio root (`data/fulcio/root_v1.pem`). A tampered
+//! intermediate in the source tree is caught here -- hasp falls back to
+//! `ChainVerdict::Malformed` for every attestation rather than trusting
+//! it silently. This closes the chain: leaf → intermediate → root, all
+//! verified cryptographically via `ring::signature::ECDSA_P384_SHA384`
+//! at the root/intermediate tier and `ECDSA_P256_SHA256` at leaves.
 
 use std::sync::OnceLock;
 use yaml_rust2::Yaml;
 
-// ─── Bundled Fulcio intermediate ────────────────────────────────────────────
+// ─── Bundled Fulcio root + intermediate ─────────────────────────────────────
 //
-// Sigstore public-good Fulcio intermediate-v1, fetched from
-// https://github.com/sigstore/root-signing/raw/main/targets/fulcio_intermediate_v1.crt.pem
-// (stored at data/fulcio/intermediate_v1.pem in the source tree).
+// Sigstore public-good Fulcio v1, fetched from
+//   https://github.com/sigstore/root-signing/raw/main/targets/fulcio_v1.crt.pem
+//   https://github.com/sigstore/root-signing/raw/main/targets/fulcio_intermediate_v1.crt.pem
+// (stored at data/fulcio/{root,intermediate}_v1.pem in the source tree).
 //
-// This is a P-384 signing cert issued by the public-good Fulcio root. All
-// attestations minted by GitHub Actions against Sigstore public-good are
-// signed by a Fulcio-issued leaf whose issuer is this intermediate.
+// Both are P-384 signing certs. The intermediate is cryptographically
+// verified against the root at first use; if the check fails, hasp refuses
+// to do any chain validation (the intermediate is treated as malformed).
+// This closes the v2.2c gap: an attacker who tampers with the bundled
+// intermediate but not the root is caught at load time.
 //
-// Rotate by replacing the PEM file and shipping a new hasp release -- the
-// intermediate's validity window runs until 2031-10-05.
+// Rotation: both certs are valid through 2031-10-05. Rotate by replacing
+// the PEM files and shipping a new hasp release.
+const FULCIO_ROOT_V1_PEM: &str = include_str!("../../data/fulcio/root_v1.pem");
 const FULCIO_INTERMEDIATE_V1_PEM: &str =
     include_str!("../../data/fulcio/intermediate_v1.pem");
 
-fn fulcio_intermediate_der() -> &'static [u8] {
+fn fulcio_root_der() -> &'static [u8] {
     static DER: OnceLock<Vec<u8>> = OnceLock::new();
-    DER.get_or_init(|| pem_to_der(FULCIO_INTERMEDIATE_V1_PEM).expect("bundled PEM must decode"))
+    DER.get_or_init(|| pem_to_der(FULCIO_ROOT_V1_PEM).expect("bundled root PEM must decode"))
 }
 
+fn fulcio_intermediate_der() -> &'static [u8] {
+    static DER: OnceLock<Vec<u8>> = OnceLock::new();
+    DER.get_or_init(|| {
+        pem_to_der(FULCIO_INTERMEDIATE_V1_PEM).expect("bundled intermediate PEM must decode")
+    })
+}
+
+/// Returns the bundled intermediate's SPKI + Subject *only if* the
+/// intermediate's signature verifies against the bundled root's public key.
+/// A mismatch returns `None`, which surfaces as `ChainVerdict::Malformed`
+/// to every caller — hasp fails closed rather than trusting a tampered
+/// intermediate.
 fn fulcio_intermediate_spki() -> Option<&'static FulcioSpki> {
     static SPKI: OnceLock<Option<FulcioSpki>> = OnceLock::new();
-    SPKI.get_or_init(|| extract_intermediate_spki(fulcio_intermediate_der()))
-        .as_ref()
+    SPKI.get_or_init(load_verified_intermediate).as_ref()
+}
+
+fn load_verified_intermediate() -> Option<FulcioSpki> {
+    let root_spki = extract_intermediate_spki(fulcio_root_der())?;
+    let intermediate_der = fulcio_intermediate_der();
+    let (int_tbs, int_sig, int_issuer) = extract_signed_parts(intermediate_der)?;
+
+    // Sigstore's root is self-signed, so the intermediate's issuer DN must
+    // match the root's Subject DN byte-for-byte.
+    if int_issuer != root_spki.subject {
+        eprintln!(
+            "hasp: error: bundled Fulcio intermediate issuer DN does not match bundled \
+             Fulcio root Subject DN -- intermediate will not be trusted"
+        );
+        return None;
+    }
+
+    let verifier = ring::signature::UnparsedPublicKey::new(
+        &ring::signature::ECDSA_P384_SHA384_ASN1,
+        &root_spki.point,
+    );
+    if verifier.verify(&int_tbs, &int_sig).is_err() {
+        eprintln!(
+            "hasp: error: bundled Fulcio intermediate signature did not verify against \
+             bundled Fulcio root -- intermediate will not be trusted"
+        );
+        return None;
+    }
+
+    extract_intermediate_spki(intermediate_der)
 }
 
 #[derive(Debug, Clone)]
@@ -694,6 +747,39 @@ mod tests {
         assert_eq!(spki.point.len(), 97);
         assert_eq!(spki.point[0], 0x04);
         assert!(!spki.subject.is_empty());
+    }
+
+    #[test]
+    fn bundled_root_is_self_signed_and_p384() {
+        let der = fulcio_root_der();
+        assert!(!der.is_empty(), "bundled root PEM must decode");
+        let spki = extract_intermediate_spki(der).expect("bundled root SPKI must parse");
+        assert_eq!(spki.point.len(), 97, "root pubkey is P-384");
+        assert_eq!(spki.point[0], 0x04);
+        // Self-signed: issuer DN == subject DN + signature verifies against
+        // own pubkey (i.e. the root is its own trust anchor).
+        let (tbs, sig, issuer) = extract_signed_parts(der).expect("root should parse");
+        assert_eq!(issuer, spki.subject, "root issuer DN == subject DN");
+        let verifier = ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P384_SHA384_ASN1,
+            &spki.point,
+        );
+        verifier
+            .verify(&tbs, &sig)
+            .expect("root must be self-signed");
+    }
+
+    #[test]
+    fn intermediate_verifies_against_bundled_root() {
+        // This is the v2.2c end-to-end assertion: the bundled intermediate
+        // must cryptographically chain to the bundled root. If this fails,
+        // `fulcio_intermediate_spki()` returns None and every call to
+        // `verify_chain_to_fulcio` surfaces Malformed.
+        let loaded = load_verified_intermediate();
+        assert!(
+            loaded.is_some(),
+            "bundled intermediate must verify against bundled root"
+        );
     }
 
     #[test]
