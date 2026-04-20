@@ -16,6 +16,7 @@ mod report;
 mod sandbox;
 mod scanner;
 mod selfcheck;
+mod supply_chain_graph;
 mod token;
 
 #[global_allocator]
@@ -61,6 +62,7 @@ fn run() -> Result<()> {
     match args.mode {
         Mode::Launcher => run_launcher(&args),
         Mode::Diff => diff::run(&args),
+        Mode::Tree => supply_chain_graph::run_tree(&args),
         Mode::Exec => exec::run_exec(&args),
         Mode::InternalScan => run_internal_scan(&args),
         Mode::InternalVerify => run_internal_verify(&args),

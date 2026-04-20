@@ -39,6 +39,7 @@ pub(crate) mod report;
 pub(crate) mod sandbox;
 pub(crate) mod scanner;
 pub(crate) mod selfcheck;
+pub(crate) mod supply_chain_graph;
 pub(crate) mod token;
 
 /// Fuzz-only re-exports. Only compiled when the fuzz harness crate enables
