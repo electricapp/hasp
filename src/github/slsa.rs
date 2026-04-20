@@ -55,9 +55,16 @@ const TRUSTED_BUILDER_PREFIXES: &[&str] =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AttestationVerdict {
     /// Attestation exists, subject binds to the pinned SHA, builder is trusted.
+    ///
+    /// `signer_identity` is populated when the bundle carries
+    /// verification-material with an x509 cert we can structurally parse.
+    /// This is *evidence* extracted from the cert -- hasp does not yet
+    /// cryptographically verify the DSSE signature over the payload or the
+    /// cert chain to the Fulcio root (see docs/SECURITY.md for the gap).
     Verified {
         workflow_ref: Option<String>,
         builder_id: String,
+        signer_identity: Option<super::sigstore::SignerIdentity>,
     },
     /// No attestation was present for this SHA.
     Missing,
@@ -70,6 +77,12 @@ pub(crate) enum AttestationVerdict {
     UntrustedBuilder { builder_id: String },
     /// Attestation exists but the predicateType isn't SLSA v0.2 or v1.
     UnknownPredicate { predicate_type: String },
+    /// Attestation cert was issued by a CA we don't recognise as Fulcio-shaped.
+    /// Carries the best-effort extracted identity so callers can diagnose.
+    UntrustedIssuer {
+        issuer_cn: String,
+        subject_uri: Option<String>,
+    },
     /// We couldn't parse the attestation bundle. Carries the parse error.
     MalformedAttestation(String),
 }
@@ -147,10 +160,33 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
         return Ok(AttestationVerdict::UntrustedBuilder { builder_id });
     }
 
+    // Evidence layer (v2.1): pull the signer identity from the cert if present.
+    let signer_identity = attestation
+        .as_hash()
+        .and_then(|m| m.get(&Yaml::String("bundle".to_string())))
+        .and_then(Yaml::as_hash)
+        .and_then(super::sigstore::extract_identity_from_bundle);
+
+    // If we have a cert and its issuer clearly isn't Fulcio-shaped, treat
+    // that as a distinct verdict rather than lumping it into `Verified`.
+    if let Some(identity) = signer_identity.as_ref()
+        && identity.issuer_cn.is_some()
+        && !identity.looks_like_fulcio()
+    {
+        return Ok(AttestationVerdict::UntrustedIssuer {
+            issuer_cn: identity
+                .issuer_cn
+                .clone()
+                .unwrap_or_default(),
+            subject_uri: identity.subject_uri.clone(),
+        });
+    }
+
     let workflow_ref = extract_workflow_ref(statement_map);
     Ok(AttestationVerdict::Verified {
         workflow_ref,
         builder_id,
+        signer_identity,
     })
 }
 
@@ -343,6 +379,7 @@ mod tests {
         if let AttestationVerdict::Verified {
             workflow_ref,
             builder_id,
+            signer_identity: _,
         } = verdict
         {
             assert!(builder_id.starts_with("https://github.com/actions/runner/"));
