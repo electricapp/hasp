@@ -31,6 +31,8 @@ pub(crate) struct Args {
     pub(crate) no_policy: bool,
     pub(crate) max_transitive_depth: u8,
     pub(crate) diff_base: Option<String>,
+    pub(crate) oidc_policies: Vec<(String, PathBuf)>,
+    pub(crate) no_oidc: bool,
     pub(crate) mode: Mode,
     pub(crate) exec: Option<ExecArgs>,
 }
@@ -50,6 +52,8 @@ impl Default for Args {
             no_policy: false,
             max_transitive_depth: 3,
             diff_base: None,
+            oidc_policies: Vec::new(),
+            no_oidc: false,
             mode: Mode::Launcher,
             exec: None,
         }
@@ -130,6 +134,7 @@ fn parse_exec(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
     args
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_scanner_args(args: &mut Args, mut iter: impl Iterator<Item = String>) {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -187,6 +192,27 @@ fn parse_scanner_args(args: &mut Args, mut iter: impl Iterator<Item = String>) {
                     std::process::exit(2);
                 }));
             }
+            "--oidc-policy" => {
+                let raw = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp: --oidc-policy requires a value like aws:./trust.json");
+                    std::process::exit(2);
+                });
+                let Some((provider, path)) = raw.split_once(':') else {
+                    eprintln!(
+                        "hasp: --oidc-policy expects <provider>:<path>, got {raw:?}"
+                    );
+                    std::process::exit(2);
+                };
+                if provider.is_empty() || path.is_empty() {
+                    eprintln!(
+                        "hasp: --oidc-policy expects <provider>:<path>, got {raw:?}"
+                    );
+                    std::process::exit(2);
+                }
+                args.oidc_policies
+                    .push((provider.to_string(), PathBuf::from(path)));
+            }
+            "--no-oidc" => args.no_oidc = true,
             "--self-check" => args.self_check = true,
             "--allow-unsandboxed" => args.allow_unsandboxed = true,
             "--internal-scan" => args.mode = Mode::InternalScan,

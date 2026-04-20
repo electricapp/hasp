@@ -1,4 +1,9 @@
-#![allow(clippy::tests_outside_test_module, clippy::unwrap_used)]
+#![allow(
+    clippy::tests_outside_test_module,
+    clippy::unwrap_used,
+    clippy::doc_markdown,
+    clippy::needless_raw_strings
+)]
 //! Cross-workflow taint analysis: artifact flows from untrusted triggers to
 //! privileged workflow_run sinks (tj-actions / Ultralytics pattern), unguarded
 //! workflow_run triggers, and attacker-controlled workflow_run event reads.
