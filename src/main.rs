@@ -1,5 +1,6 @@
 mod audit;
 mod cli;
+mod diff;
 mod error;
 mod exec;
 mod forward_proxy;
@@ -59,6 +60,7 @@ fn run() -> Result<()> {
 
     match args.mode {
         Mode::Launcher => run_launcher(&args),
+        Mode::Diff => diff::run(&args),
         Mode::Exec => exec::run_exec(&args),
         Mode::InternalScan => run_internal_scan(&args),
         Mode::InternalVerify => run_internal_verify(&args),
