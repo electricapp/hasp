@@ -1,5 +1,6 @@
 mod cross_workflow;
 mod injection;
+pub(crate) mod oidc;
 mod permissions;
 mod supply_chain;
 mod triggers;
