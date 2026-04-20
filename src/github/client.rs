@@ -91,6 +91,14 @@ pub(crate) trait Api {
         base: &str,
         head: &str,
     ) -> Result<CompareResult>;
+    /// Fetch the raw attestation response body from GitHub for `{owner}/{repo}@{sha}`.
+    /// Returns `Ok(None)` when no attestations exist (404). Called rarely — only
+    /// when the SLSA audit is enabled — so it's acceptable to pay a full round-trip.
+    ///
+    /// Default impl returns `Ok(None)` so existing test mocks don't need updating.
+    fn get_attestation(&self, _owner: &str, _repo: &str, _sha: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -591,6 +599,30 @@ impl Client {
         Ok(None)
     }
 
+    /// Fetch raw attestation envelope JSON from GitHub.
+    /// Uses a higher body cap than the default (256 KiB) because SLSA bundles
+    /// are multi-KB each and a repo may have several attestations per SHA.
+    pub(crate) fn get_attestation(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Option<String>> {
+        const MAX_ATTESTATION_BYTES: u64 = 256 * 1024;
+        let url = api_url(&format!("repos/{owner}/{repo}/attestations/{sha}"));
+        let resp = match self.get(&url)?.call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(404, _)) => return Ok(None),
+            Err(e) => bail!("GitHub API error fetching attestation for {owner}/{repo}@{sha}: {e}"),
+        };
+        let mut buf = String::new();
+        resp.into_reader()
+            .take(MAX_ATTESTATION_BYTES)
+            .read_to_string(&mut buf)
+            .context("Failed to read attestation response body")?;
+        Ok(Some(buf))
+    }
+
     fn get_commit_metadata(
         &self,
         owner: &str,
@@ -841,5 +873,12 @@ impl Api for Client {
         validate_sha_param(base)?;
         validate_sha_param(head)?;
         Self::compare_commits(self, owner, repo, base, head)
+    }
+
+    fn get_attestation(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
+        validate_component(owner, "owner")?;
+        validate_component(repo, "repo")?;
+        validate_sha_param(sha)?;
+        Self::get_attestation(self, owner, repo, sha)
     }
 }

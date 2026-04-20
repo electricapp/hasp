@@ -30,6 +30,7 @@ pub(super) const KNOWN_CHECK_NAMES: &[&str] = &[
     "recent-repo",
     "transitive",
     "hidden-execution",
+    "slsa-attestation",
 ];
 
 // ─── Check level ─────────────────────────────────────────────────────────────
@@ -102,6 +103,7 @@ pub(crate) struct ProvenanceCheckConfig {
     pub(crate) recent_repo: CheckLevel,
     pub(crate) transitive: CheckLevel,
     pub(crate) hidden_execution: CheckLevel,
+    pub(crate) slsa_attestation: CheckLevel,
 }
 
 impl Default for ProvenanceCheckConfig {
@@ -115,6 +117,10 @@ impl Default for ProvenanceCheckConfig {
             recent_repo: CheckLevel::Deny,
             transitive: CheckLevel::Deny,
             hidden_execution: CheckLevel::Deny,
+            // Default Warn: when the SLSA audit is enabled, a missing
+            // attestation for a known-good action (like actions/checkout)
+            // should warn, not block — many actions haven't adopted SLSA yet.
+            slsa_attestation: CheckLevel::Warn,
         }
     }
 }
@@ -185,6 +191,7 @@ pub(super) struct PartialProvenanceConfig {
     pub(super) recent_repo: Option<CheckLevel>,
     pub(super) transitive: Option<CheckLevel>,
     pub(super) hidden_execution: Option<CheckLevel>,
+    pub(super) slsa_attestation: Option<CheckLevel>,
 }
 
 // ─── Trust configuration ─────────────────────────────────────────────────────
@@ -614,6 +621,7 @@ impl Policy {
             || !c.provenance.recent_repo.is_off()
             || !c.provenance.transitive.is_off()
             || !c.provenance.hidden_execution.is_off()
+            || !c.provenance.slsa_attestation.is_off()
     }
 
     /// Returns true if any provenance sub-check is enabled.
@@ -627,6 +635,7 @@ impl Policy {
             || !p.recent_repo.is_off()
             || !p.transitive.is_off()
             || !p.hidden_execution.is_off()
+            || !p.slsa_attestation.is_off()
     }
 
     /// Returns true if the policy has any suppressions configured.
@@ -805,6 +814,12 @@ pub(crate) fn detect_policy_drift(old: &Policy, new: &Policy) -> Vec<PolicyDrift
         "provenance.hidden-execution",
         old.checks.provenance.hidden_execution,
         new.checks.provenance.hidden_execution,
+    );
+    drift_check(
+        &mut drifts,
+        "provenance.slsa-attestation",
+        old.checks.provenance.slsa_attestation,
+        new.checks.provenance.slsa_attestation,
     );
 
     // Suppressions added
@@ -1032,6 +1047,11 @@ fn apply_partial_checks(full: &mut CheckConfig, partial: &PartialCheckConfig) {
             prov.hidden_execution,
             "hidden-execution",
         );
+        apply_level(
+            &mut full.provenance.slsa_attestation,
+            prov.slsa_attestation,
+            "slsa-attestation",
+        );
     }
 }
 
@@ -1056,6 +1076,7 @@ const fn set_all_checks_deny(checks: &mut CheckConfig) {
     checks.provenance.recent_repo = CheckLevel::Deny;
     checks.provenance.transitive = CheckLevel::Deny;
     checks.provenance.hidden_execution = CheckLevel::Deny;
+    checks.provenance.slsa_attestation = CheckLevel::Deny;
 }
 
 /// Map a finding title to its policy check name for suppression matching.
@@ -1154,6 +1175,12 @@ pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
     // "Action `...` contains hidden execution paths"
     if title.contains("hidden execution") {
         return "hidden-execution";
+    }
+
+    // SLSA attestation: "No SLSA attestation ...", "SLSA attestation tampered",
+    // "SLSA attestation signed by untrusted builder", etc.
+    if title.contains("SLSA attestation") {
+        return "slsa-attestation";
     }
 
     // ── Broader patterns (checked after specific ones) ──────────────────
