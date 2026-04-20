@@ -22,6 +22,7 @@ pub(super) const KNOWN_CHECK_NAMES: &[&str] = &[
     "untrusted-sources",
     "cross-workflow",
     "oidc",
+    "external-artifacts",
     "reachability",
     "signatures",
     "fresh-commit",
@@ -139,6 +140,7 @@ pub(crate) struct CheckConfig {
     pub(crate) untrusted_sources: CheckLevel,
     pub(crate) cross_workflow: CheckLevel,
     pub(crate) oidc: CheckLevel,
+    pub(crate) external_artifacts: CheckLevel,
     pub(crate) provenance: ProvenanceCheckConfig,
 }
 
@@ -157,6 +159,7 @@ impl Default for CheckConfig {
             untrusted_sources: CheckLevel::Warn,
             cross_workflow: CheckLevel::Deny,
             oidc: CheckLevel::Deny,
+            external_artifacts: CheckLevel::Deny,
             provenance: ProvenanceCheckConfig::default(),
         }
     }
@@ -178,6 +181,7 @@ pub(super) struct PartialCheckConfig {
     pub(super) untrusted_sources: Option<CheckLevel>,
     pub(super) cross_workflow: Option<CheckLevel>,
     pub(super) oidc: Option<CheckLevel>,
+    pub(super) external_artifacts: Option<CheckLevel>,
     pub(super) provenance: Option<PartialProvenanceConfig>,
 }
 
@@ -613,6 +617,7 @@ impl Policy {
             || !c.untrusted_sources.is_off()
             || !c.cross_workflow.is_off()
             || !c.oidc.is_off()
+            || !c.external_artifacts.is_off()
             || !c.provenance.reachability.is_off()
             || !c.provenance.signatures.is_off()
             || !c.provenance.fresh_commit.is_off()
@@ -765,6 +770,12 @@ pub(crate) fn detect_policy_drift(old: &Policy, new: &Policy) -> Vec<PolicyDrift
         new.checks.cross_workflow,
     );
     drift_check(&mut drifts, "oidc", old.checks.oidc, new.checks.oidc);
+    drift_check(
+        &mut drifts,
+        "external-artifacts",
+        old.checks.external_artifacts,
+        new.checks.external_artifacts,
+    );
 
     // Provenance sub-checks
     drift_check(
@@ -954,6 +965,13 @@ fn apply_level(full: &mut CheckLevel, partial: Option<CheckLevel>, name: &str) {
 }
 
 fn apply_partial_checks(full: &mut CheckConfig, partial: &PartialCheckConfig) {
+    apply_top_level_partial(full, partial);
+    if let Some(prov) = &partial.provenance {
+        apply_provenance_partial(&mut full.provenance, prov);
+    }
+}
+
+fn apply_top_level_partial(full: &mut CheckConfig, partial: &PartialCheckConfig) {
     apply_level(
         &mut full.expression_injection,
         partial.expression_injection,
@@ -1006,53 +1024,27 @@ fn apply_partial_checks(full: &mut CheckConfig, partial: &PartialCheckConfig) {
         "cross-workflow",
     );
     apply_level(&mut full.oidc, partial.oidc, "oidc");
-    if let Some(prov) = &partial.provenance {
-        apply_level(
-            &mut full.provenance.reachability,
-            prov.reachability,
-            "reachability",
-        );
-        apply_level(
-            &mut full.provenance.signatures,
-            prov.signatures,
-            "signatures",
-        );
-        apply_level(
-            &mut full.provenance.fresh_commit,
-            prov.fresh_commit,
-            "fresh-commit",
-        );
-        apply_level(
-            &mut full.provenance.tag_age_gap,
-            prov.tag_age_gap,
-            "tag-age-gap",
-        );
-        apply_level(
-            &mut full.provenance.repo_reputation,
-            prov.repo_reputation,
-            "repo-reputation",
-        );
-        apply_level(
-            &mut full.provenance.recent_repo,
-            prov.recent_repo,
-            "recent-repo",
-        );
-        apply_level(
-            &mut full.provenance.transitive,
-            prov.transitive,
-            "transitive",
-        );
-        apply_level(
-            &mut full.provenance.hidden_execution,
-            prov.hidden_execution,
-            "hidden-execution",
-        );
-        apply_level(
-            &mut full.provenance.slsa_attestation,
-            prov.slsa_attestation,
-            "slsa-attestation",
-        );
-    }
+    apply_level(
+        &mut full.external_artifacts,
+        partial.external_artifacts,
+        "external-artifacts",
+    );
+}
+
+fn apply_provenance_partial(full: &mut ProvenanceCheckConfig, prov: &PartialProvenanceConfig) {
+    apply_level(&mut full.reachability, prov.reachability, "reachability");
+    apply_level(&mut full.signatures, prov.signatures, "signatures");
+    apply_level(&mut full.fresh_commit, prov.fresh_commit, "fresh-commit");
+    apply_level(&mut full.tag_age_gap, prov.tag_age_gap, "tag-age-gap");
+    apply_level(&mut full.repo_reputation, prov.repo_reputation, "repo-reputation");
+    apply_level(&mut full.recent_repo, prov.recent_repo, "recent-repo");
+    apply_level(&mut full.transitive, prov.transitive, "transitive");
+    apply_level(&mut full.hidden_execution, prov.hidden_execution, "hidden-execution");
+    apply_level(
+        &mut full.slsa_attestation,
+        prov.slsa_attestation,
+        "slsa-attestation",
+    );
 }
 
 const fn set_all_checks_deny(checks: &mut CheckConfig) {
@@ -1068,6 +1060,7 @@ const fn set_all_checks_deny(checks: &mut CheckConfig) {
     checks.untrusted_sources = CheckLevel::Deny;
     checks.cross_workflow = CheckLevel::Deny;
     checks.oidc = CheckLevel::Deny;
+    checks.external_artifacts = CheckLevel::Deny;
     checks.provenance.reachability = CheckLevel::Deny;
     checks.provenance.signatures = CheckLevel::Deny;
     checks.provenance.fresh_commit = CheckLevel::Deny;
@@ -1098,6 +1091,11 @@ pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
     // OIDC: "OIDC trust policy (aws/gcp/azure) ..."
     if title.starts_with("OIDC trust policy") {
         return "oidc";
+    }
+
+    // External artifacts: "Unpinned external artifact download ..."
+    if title.starts_with("Unpinned external artifact download") {
+        return "external-artifacts";
     }
 
     // "Privileged checkout of attacker code in ..."
