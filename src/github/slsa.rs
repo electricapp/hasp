@@ -87,6 +87,10 @@ pub(crate) enum AttestationVerdict {
     /// Attestation's DSSE ECDSA signature does not verify against the
     /// cert's public key. This is the strongest tampering signal.
     SignatureInvalid { reason: String },
+    /// The attestation cert does not chain to the bundled Sigstore
+    /// public-good Fulcio intermediate. Either from a private Fulcio
+    /// instance (extend the trust list) or a forgery attempt.
+    ChainInvalid { reason: String },
     /// We couldn't parse the attestation bundle. Carries the parse error.
     MalformedAttestation(String),
 }
@@ -186,9 +190,9 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
         });
     }
 
-    // DSSE signature verification (v2.2a). Verifies the envelope's signature
-    // against the cert's EC public key. Does NOT verify the cert chains to
-    // the Fulcio root -- that's the v2.2b layer below.
+    // DSSE signature verification (v2.2a) runs before chain validation so a
+    // tampered payload is flagged even when the chain is also bogus. Either
+    // failure short-circuits with the most specific verdict.
     let signature_verified = match verify_dsse_signature(bundle) {
         DsseResult::Verified => Some(true),
         DsseResult::NotAttempted => None,
@@ -196,6 +200,31 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
             return Ok(AttestationVerdict::SignatureInvalid { reason });
         }
     };
+
+    // Chain validation (v2.2b): verify leaf was signed by bundled Fulcio intermediate.
+    if let Some(bundle_map) = bundle {
+        match super::sigstore::verify_chain_to_fulcio(bundle_map) {
+            super::sigstore::ChainVerdict::VerifiedAgainstFulcio
+            | super::sigstore::ChainVerdict::NoMaterial => {}
+            super::sigstore::ChainVerdict::IssuerMismatch => {
+                return Ok(AttestationVerdict::ChainInvalid {
+                    reason: "leaf cert issuer does not match bundled Sigstore \
+                             public-good Fulcio intermediate"
+                        .to_string(),
+                });
+            }
+            super::sigstore::ChainVerdict::SignatureInvalid => {
+                return Ok(AttestationVerdict::ChainInvalid {
+                    reason: "leaf cert's signature does not verify against bundled \
+                             Sigstore public-good Fulcio intermediate"
+                        .to_string(),
+                });
+            }
+            super::sigstore::ChainVerdict::Malformed(msg) => {
+                return Ok(AttestationVerdict::MalformedAttestation(msg));
+            }
+        }
+    }
 
     let workflow_ref = extract_workflow_ref(statement_map);
     Ok(AttestationVerdict::Verified {
@@ -206,6 +235,7 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
     })
 }
 
+#[derive(Debug)]
 enum DsseResult {
     Verified,
     /// Bundle lacks crypto material (e.g. legacy shape with no cert) so we
@@ -553,8 +583,11 @@ mod tests {
     fn verifies_real_dsse_signature_end_to_end() {
         // Generate a live ECDSA P-256 keypair with ring, sign a real DSSE
         // PAE over the attestation payload, wrap the pubkey in a synthetic
-        // x509 cert, and assert the full verifier reports Verified with
-        // signature_verified = Some(true).
+        // x509 cert. The synthetic cert can't pass chain-to-Fulcio
+        // validation (no real Fulcio private key at test time), so the
+        // top-level verdict is `ChainInvalid`. The DSSE signature itself
+        // *does* verify — we assert that by calling `verify_dsse_signature`
+        // directly against the same bundle.
         use base64::{Engine, engine::general_purpose::STANDARD};
         use ring::rand::SystemRandom;
         use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
@@ -572,7 +605,6 @@ mod tests {
         assert_eq!(pubkey_sec1.len(), 65, "SEC1 uncompressed P-256 point is 65 bytes");
         assert_eq!(pubkey_sec1[0], 0x04);
 
-        // Build the in-toto statement + compute PAE against its encoded payload.
         let statement = r#"{
           "_type": "https://in-toto.io/Statement/v1",
           "subject": [{"name": "git", "digest": {"sha1": "abcdef0000000000000000000000000000000000"}}],
@@ -594,12 +626,10 @@ mod tests {
         let sig = keypair.sign(&rng, &pae).unwrap();
         let sig_b64 = STANDARD.encode(sig.as_ref());
         let payload_b64 = STANDARD.encode(payload_bytes);
-
-        // Build a synthetic cert wrapping our real pubkey. DER helpers below.
         let cert_der = build_cert_with_pubkey(&pubkey_sec1);
         let cert_b64 = STANDARD.encode(&cert_der);
 
-        let bundle = format!(
+        let bundle_text = format!(
             r#"{{
                 "attestations": [{{
                     "bundle": {{
@@ -616,27 +646,41 @@ mod tests {
             }}"#
         );
 
+        // Direct DSSE verification against the synthetic bundle (bypasses chain check).
+        let parsed = YamlLoader::load_from_str(&bundle_text).unwrap();
+        let root = &parsed[0];
+        let attestations = root
+            .as_hash()
+            .unwrap()
+            .get(&Yaml::String("attestations".to_string()))
+            .unwrap()
+            .as_vec()
+            .unwrap();
+        let bundle_hash = attestations[0]
+            .as_hash()
+            .unwrap()
+            .get(&Yaml::String("bundle".to_string()))
+            .unwrap()
+            .as_hash()
+            .unwrap();
+        assert!(
+            matches!(verify_dsse_signature(Some(bundle_hash)), DsseResult::Verified),
+            "DSSE verification should succeed on matching keypair"
+        );
+
+        // Top-level verdict: ChainInvalid because the synthetic cert doesn't
+        // chain to the bundled Fulcio intermediate. Chain validation is the
+        // v2.2b layer; it correctly rejects self-signed / non-Fulcio certs
+        // even when the DSSE signature is valid.
         let verdict = verify_attestation_response(
-            &bundle,
+            &bundle_text,
             "abcdef0000000000000000000000000000000000",
         )
         .unwrap();
-        if let AttestationVerdict::Verified {
-            signature_verified,
-            signer_identity,
-            ..
-        } = verdict
-        {
-            assert_eq!(
-                signature_verified,
-                Some(true),
-                "signature should verify against the matching pubkey"
-            );
-            // Cert has issuer CN `sigstore-intermediate` so it looks like Fulcio.
-            assert!(signer_identity.is_some_and(|i| i.looks_like_fulcio()));
-        } else {
-            panic!("expected Verified, got {verdict:?}");
-        }
+        assert!(
+            matches!(verdict, AttestationVerdict::ChainInvalid { .. }),
+            "expected ChainInvalid for synthetic cert, got {verdict:?}"
+        );
     }
 
     #[test]

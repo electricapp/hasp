@@ -69,23 +69,34 @@ What hasp does today:
 - Walks the attestation cert's DER (v2.1) to extract the Fulcio-signed
   SubjectAlternativeName URI (workflow identity) and issuer Common Name
 
-What hasp **does** do as of v2.2a:
+What hasp **does** do as of v2.2b:
 
-- **DSSE signature verification** (ECDSA_P256_SHA256) against the cert's
+- **DSSE signature verification** (`ECDSA_P256_SHA256`) against the cert's
   `SubjectPublicKeyInfo` via `ring`. A tampered payload yields
   `AttestationVerdict::SignatureInvalid` and a CRIT finding.
+- **Leaf-to-intermediate cert-chain validation.** The Sigstore
+  public-good Fulcio intermediate cert is bundled at
+  `data/fulcio/intermediate_v1.pem`. Each attestation's leaf cert is
+  verified by byte-comparing its issuer DN to the bundled
+  intermediate's Subject DN, then cryptographically verifying its
+  `ECDSA_P384_SHA384` signature against the bundled intermediate's
+  public key. A leaf that fails either check yields
+  `AttestationVerdict::ChainInvalid` and a CRIT finding.
 
-What hasp **does not** do yet:
+What's still out of scope:
 
-- **Cert-chain validation to Fulcio root.** Issuer identity is still a
-  string match on the CN (e.g. contains `sigstore` or `fulcio`), not a
-  rustls-webpki chain build. A self-signed cert with CN
-  `sigstore-intermediate` holding a valid keypair that signs the DSSE
-  envelope would pass both `looks_like_fulcio` and DSSE verification.
-
-Tracked with `TODO(v2.2b)` in `src/github/sigstore.rs`. Closing it needs
-`rustls-webpki` (already a direct dep) to verify the attestation cert
-chains to the bundled Fulcio production root.
+- **Verifying the bundled intermediate's signature against the Fulcio
+  root.** hasp pins the intermediate directly rather than walking to
+  the root, so an attacker who controls the hasp build can substitute
+  a different intermediate. That threat is the same as "an attacker
+  can ship arbitrary code as hasp" and is addressed by hasp's own
+  build provenance (`--self-check`), not by runtime verification.
+- **Intermediate rotation.** The bundled intermediate's validity window
+  runs until 2031-10-05. Rotation before then requires replacing
+  `data/fulcio/intermediate_v1.pem` and shipping a new hasp release.
+- **Private Fulcio instances.** Organizations running their own Fulcio
+  CA will see `ChainInvalid` findings. A trust-list extension for
+  private-instance CAs would go in `.hasp.yml` — no current mechanism.
 
 ### Sandboxed `hasp diff` sandbox assertion
 

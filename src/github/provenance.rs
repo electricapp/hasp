@@ -443,6 +443,9 @@ fn emit_slsa_finding(
         AttestationVerdict::SignatureInvalid { reason } => findings.push(
             slsa_signature_invalid_finding(&file, target, short_sha, reason, is_warning),
         ),
+        AttestationVerdict::ChainInvalid { reason } => findings.push(
+            slsa_chain_invalid_finding(&file, target, short_sha, reason, is_warning),
+        ),
         AttestationVerdict::SubjectMismatch { observed, .. } => findings.push(
             slsa_subject_mismatch_finding(&file, target, short_sha, observed, is_warning),
         ),
@@ -496,6 +499,28 @@ fn slsa_signature_invalid_finding(
              This is the strongest tampering signal -- either the attestation body was \
              modified after signing, or the cert in the bundle does not hold the private \
              key that signed the envelope. Do not trust this attestation."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_chain_invalid_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    reason: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::Critical,
+        title: format!("SLSA attestation for {target} cert chain is invalid"),
+        detail: format!(
+            "Cert-chain validation failed for {short_sha} in {target}: {reason}. \
+             The attestation's leaf cert does not demonstrably originate from the \
+             Sigstore public-good Fulcio CA. If this is from a private Fulcio \
+             instance, extend hasp's bundled trust material (data/fulcio/). \
+             Otherwise treat as a misissued or forged attestation."
         ),
         is_warning,
     }
