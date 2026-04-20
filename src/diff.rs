@@ -5,20 +5,18 @@
 //! findings, and unchanged findings. Output is terse-text, markdown (PR
 //! comment-friendly), or JSON (CI-consumable).
 //!
-//! Unlike the primary `hasp --paranoid` scan, delta mode runs inline (no
-//! multi-process sandbox) because it is a developer-facing convenience
-//! that post-processes two authoritative scans. If you need the hardened
-//! sandbox, run `hasp --paranoid` on each branch separately and diff
-//! the reports yourself.
+//! Each scan runs in a separate sandboxed `--internal-scan` subprocess
+//! (Landlock / seccomp / BPF where available), matching the threat model
+//! of the regular `hasp --paranoid` pass. The launcher only orchestrates
+//! the two subprocesses and computes the finding-level delta from the
+//! IPC payloads.
 
-use crate::audit::{self, AuditFinding, Severity};
+use crate::audit::{AuditFinding, Severity};
 use crate::error::{Context, Result, bail};
-use crate::policy::Policy;
-use crate::scanner;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffFormat {
@@ -82,21 +80,24 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
     let repo_root = git_repo_root(&canonical_dir)?;
     let relative_dir = canonical_dir
         .strip_prefix(&repo_root)
-        .context("workflow directory is outside the git repo")?;
+        .context("workflow directory is outside the git repo")?
+        .to_path_buf();
 
     // Verify the base ref resolves.
     let base_sha = resolve_git_ref(&repo_root, &base)?;
 
-    // Policy (same policy for both scans).
-    let policy = load_effective_policy(args, &canonical_dir)?;
+    let exe =
+        std::env::current_exe().context("Cannot resolve current executable path")?;
 
-    let head_findings = scan_and_audit(&canonical_dir, &policy)?;
+    // Run the head scan in a sandboxed --internal-scan subprocess.
+    let head_payload = run_internal_scan(&exe, &canonical_dir, args)?;
+    let head_findings = head_payload.audit_findings;
 
-    // Temp worktree for base.
+    // Base scan: spawn a second sandboxed subprocess against the temp worktree.
     let worktree = BaseWorktree::create(&repo_root, &base_sha)?;
-    let base_dir = worktree.path().join(relative_dir);
+    let base_dir = worktree.path().join(&relative_dir);
     let base_findings = if base_dir.is_dir() {
-        scan_and_audit(&base_dir, &policy)?
+        run_internal_scan(&exe, &base_dir, args)?.audit_findings
     } else {
         // Base didn't have the workflow dir at all. All head findings are new.
         Vec::new()
@@ -117,73 +118,6 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
-}
-
-/// Load policy, respecting --no-policy / --policy / --paranoid as the
-/// launcher does. Small duplication of `main::load_policy` avoids leaking that
-/// function to the diff path without refactoring main.rs.
-fn load_effective_policy(args: &crate::cli::Args, canonical_dir: &Path) -> Result<Policy> {
-    if args.no_policy {
-        let mut p = Policy::default();
-        if args.paranoid {
-            p.merge_cli(args);
-        }
-        return Ok(p);
-    }
-    if let Some(path) = &args.policy_path {
-        let canonical = path
-            .canonicalize()
-            .context("Cannot resolve --policy path")?;
-        let mut p = Policy::load_from(&canonical)?;
-        p.merge_cli(args);
-        return Ok(p);
-    }
-    let root = infer_repo_root(canonical_dir);
-    Ok(Policy::load(&root)?.map_or_else(
-        || {
-            let mut p = Policy::default();
-            if args.paranoid {
-                p.merge_cli(args);
-            }
-            p
-        },
-        |mut p| {
-            p.merge_cli(args);
-            p
-        },
-    ))
-}
-
-fn infer_repo_root(start: &Path) -> PathBuf {
-    let mut dir = start.to_path_buf();
-    let mut depth = 0_u32;
-    loop {
-        if dir.join(".git").exists() || dir.join(".hasp.yml").exists() {
-            return dir;
-        }
-        depth += 1;
-        if depth > 10 || !dir.pop() {
-            return start.to_path_buf();
-        }
-    }
-}
-
-fn scan_and_audit(dir: &Path, policy: &Policy) -> Result<Vec<AuditFinding>> {
-    let scan = scanner::scan_directory(dir)?;
-    let mut findings = audit::run(&scan.workflow_docs, &scan.action_refs, &policy.checks);
-    if !policy.checks.untrusted_sources.is_off() {
-        let owners = Policy::effective_list(
-            policy.trust.owners.as_ref(),
-            audit::builtin_trusted_owners(),
-        );
-        audit::check_untrusted_sources(
-            &scan.action_refs,
-            &mut findings,
-            policy.checks.untrusted_sources,
-            &owners,
-        );
-    }
-    Ok(findings)
 }
 
 fn compute_delta(
@@ -389,6 +323,60 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ─── Sandboxed scan subprocess ──────────────────────────────────────────────
+//
+// Spawns `hasp --internal-scan` as a child process. Forwarding CLI flags
+// manually (rather than re-serializing the whole Args) keeps the child's CLI
+// surface minimal and avoids accidentally re-entering diff/tree/exec
+// subcommands in the child.
+
+fn run_internal_scan(
+    exe: &Path,
+    dir: &Path,
+    args: &crate::cli::Args,
+) -> Result<crate::ipc::ScanPayload> {
+    let mut cmd = Command::new(exe);
+    if args.allow_unsandboxed {
+        cmd.arg("--allow-unsandboxed");
+    }
+    if args.paranoid {
+        cmd.arg("--paranoid");
+    }
+    if args.strict {
+        cmd.arg("--strict");
+    }
+    if args.no_policy {
+        cmd.arg("--no-policy");
+    }
+    if let Some(path) = &args.policy_path {
+        cmd.arg("--policy").arg(path);
+    }
+    if args.no_oidc {
+        cmd.arg("--no-oidc");
+    }
+    for (provider, path) in &args.oidc_policies {
+        cmd.arg("--oidc-policy")
+            .arg(format!("{provider}:{}", path.display()));
+    }
+    cmd.arg("--dir").arg(dir);
+    cmd.arg("--internal-scan");
+    cmd.env_clear();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let output = cmd
+        .output()
+        .context("Failed to launch scanner subprocess")?;
+    if !output.status.success() {
+        bail!(
+            "scanner subprocess failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+    crate::ipc::read_scan_payload(output.stdout.as_slice())
 }
 
 // ─── git helpers + base worktree ────────────────────────────────────────────

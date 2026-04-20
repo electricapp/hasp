@@ -13,6 +13,7 @@ pub(crate) enum Mode {
     InternalBpfHelper,
 }
 
+#[derive(Clone)]
 pub(crate) struct ExecArgs {
     pub(crate) manifest: Option<PathBuf>,
     pub(crate) writable_dirs: Vec<PathBuf>,
@@ -20,6 +21,7 @@ pub(crate) struct ExecArgs {
 }
 
 #[allow(clippy::struct_excessive_bools)] // CLI flags are inherently boolean
+#[derive(Clone)]
 pub(crate) struct Args {
     pub(crate) dir: PathBuf,
     pub(crate) strict: bool,
