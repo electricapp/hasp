@@ -69,20 +69,23 @@ What hasp does today:
 - Walks the attestation cert's DER (v2.1) to extract the Fulcio-signed
   SubjectAlternativeName URI (workflow identity) and issuer Common Name
 
+What hasp **does** do as of v2.2a:
+
+- **DSSE signature verification** (ECDSA_P256_SHA256) against the cert's
+  `SubjectPublicKeyInfo` via `ring`. A tampered payload yields
+  `AttestationVerdict::SignatureInvalid` and a CRIT finding.
+
 What hasp **does not** do yet:
 
-- **DSSE signature verification.** The envelope's `signatures` array is
-  not verified cryptographically against the cert's EC public key. A
-  tampered payload + signature pair would not be caught today.
-- **Cert-chain validation to Fulcio root.** Issuer identity is a string
-  match on the CN (e.g. contains `sigstore` or `fulcio`), not a
+- **Cert-chain validation to Fulcio root.** Issuer identity is still a
+  string match on the CN (e.g. contains `sigstore` or `fulcio`), not a
   rustls-webpki chain build. A self-signed cert with CN
-  `sigstore-intermediate` would pass `looks_like_fulcio`.
+  `sigstore-intermediate` holding a valid keypair that signs the DSSE
+  envelope would pass both `looks_like_fulcio` and DSSE verification.
 
-Both gaps are tracked with `TODO(v2.2)` comments in
-`src/github/sigstore.rs`. Closing them requires adding `ring` and
-`rustls-webpki` as direct dependencies (both are already transitive via
-`rustls`) plus ~500 lines of cert-chain and DSSE-PAE plumbing.
+Tracked with `TODO(v2.2b)` in `src/github/sigstore.rs`. Closing it needs
+`rustls-webpki` (already a direct dep) to verify the attestation cert
+chains to the bundled Fulcio production root.
 
 ### Sandboxed `hasp diff` sandbox assertion
 
