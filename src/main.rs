@@ -12,6 +12,7 @@ mod netguard;
 mod oidc;
 mod policy;
 mod proxy;
+mod replay;
 mod report;
 mod sandbox;
 mod scanner;
@@ -63,6 +64,7 @@ fn run() -> Result<()> {
         Mode::Launcher => run_launcher(&args),
         Mode::Diff => diff::run(&args),
         Mode::Tree => supply_chain_graph::run_tree(&args),
+        Mode::Replay => replay::run(&args),
         Mode::Exec => exec::run_exec(&args),
         Mode::InternalScan => run_internal_scan(&args),
         Mode::InternalVerify => run_internal_verify(&args),
