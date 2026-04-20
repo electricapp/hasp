@@ -1,6 +1,7 @@
 mod client;
 mod json;
 mod provenance;
+pub(crate) mod slsa;
 mod transitive;
 mod verify;
 

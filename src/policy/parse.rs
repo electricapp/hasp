@@ -113,6 +113,7 @@ pub(super) fn parse_provenance_config(val: &Yaml) -> Result<ProvenanceCheckConfi
             "recent-repo" => config.recent_repo = level,
             "transitive" => config.transitive = level,
             "hidden-execution" => config.hidden_execution = level,
+            "slsa-attestation" => config.slsa_attestation = level,
             other => bail!("Unknown provenance check `{other}` in policy"),
         }
     }
@@ -191,6 +192,7 @@ pub(super) fn parse_partial_provenance(val: &Yaml) -> Result<PartialProvenanceCo
             "recent-repo" => config.recent_repo = Some(level),
             "transitive" => config.transitive = Some(level),
             "hidden-execution" => config.hidden_execution = Some(level),
+            "slsa-attestation" => config.slsa_attestation = Some(level),
             other => bail!("Unknown provenance check `{other}` in action override"),
         }
     }

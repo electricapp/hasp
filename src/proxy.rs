@@ -16,6 +16,9 @@ pub(crate) const GITHUB_ADDRS_ENV: &str = "HASP_GITHUB_ADDRS";
 pub(crate) const READY_MAGIC: &str = "HASP_PROXY_READY_V1";
 
 const MAX_MESSAGE_BYTES: usize = 4096;
+/// Cap for multi-KB responses (SLSA attestation bundles).  Applied only on the
+/// client side for commands that explicitly opt into the large-response path.
+const MAX_LARGE_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_API_CALLS_PER_RUN: u32 = 300;
 const MAX_AUTH_FAILURES: u32 = 5;
 const MAX_CONNECTIONS: u32 = 1000;
@@ -40,6 +43,15 @@ impl Client {
     }
 
     fn request(&self, tag: &str, fields: &[&str]) -> Result<Vec<String>> {
+        self.request_with_cap(tag, fields, MAX_MESSAGE_BYTES)
+    }
+
+    fn request_with_cap(
+        &self,
+        tag: &str,
+        fields: &[&str],
+        response_cap: usize,
+    ) -> Result<Vec<String>> {
         let mut stream = TcpStream::connect(self.proxy_addr).context(format!(
             "Failed to connect to local proxy at {}",
             self.proxy_addr
@@ -63,11 +75,11 @@ impl Client {
 
         let mut resp = String::new();
         stream
-            .take(MAX_MESSAGE_BYTES as u64 + 1)
+            .take(response_cap as u64 + 1)
             .read_to_string(&mut resp)
             .context("Failed to read proxy response")?;
-        if resp.len() > MAX_MESSAGE_BYTES {
-            bail!("Proxy response exceeded {} bytes", MAX_MESSAGE_BYTES);
+        if resp.len() > response_cap {
+            bail!("Proxy response exceeded {} bytes", response_cap);
         }
 
         let line = resp
@@ -241,6 +253,22 @@ impl Api for Client {
             commit_summaries,
             html_url,
         })
+    }
+
+    fn get_attestation(&self, owner: &str, repo: &str, sha: &str) -> Result<Option<String>> {
+        let fields = self.request_with_cap(
+            "GET_ATTESTATION",
+            &[owner, repo, sha],
+            MAX_LARGE_MESSAGE_BYTES,
+        )?;
+        if fields.len() != 2 || fields[0] != "OPTION" {
+            bail!("Malformed GET_ATTESTATION response from proxy");
+        }
+        if fields[1].is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(fields[1].clone()))
+        }
     }
 }
 
@@ -537,6 +565,16 @@ fn handle_connection(
                 resp_fields.push(s);
             }
             write_response(stream, "COMPARE_RESULT", &resp_fields)?;
+        }
+        "GET_ATTESTATION" => {
+            if fields.len() != 5 {
+                bail!("Malformed GET_ATTESTATION request");
+            }
+            validate_github_component(&fields[2], "owner")?;
+            validate_github_component(&fields[3], "repo")?;
+            validate_sha(&fields[4])?;
+            let body = client.get_attestation(&fields[2], &fields[3], &fields[4])?;
+            write_response(stream, "OPTION", &[body.as_deref().unwrap_or("")])?;
         }
         other => {
             let truncated = if other.len() > 32 {
