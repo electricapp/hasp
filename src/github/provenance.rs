@@ -433,6 +433,27 @@ fn emit_slsa_finding(
     let is_warning = level.is_warn();
     match verdict {
         AttestationVerdict::Verified { .. } | AttestationVerdict::Missing => {}
+        AttestationVerdict::UntrustedIssuer {
+            issuer_cn,
+            subject_uri,
+        } => {
+            findings.push(AuditFinding {
+                file: result.action_ref.file.clone(),
+                severity: Severity::High,
+                title: format!(
+                    "SLSA attestation for {target} issued by non-Fulcio CA"
+                ),
+                detail: format!(
+                    "The attestation bundle's cert was issued by `{issuer_cn}`, which \
+                     does not match Sigstore's public Fulcio CA. Workflow identity in \
+                     the cert: {}. If this is intentional (private Fulcio instance), \
+                     extend hasp's trusted-issuer allowlist. Otherwise treat this as \
+                     a tampered or misissued attestation.",
+                    subject_uri.as_deref().unwrap_or("<not extracted>")
+                ),
+                is_warning,
+            });
+        }
         AttestationVerdict::SubjectMismatch { observed, .. } => {
             findings.push(AuditFinding {
                 file: result.action_ref.file.clone(),
