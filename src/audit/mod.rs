@@ -1,4 +1,5 @@
 mod cross_workflow;
+mod external_artifacts;
 mod injection;
 pub(crate) mod oidc;
 mod permissions;
@@ -190,6 +191,9 @@ pub(crate) fn run(
     }
     if !checks.cross_workflow.is_off() {
         cross_workflow::run(docs, &mut findings, checks.cross_workflow);
+    }
+    if !checks.external_artifacts.is_off() {
+        external_artifacts::run(docs, &mut findings, checks.external_artifacts);
     }
     // Sort by severity: Critical < High < Medium (ascending order)
     // Severity derives Ord based on declaration order: Critical=0, High=1, Medium=2
