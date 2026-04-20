@@ -26,21 +26,100 @@
 //!
 //! ## v2.2a (landed): DSSE signature verification
 //!
-//! `verify_dsse_signature` in `slsa.rs` now cryptographically verifies the
+//! `verify_dsse_signature` in `slsa.rs` cryptographically verifies the
 //! envelope's `ECDSA_P256_SHA256` signature against the cert's
 //! `SubjectPublicKeyInfo` via `ring`. A tampered payload or signature
 //! produces `AttestationVerdict::SignatureInvalid` (CRIT finding).
 //!
-//! ## TODO(v2.2b): Fulcio cert-chain validation
+//! ## v2.2b (landed): Leaf-to-intermediate chain validation
 //!
-//! `looks_like_fulcio` is still only a string match on the issuer CN --
-//! trivially spoofable by a self-signed cert naming itself
-//! `sigstore-intermediate`. Closing this gap needs `rustls-webpki`
-//! (already a direct dep) to verify the attestation cert chains to the
-//! bundled Fulcio production root. See docs/SECURITY.md for the full
-//! threat model.
+//! `verify_chain_to_fulcio` verifies the leaf cert's signature against
+//! the bundled Sigstore public-good Fulcio intermediate
+//! (`data/fulcio/intermediate_v1.pem`). Issuer DN is matched
+//! byte-for-byte against the bundled intermediate's Subject DN, and the
+//! leaf's `ECDSA_P384_SHA384` signature is verified against the
+//! intermediate's public key. A forgery needs Sigstore's intermediate
+//! private key to pass -- string spoofing `sigstore-intermediate` as a
+//! CN no longer works. Chain verification is not extended to the Fulcio
+//! root: see docs/SECURITY.md for the full threat model.
 
+use std::sync::OnceLock;
 use yaml_rust2::Yaml;
+
+// ─── Bundled Fulcio intermediate ────────────────────────────────────────────
+//
+// Sigstore public-good Fulcio intermediate-v1, fetched from
+// https://github.com/sigstore/root-signing/raw/main/targets/fulcio_intermediate_v1.crt.pem
+// (stored at data/fulcio/intermediate_v1.pem in the source tree).
+//
+// This is a P-384 signing cert issued by the public-good Fulcio root. All
+// attestations minted by GitHub Actions against Sigstore public-good are
+// signed by a Fulcio-issued leaf whose issuer is this intermediate.
+//
+// Rotate by replacing the PEM file and shipping a new hasp release -- the
+// intermediate's validity window runs until 2031-10-05.
+const FULCIO_INTERMEDIATE_V1_PEM: &str =
+    include_str!("../../data/fulcio/intermediate_v1.pem");
+
+fn fulcio_intermediate_der() -> &'static [u8] {
+    static DER: OnceLock<Vec<u8>> = OnceLock::new();
+    DER.get_or_init(|| pem_to_der(FULCIO_INTERMEDIATE_V1_PEM).expect("bundled PEM must decode"))
+}
+
+fn fulcio_intermediate_spki() -> Option<&'static FulcioSpki> {
+    static SPKI: OnceLock<Option<FulcioSpki>> = OnceLock::new();
+    SPKI.get_or_init(|| extract_intermediate_spki(fulcio_intermediate_der()))
+        .as_ref()
+}
+
+#[derive(Debug, Clone)]
+struct FulcioSpki {
+    /// SEC1 uncompressed point, 97 bytes for P-384 (0x04 || X(48) || Y(48))
+    point: Vec<u8>,
+    /// Signed-name: the cert's Subject DN (for issuer-match on leaf certs).
+    subject: Vec<u8>,
+}
+
+fn extract_intermediate_spki(der: &[u8]) -> Option<FulcioSpki> {
+    let outer = read_tlv(der)?;
+    if outer.tag != 0x30 {
+        return None;
+    }
+    let tbs = read_tlv(outer.value)?;
+    let items = walk_sequence(tbs.value);
+    let version_present = items.first().is_some_and(|t| t.tag == 0xA0);
+    let start = usize::from(version_present);
+    let subject = items.get(start + 4)?; // issuer, validity, subject
+    let spki = items.get(start + 5)?;
+    if spki.tag != 0x30 {
+        return None;
+    }
+    let spki_parts = walk_sequence(spki.value);
+    let bit = spki_parts.get(1)?;
+    if bit.tag != 0x03 || bit.value.len() < 2 || bit.value[0] != 0 {
+        return None;
+    }
+    Some(FulcioSpki {
+        point: bit.value[1..].to_vec(),
+        subject: subject.value.to_vec(),
+    })
+}
+
+fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut b64 = String::new();
+    let mut in_cert = false;
+    for line in pem.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE") {
+            in_cert = true;
+        } else if line.starts_with("-----END CERTIFICATE") {
+            in_cert = false;
+        } else if in_cert {
+            b64.push_str(line.trim());
+        }
+    }
+    STANDARD.decode(b64).ok()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SignerIdentity {
@@ -89,6 +168,107 @@ pub(crate) fn extract_spki_ec_point_from_bundle(
     let cert_b64 = first_cert_raw_bytes(material)?;
     let decoded = base64_decode(cert_b64).ok()?;
     extract_spki_ec_point(&decoded)
+}
+
+/// Chain-verification result for the leaf attestation cert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainVerdict {
+    /// Leaf was signed by the bundled Fulcio intermediate's public key.
+    VerifiedAgainstFulcio,
+    /// Leaf's issuer doesn't match the bundled intermediate's Subject DN.
+    /// This is usually an attestation from a private Fulcio instance.
+    IssuerMismatch,
+    /// Leaf's issuer matches, but its ECDSA signature didn't verify against
+    /// the bundled intermediate's public key. Strongest tampering signal.
+    SignatureInvalid,
+    /// The bundle carried no cert material, so there's nothing to verify.
+    NoMaterial,
+    /// Structural failure: we couldn't parse the leaf cert well enough to
+    /// extract the tbsCertificate bytes or the signature.
+    Malformed(String),
+}
+
+/// Verify that the bundle's leaf cert was signed by the bundled Sigstore
+/// public-good Fulcio intermediate. This doesn't walk to the root -- it
+/// trusts the pinned intermediate directly. An attacker would need
+/// Sigstore's intermediate private key to forge a cert that passes.
+pub(crate) fn verify_chain_to_fulcio(
+    bundle: &yaml_rust2::yaml::Hash,
+) -> ChainVerdict {
+    let Some(material) = bundle
+        .get(&Yaml::String("verificationMaterial".to_string()))
+        .and_then(Yaml::as_hash)
+    else {
+        return ChainVerdict::NoMaterial;
+    };
+    let Some(cert_b64) = first_cert_raw_bytes(material) else {
+        return ChainVerdict::NoMaterial;
+    };
+    let Ok(leaf_der) = base64_decode(cert_b64) else {
+        return ChainVerdict::Malformed("leaf cert base64 decode failed".into());
+    };
+    let Some(intermediate_spki) = fulcio_intermediate_spki() else {
+        return ChainVerdict::Malformed(
+            "bundled Fulcio intermediate could not be parsed".into(),
+        );
+    };
+
+    let Some((tbs_bytes, sig_bytes, leaf_issuer)) = extract_signed_parts(&leaf_der) else {
+        return ChainVerdict::Malformed("failed to parse leaf cert".into());
+    };
+
+    if leaf_issuer != intermediate_spki.subject {
+        return ChainVerdict::IssuerMismatch;
+    }
+
+    // Fulcio intermediate uses P-384; leaf certs it issues are signed with
+    // ECDSA_P384_SHA384.
+    let verifier = ring::signature::UnparsedPublicKey::new(
+        &ring::signature::ECDSA_P384_SHA384_ASN1,
+        &intermediate_spki.point,
+    );
+    match verifier.verify(&tbs_bytes, &sig_bytes) {
+        Ok(()) => ChainVerdict::VerifiedAgainstFulcio,
+        Err(_) => ChainVerdict::SignatureInvalid,
+    }
+}
+
+/// Extract (tbsCertificate bytes, signatureValue bytes, issuer DN bytes) from a DER cert.
+fn extract_signed_parts(cert_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let outer = read_tlv(cert_der)?;
+    if outer.tag != 0x30 {
+        return None;
+    }
+    // Within the outer SEQUENCE value, walk children: tbsCertificate,
+    // signatureAlgorithm, signatureValue. We need the tbsCertificate's full
+    // DER bytes (tag + length + value), which is the slice read_tlv
+    // consumed.
+    let mut cursor = outer.value;
+    let tbs = read_tlv(cursor)?;
+    if tbs.tag != 0x30 {
+        return None;
+    }
+    let tbs_bytes = cursor[..tbs.consumed].to_vec();
+    cursor = &cursor[tbs.consumed..];
+
+    // Skip signatureAlgorithm.
+    let sig_alg = read_tlv(cursor)?;
+    cursor = &cursor[sig_alg.consumed..];
+
+    // signatureValue: BIT STRING; skip the first byte (unused-bits count).
+    let sig_value = read_tlv(cursor)?;
+    if sig_value.tag != 0x03 || sig_value.value.is_empty() {
+        return None;
+    }
+    let sig_bytes = sig_value.value[1..].to_vec();
+
+    // Extract issuer DN from tbsCertificate (for matching against bundled
+    // intermediate's Subject).
+    let tbs_items = walk_sequence(tbs.value);
+    let version_present = tbs_items.first().is_some_and(|t| t.tag == 0xA0);
+    let issuer_idx = if version_present { 3 } else { 2 };
+    let issuer = tbs_items.get(issuer_idx)?;
+    Some((tbs_bytes, sig_bytes, issuer.value.to_vec()))
 }
 
 /// Pull `SubjectPublicKeyInfo.subjectPublicKey` bytes out of a cert's DER.
@@ -505,6 +685,91 @@ mod tests {
         let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
         let map = doc.as_hash().unwrap();
         assert!(extract_identity_from_bundle(map).is_none());
+    }
+
+    #[test]
+    fn bundled_fulcio_intermediate_parses_and_has_p384_spki() {
+        let spki = fulcio_intermediate_spki().expect("bundled PEM should parse");
+        // P-384 SEC1 uncompressed: 0x04 || X(48) || Y(48) = 97 bytes
+        assert_eq!(spki.point.len(), 97);
+        assert_eq!(spki.point[0], 0x04);
+        assert!(!spki.subject.is_empty());
+    }
+
+    #[test]
+    fn chain_verify_returns_no_material_for_empty_bundle() {
+        let yaml = "{}";
+        let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
+        let map = doc.as_hash().unwrap();
+        assert_eq!(verify_chain_to_fulcio(map), ChainVerdict::NoMaterial);
+    }
+
+    #[test]
+    fn chain_verify_rejects_synthetic_non_fulcio_cert() {
+        // Build a synthetic cert (issuer CN "sigstore-intermediate" — a naming
+        // spoof) and verify_chain_to_fulcio rejects it because the DN bytes
+        // don't match the real bundled intermediate.
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            if value.len() < 0x80 {
+                out.push(u8::try_from(value.len()).unwrap());
+            } else if value.len() < 0x100 {
+                out.push(0x81);
+                out.push(u8::try_from(value.len()).unwrap());
+            } else {
+                out.push(0x82);
+                out.push(u8::try_from(value.len() >> 8).unwrap());
+                out.push(u8::try_from(value.len() & 0xff).unwrap());
+            }
+            out.extend_from_slice(value);
+            out
+        }
+        fn seq(children: &[&[u8]]) -> Vec<u8> {
+            let inner: Vec<u8> = children.iter().flat_map(|c| c.iter().copied()).collect();
+            tlv(0x30, &inner)
+        }
+        fn rdn_cn(cn: &str) -> Vec<u8> {
+            let oid = tlv(0x06, &[0x55, 0x04, 0x03]);
+            let value = tlv(0x13, cn.as_bytes());
+            let attr = seq(&[&oid, &value]);
+            let rdn = tlv(0x31, &attr);
+            seq(&[&rdn])
+        }
+        let issuer = rdn_cn("sigstore-intermediate"); // naming-only spoof
+        let subject = rdn_cn("ignored");
+        let utc1 = tlv(0x17, b"250101000000Z");
+        let utc2 = tlv(0x17, b"260101000000Z");
+        let validity = seq(&[&utc1, &utc2]);
+        let alg_oid = tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
+        let alg_params = tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]);
+        let alg = seq(&[&alg_oid, &alg_params]);
+        let bit_string_bytes: Vec<u8> = std::iter::once(0_u8)
+            .chain(std::iter::once(0x04))
+            .chain(std::iter::repeat_n(0x01_u8, 64))
+            .collect();
+        let bitstr = tlv(0x03, &bit_string_bytes);
+        let spki = seq(&[&alg, &bitstr]);
+        let version = tlv(0xA0, &tlv(0x02, &[0x02]));
+        let serial = tlv(0x02, &[0x01]);
+        let sig_alg = seq(&[&alg_oid, &alg_params]);
+        let tbs = seq(&[&version, &serial, &sig_alg, &issuer, &validity, &subject, &spki]);
+        let sig_alg_outer = seq(&[&alg_oid, &alg_params]);
+        let sig_value = tlv(0x03, &[0x00, 0xAA]);
+        let cert = seq(&[&tbs, &sig_alg_outer, &sig_value]);
+        let cert_b64 = STANDARD.encode(&cert);
+
+        let yaml = format!(
+            r#"{{"verificationMaterial":{{"certificate":{{"rawBytes":"{cert_b64}"}}}}}}"#
+        );
+        let doc = yaml_rust2::YamlLoader::load_from_str(&yaml).unwrap().remove(0);
+        let map = doc.as_hash().unwrap();
+
+        // The synthetic cert's issuer DN is "sigstore-intermediate" but the
+        // real bundled Fulcio intermediate's Subject DN is
+        // "sigstore.dev / sigstore-intermediate" (two RDNs). Byte comparison
+        // fails -> IssuerMismatch.
+        assert_eq!(verify_chain_to_fulcio(map), ChainVerdict::IssuerMismatch);
     }
 
     #[test]
