@@ -24,12 +24,24 @@
 //! of *what* built the artifact -- even though hasp itself doesn't yet
 //! cryptographically verify the DSSE signature over the payload.
 //!
-//! ## What's still v2.2
+//! ## TODO(v2.2): Full cryptographic verification
 //!
-//! True cryptographic verification of the DSSE envelope (ECDSA over PAE) and
-//! cert-chain validation to the bundled Fulcio root are **not** performed.
-//! That requires adding `ring` (already a transitive dep via rustls) as a
-//! direct dep and an ~500-line cert-chain builder. See docs/SECURITY.md.
+//! Two gaps remain before this is *cryptographic* verification rather than
+//! evidence extraction.  Both are also listed in docs/SECURITY.md's
+//! "Known limitations" section.
+//!
+//! 1. **DSSE signature verification.**  Parse the envelope's `signatures`
+//!    array, build DSSE v1 PAE (`"DSSEv1" SP len(payloadType) SP
+//!    payloadType SP len(payload) SP payload`), then verify with
+//!    `ring::signature::UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1,
+//!    spki)` using the EC public-key bytes extracted from the cert's
+//!    `SubjectPublicKeyInfo`. Adds `ring` as a direct dep (already
+//!    transitive via rustls).
+//! 2. **Cert-chain validation to Fulcio root.**  Bundle the Fulcio
+//!    production root CA as a PEM literal, use `rustls-webpki` (also
+//!    already transitive) to verify the attestation cert chains to it.
+//!    Without this, `looks_like_fulcio` is only a string match on the
+//!    issuer CN -- trivially spoofable by a crafted cert.
 
 use yaml_rust2::Yaml;
 
