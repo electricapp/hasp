@@ -1,7 +1,8 @@
 #![allow(clippy::tests_outside_test_module, clippy::unwrap_used)]
 //! Cross-workflow taint analysis: artifact flows from untrusted triggers to
-//! privileged workflow_run sinks (tj-actions / Ultralytics pattern), unguarded
-//! workflow_run triggers, and attacker-controlled workflow_run event reads.
+//! privileged `workflow_run` sinks (tj-actions / Ultralytics pattern),
+//! unguarded `workflow_run` triggers, and attacker-controlled
+//! `workflow_run` event reads.
 
 mod common;
 use common::*;
@@ -13,7 +14,7 @@ fn detects_tj_actions_artifact_flow_pattern() {
     write_workflow(
         &repo,
         "lint.yml",
-        r"name: Lint
+        "name: Lint
 on: pull_request
 permissions: {}
 jobs:
@@ -31,7 +32,7 @@ jobs:
     write_workflow(
         &repo,
         "post-lint.yml",
-        r"name: Post Lint
+        "name: Post Lint
 on:
   workflow_run:
     workflows: [Lint]
@@ -77,7 +78,7 @@ fn does_not_flag_safe_push_triggered_flow() {
     write_workflow(
         &repo,
         "ci.yml",
-        r"name: CI
+        "name: CI
 on: push
 permissions: {}
 jobs:
@@ -92,7 +93,7 @@ jobs:
     write_workflow(
         &repo,
         "deploy.yml",
-        r"name: Deploy
+        "name: Deploy
 on:
   workflow_run:
     workflows: [CI]
@@ -137,7 +138,7 @@ fn detects_unguarded_workflow_run() {
     write_workflow(
         &repo,
         "privileged.yml",
-        r"name: Privileged
+        "name: Privileged
 on: workflow_run
 permissions:
   contents: write
@@ -176,7 +177,7 @@ fn detects_workflow_run_event_taint() {
     write_workflow(
         &repo,
         "pr.yml",
-        r"name: PR
+        "name: PR
 on: pull_request
 permissions: {}
 jobs:
@@ -189,7 +190,7 @@ jobs:
     write_workflow(
         &repo,
         "privileged.yml",
-        r"name: Privileged
+        "name: Privileged
 on:
   workflow_run:
     workflows: [PR]

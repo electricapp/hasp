@@ -1,0 +1,9 @@
+name: CI
+on: push
+permissions:
+  contents: read
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
