@@ -1,0 +1,14 @@
+name: Sink
+on:
+  workflow_run:
+    workflows: ['.github/workflows/ci.yml']
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        with:
+          name: blob

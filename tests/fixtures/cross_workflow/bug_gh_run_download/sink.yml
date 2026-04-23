@@ -1,0 +1,14 @@
+name: Sink
+on:
+  workflow_run:
+    workflows: [PR]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh run download ${{ github.event.workflow_run.id }} -n report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

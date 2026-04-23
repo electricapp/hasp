@@ -1,0 +1,8 @@
+name: PR
+on: pull_request
+permissions: {}
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi

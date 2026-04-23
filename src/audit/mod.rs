@@ -1,3 +1,4 @@
+mod cross_workflow;
 mod injection;
 mod permissions;
 mod supply_chain;
@@ -185,6 +186,9 @@ pub(crate) fn run(
     }
     if !checks.typosquatting.is_off() {
         supply_chain::check_typosquatting(refs, &mut findings, checks.typosquatting);
+    }
+    if !checks.cross_workflow.is_off() {
+        cross_workflow::run(docs, &mut findings, checks.cross_workflow);
     }
     // Sort by severity: Critical < High < Medium (ascending order)
     // Severity derives Ord based on declaration order: Critical=0, High=1, Medium=2
