@@ -67,10 +67,22 @@ fn run() -> Result<()> {
     }
 }
 
+fn trace_ts(msg: &str) {
+    if std::env::var_os("HASP_TRACE").is_some() {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        eprintln!("hasp[trace {t:.3}]: {msg}");
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_launcher(args: &cli::Args) -> Result<()> {
+    trace_ts("run_launcher: enter");
     sandbox::platform_preflight(args.allow_unsandboxed, true)?;
     scrub_parent_environment();
+    trace_ts("run_launcher: after preflight + env scrub");
 
     let canonical_dir = args
         .dir
@@ -100,7 +112,9 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
 
     println!("hasp: scanning {}/", canonical_dir.display());
     let exe = std::env::current_exe().context("Cannot resolve current executable path")?;
+    trace_ts("run_launcher: before run_scan_subprocess");
     let scan = run_scan_subprocess(&exe, args)?;
+    trace_ts("run_launcher: after run_scan_subprocess");
 
     if scan.action_refs.is_empty()
         && scan.container_refs.is_empty()
@@ -156,7 +170,9 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
     } else if has_token {
         // run_verify_subprocess scrubs GITHUB_TOKEN from the environment
         // immediately after capturing it for the proxy child.
+        trace_ts("run_launcher: before run_verify_subprocess");
         let payload = run_verify_subprocess(&exe, args, &scan.action_refs, &diff_changes)?;
+        trace_ts("run_launcher: after run_verify_subprocess");
         (
             payload.results,
             payload.provenance_findings,
@@ -672,14 +688,18 @@ fn run_verify_subprocess(
     action_refs: &[scanner::ActionRef],
     diff_changes: &[scanner::ActionRefChange],
 ) -> Result<ipc::VerifyPayload> {
+    trace_ts("verify: before pre_resolve_api");
     let github_addrs = github::pre_resolve_api()?;
+    trace_ts("verify: after pre_resolve_api");
     let mut proxy_auth = token::generate_ephemeral_secret_hex(32)?;
 
+    trace_ts("verify: before maybe_prepare(Proxy)");
     let proxy_sandbox = netguard::maybe_prepare(
         netguard::SandboxMode::Proxy,
         &github_addrs,
         args.allow_unsandboxed,
     )?;
+    trace_ts("verify: after maybe_prepare(Proxy)");
     let mut proxy_cmd = build_child_command(exe, args);
     proxy_cmd
         .arg("--internal-proxy")
@@ -710,6 +730,7 @@ fn run_verify_subprocess(
     apply_env_allowlist(&mut proxy_cmd, &proxy_env);
     drop(proxy_env);
 
+    trace_ts("verify: before spawn proxy");
     let mut proxy_child = match netguard::spawn_command(proxy_cmd, proxy_sandbox.as_ref()) {
         Ok(child) => child,
         Err(err) => {
@@ -717,6 +738,7 @@ fn run_verify_subprocess(
             return Err(err);
         }
     };
+    trace_ts("verify: after spawn proxy, before read_ready_line");
     let proxy_addr = {
         let stdout = proxy_child
             .stdout
@@ -731,13 +753,16 @@ fn run_verify_subprocess(
             }
         }
     };
+    trace_ts("verify: got proxy ready line");
 
     let verifier_allowlist = [proxy_addr];
+    trace_ts("verify: before maybe_prepare(Verifier)");
     let verifier_sandbox = netguard::maybe_prepare(
         netguard::SandboxMode::Verifier,
         &verifier_allowlist,
         args.allow_unsandboxed,
     )?;
+    trace_ts("verify: after maybe_prepare(Verifier)");
     let mut verifier_cmd = build_child_command(exe, args);
     verifier_cmd
         .arg("--internal-verify")
@@ -756,6 +781,7 @@ fn run_verify_subprocess(
     ];
     apply_env_allowlist(&mut verifier_cmd, &verifier_env);
     drop(verifier_env);
+    trace_ts("verify: before spawn verifier");
     let mut child = match netguard::spawn_command(verifier_cmd, verifier_sandbox.as_ref()) {
         Ok(child) => {
             token::scrub_string(&mut proxy_auth);
@@ -767,6 +793,7 @@ fn run_verify_subprocess(
             return Err(err);
         }
     };
+    trace_ts("verify: after spawn verifier");
 
     {
         let mut stdin = child
@@ -778,11 +805,14 @@ fn run_verify_subprocess(
             .flush()
             .context("Failed to flush verifier input payload")?;
     }
+    trace_ts("verify: wrote action_refs to verifier stdin");
 
     let output = child
         .wait_with_output()
         .context("Failed to read verifier subprocess output")?;
+    trace_ts("verify: verifier exited, terminating proxy");
     terminate_child(&mut proxy_child);
+    trace_ts("verify: proxy terminated");
     ensure_child_success("verifier", output.status)?;
     ipc::read_verification_results(output.stdout.as_slice())
 }

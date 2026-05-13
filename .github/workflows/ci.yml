@@ -63,9 +63,12 @@ jobs:
       # Proptest cases: bumped from the 256 default to 2000 to give
       # parser/encoder properties a more meaningful run per CI execution.
       - name: Unit + integration tests
-        run: cargo test
+        timeout-minutes: 15
+        run: cargo test -- --nocapture --test-threads=1
         env:
           PROPTEST_CASES: "2000"
+          HASP_TRACE: "1"
+          RUST_BACKTRACE: "1"
 
       # Token-gated tests temporarily disabled: GITHUB_TOKEN rate-limit
       # contention across CI/security/release workflows was causing
