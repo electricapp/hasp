@@ -14,8 +14,6 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 // ─── BPF syscall constants ───────────────────────────────────────────────────
