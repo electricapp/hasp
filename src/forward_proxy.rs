@@ -21,7 +21,7 @@ const MAX_AUTH_FAILURES: u32 = 5;
 /// Proxy exits if no connection arrives within this window. Prevents
 /// orphaned proxies (e.g. orchestrator OOM-killed) from holding the
 /// secret in memory indefinitely.
-const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Run as `hasp --internal-forward-proxy`. Reads configuration from env vars,
 /// binds to an ephemeral localhost port, and announces readiness on stdout.
@@ -132,10 +132,10 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
             bail!("Forward proxy shutting down after {MAX_AUTH_FAILURES} auth failures");
         }
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_read_timeout(Some(std::time::Duration::from_mins(1)))
             .context("Failed to set read timeout")?;
         stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(60)))
+            .set_write_timeout(Some(std::time::Duration::from_mins(1)))
             .context("Failed to set write timeout")?;
 
         // Only accept loopback clients

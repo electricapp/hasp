@@ -192,7 +192,7 @@ pub(crate) fn run(
     }
     // Sort by severity: Critical < High < Medium (ascending order)
     // Severity derives Ord based on declaration order: Critical=0, High=1, Medium=2
-    findings.sort_by(|a, b| a.severity.cmp(&b.severity));
+    findings.sort_by_key(|f| f.severity);
     findings
 }
 

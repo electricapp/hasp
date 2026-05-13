@@ -197,31 +197,47 @@ pub(crate) fn spawn_command(mut cmd: Command, sandbox: Option<&SandboxHandle>) -
     #[cfg(not(target_os = "linux"))]
     let _ = sandbox;
 
-    #[cfg(target_os = "linux")]
-    if sandbox.is_some() {
-        // SAFETY: pre_exec runs in the forked child between fork and exec.
-        // We only call async-signal-safe libc functions (kill, getpid).
-        #[allow(unsafe_code)]
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::kill(libc::getpid(), libc::SIGSTOP) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    let child = cmd.spawn().context("Failed to spawn child process")?;
+    // NOTE: we do NOT use a `pre_exec` SIGSTOP hook here. Rust's `Command::spawn`
+    // blocks on a CLOEXEC pipe waiting for the child to exec (the pipe close is
+    // the success signal). A pre_exec SIGSTOP would suspend the child *before*
+    // exec, so the pipe never closes and the parent deadlocks. Instead we let
+    // spawn complete normally and stop+migrate the child immediately afterward.
+    // Race window: child runs from exec to our SIGSTOP, but proxy/verifier do
+    // only env reads + Landlock/seccomp setup before any network call, so the
+    // cgroup is in place before any traffic is generated.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut child = cmd.spawn().context("Failed to spawn child process")?;
 
     #[cfg(target_os = "linux")]
     if let Some(sandbox) = sandbox {
-        wait_for_stop(child.id())?;
-        sandbox.move_pid(child.id())?;
-        resume_process(child.id())?;
+        if let Err(err) = stop_and_migrate(&child, sandbox) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
     }
 
     Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_and_migrate(child: &Child, sandbox: &SandboxHandle) -> Result<()> {
+    let pid = child.id();
+    let pid_t = libc::pid_t::try_from(pid)
+        .map_err(|_| crate::error::Error::new(format!("PID {pid} exceeds pid_t range")))?;
+    // SAFETY: kill is a well-defined POSIX syscall taking pid + signal.
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::kill(pid_t, libc::SIGSTOP) };
+    if ret != 0 {
+        bail!(
+            "Failed to SIGSTOP sandboxed child: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    wait_for_stop(pid)?;
+    sandbox.move_pid(pid)?;
+    resume_process(pid)?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

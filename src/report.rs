@@ -27,7 +27,7 @@ pub(crate) fn print_skipped_refs(skipped: &[SkippedRef]) -> bool {
                     "local ref"
                 }
             };
-            println!("  FAIL  {kind} `{}`  ({})", r.uses_str, r.detail,);
+            println!("  FAIL  {kind} `{}`  ({})", r.uses_str, r.detail);
         }
     }
 
