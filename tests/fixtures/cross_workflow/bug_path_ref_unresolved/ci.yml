@@ -1,9 +1,11 @@
 name: CI
-on: push
-permissions:
-  contents: read
+on: pull_request
+permissions: {}
 jobs:
   b:
     runs-on: ubuntu-latest
     steps:
-      - run: echo hi
+      - run: npm test > report.log
+      - uses: actions/upload-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        with:
+          name: report

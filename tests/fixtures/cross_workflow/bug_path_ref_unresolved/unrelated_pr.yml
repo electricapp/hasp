@@ -1,10 +1,10 @@
-name: Unrelated
+name: UnrelatedPR
 on: pull_request
 permissions: {}
 jobs:
   j:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/upload-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - uses: actions/upload-artifact@cccccccccccccccccccccccccccccccccccccccc
         with:
-          name: blob
+          name: report

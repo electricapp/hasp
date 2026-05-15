@@ -64,10 +64,9 @@ jobs:
       # parser/encoder properties a more meaningful run per CI execution.
       - name: Unit + integration tests
         timeout-minutes: 15
-        run: cargo test -- --nocapture --test-threads=1
+        run: cargo test
         env:
           PROPTEST_CASES: "2000"
-          HASP_TRACE: "1"
           RUST_BACKTRACE: "1"
 
       # Token-gated tests temporarily disabled: GITHUB_TOKEN rate-limit
