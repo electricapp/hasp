@@ -8,13 +8,15 @@ use crate::error::bail;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "linux")]
 use std::net::{SocketAddrV4, SocketAddrV6};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::process::Stdio;
+use std::process::{ChildStdin, ChildStdout, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 
 // ─── BPF syscall constants ───────────────────────────────────────────────────
 // These were removed from the `libc` crate in 0.2.185. Values are from
@@ -98,6 +100,21 @@ impl SandboxMode {
 
 pub(crate) struct SandboxHandle {
     path: PathBuf,
+    /// When the cgroup was set up via the privileged sudo helper, the helper
+    /// stays alive and performs PID migrations on the parent's behalf (the
+    /// unprivileged parent cannot satisfy cgroup v2's common-ancestor
+    /// migration rule on its own — see `prepare_linux_via_sudo`). When the
+    /// unprivileged BPF path succeeded, `helper` is `None` and the parent
+    /// writes `cgroup.procs` directly because it owns the cgroup.
+    #[cfg(target_os = "linux")]
+    helper: Mutex<Option<HelperChannel>>,
+}
+
+#[cfg(target_os = "linux")]
+struct HelperChannel {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
 }
 
 impl SandboxHandle {
@@ -107,13 +124,50 @@ impl SandboxHandle {
 
     #[cfg(target_os = "linux")]
     fn move_pid(&self, pid: u32) -> Result<()> {
-        std::fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
-            .context("Failed to move process into sandbox cgroup")
+        let mut guard = self
+            .helper
+            .lock()
+            .map_err(|_| crate::error::Error::new("BPF helper channel poisoned".to_string()))?;
+        let Some(helper) = guard.as_mut() else {
+            return std::fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
+                .context("Failed to move process into sandbox cgroup");
+        };
+        writeln!(helper.stdin, "{pid}").context("Failed to send PID to BPF helper")?;
+        helper
+            .stdin
+            .flush()
+            .context("Failed to flush PID to BPF helper")?;
+        let mut response = String::new();
+        let n = helper
+            .stdout
+            .read_line(&mut response)
+            .context("Failed to read BPF helper response")?;
+        if n == 0 {
+            bail!("BPF helper closed stdout without responding to PID {pid}");
+        }
+        let trimmed = response.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let Some(echoed) = trimmed.strip_prefix("OK\t") else {
+            bail!("BPF helper rejected migration of PID {pid}: {trimmed}");
+        };
+        if echoed != pid.to_string() {
+            bail!("BPF helper response PID mismatch: expected {pid}, got {echoed}");
+        }
+        Ok(())
     }
 }
 
 impl Drop for SandboxHandle {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Ok(mut guard) = self.helper.lock()
+            && let Some(mut helper) = guard.take()
+        {
+            // Dropping stdin closes the pipe, signaling EOF to the helper.
+            // The helper exits its read loop and returns. Reaping the child
+            // here avoids leaving a zombie.
+            drop(helper.stdin);
+            let _ = helper.child.wait();
+        }
         let _ = std::fs::remove_dir(&self.path);
     }
 }
@@ -137,8 +191,7 @@ pub(crate) fn maybe_prepare(
             Err(err) => {
                 // If BPF failed (EPERM) and this mode supports sudo, try elevated helper
                 if mode.use_sudo_fallback()
-                    && (err.msg().contains("BPF")
-                        || err.msg().contains("Failed to create cgroup"))
+                    && (err.msg().contains("BPF") || err.msg().contains("Failed to create cgroup"))
                 {
                     eprintln!("hasp: note: unprivileged BPF unavailable, trying sudo helper...");
                     match prepare_linux_via_sudo(mode, allowlist) {
@@ -272,11 +325,7 @@ pub(crate) fn spawn_command(
 }
 
 #[cfg(target_os = "linux")]
-fn stop_and_migrate(
-    child: &Child,
-    sandbox: &SandboxHandle,
-    protocol: StopProtocol,
-) -> Result<()> {
+fn stop_and_migrate(child: &Child, sandbox: &SandboxHandle, protocol: StopProtocol) -> Result<()> {
     let pid = child.id();
     if matches!(protocol, StopProtocol::ParentStop) {
         // The child is an arbitrary binary that won't self-SIGSTOP. Send
@@ -537,7 +586,10 @@ fn prepare_linux(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result<SandboxH
         libc::close(cgroup_fd);
     }
 
-    Ok(SandboxHandle { path: cgroup_path })
+    Ok(SandboxHandle {
+        path: cgroup_path,
+        helper: Mutex::new(None),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -969,11 +1021,21 @@ fn load_sock_addr_prog(
 
 // ─── Privileged BPF helper ──────────────────────────────────────────────────
 //
-// When unprivileged BPF is disabled (the default on Ubuntu), `hasp exec` spawns
-// a short-lived `sudo hasp --internal-bpf-helper` process that creates the
-// cgroup, loads BPF programs, delegates the cgroup to the original user, and
-// exits. The BPF programs persist on the cgroup after the helper exits.
-// The unprivileged parent then moves the child process into the cgroup.
+// When unprivileged BPF is disabled (the default on Ubuntu), `hasp` spawns
+// `sudo hasp --internal-bpf-helper` to create the cgroup and load BPF programs
+// as root. The helper then stays alive on the other end of a pipe, accepting
+// decimal PIDs on stdin and writing them to `cgroup.procs` (still as root) on
+// the parent's behalf. This sidesteps cgroup v2's "common ancestor" migration
+// rule, which an unprivileged parent cannot satisfy because the source cgroup
+// (the runner's own cgroup) is root-owned.
+//
+// Protocol on the helper's stdio (newline-delimited, UTF-8):
+//   helper → parent (once at startup): "<BPF_READY_MAGIC>\t<cgroup_path>\n"
+//   parent → helper (per migration):  "<pid>\n"
+//   helper → parent (per migration):  "OK\t<pid>\n"  on success
+//                                  or "ERR\t<reason>\n" on failure
+// EOF on stdin (parent dropped its end) means "shut down" — the helper exits
+// cleanly and leaves cgroup removal to the parent's SandboxHandle::Drop.
 //
 
 /// Entry point for `hasp --internal-bpf-helper`. Runs as root via sudo.
@@ -985,15 +1047,43 @@ pub(crate) fn run_bpf_helper() -> Result<()> {
     let group_id = parse_helper_u32(BPF_HELPER_OWNER_GID_ENV)?;
 
     let handle = prepare_linux(mode, &allowlist)?;
-    delegate_cgroup(&handle.path, user_id, group_id)?;
+    // Chown the cgroup directory so the unprivileged parent can rmdir it
+    // when its SandboxHandle drops. cgroup.procs stays root-owned because
+    // the helper performs all migrations.
+    chown_path(&handle.path, user_id, group_id)?;
+    let cgroup_procs = handle.path.join("cgroup.procs");
 
+    {
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        writeln!(lock, "{BPF_READY_MAGIC}\t{}", handle.path.display())
+            .context("Failed to announce BPF helper readiness")?;
+        lock.flush().context("Failed to flush BPF helper output")?;
+    }
+
+    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    writeln!(lock, "{BPF_READY_MAGIC}\t{}", handle.path.display())
-        .context("Failed to announce BPF helper readiness")?;
-    lock.flush().context("Failed to flush BPF helper output")?;
+    for maybe_line in stdin.lock().lines() {
+        let line = maybe_line.context("Failed to read migration request from parent")?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let response = match trimmed.parse::<u32>() {
+            Ok(pid) => match std::fs::write(&cgroup_procs, format!("{pid}\n")) {
+                Ok(()) => format!("OK\t{pid}\n"),
+                Err(err) => format!("ERR\tcgroup-write: {err}\n"),
+            },
+            Err(_) => format!("ERR\tinvalid-pid: {trimmed}\n"),
+        };
+        let mut out = stdout.lock();
+        out.write_all(response.as_bytes())
+            .context("Failed to write migration response")?;
+        out.flush().context("Failed to flush migration response")?;
+    }
 
-    // Parent takes ownership of the cgroup — suppress cleanup on drop.
+    // Parent closed our stdin: clean shutdown. Cgroup teardown is the
+    // parent's responsibility (its SandboxHandle::Drop), so don't rmdir here.
     let _keep = std::mem::ManuallyDrop::new(handle);
     Ok(())
 }
@@ -1023,7 +1113,9 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
 
     // Use `sudo env KEY=VALUE ... hasp --internal-bpf-helper` so that env
     // vars survive regardless of the system's sudoers env_reset policy.
-    let output = Command::new("sudo")
+    // Helper stays alive — we only spawn here, never `output()` (which would
+    // wait for the child to exit).
+    let mut child = Command::new("sudo")
         .args(["--non-interactive", "env"])
         .arg(format!("{BPF_HELPER_ALLOWLIST_ENV}={addrs_str}"))
         .arg(format!("{BPF_HELPER_MODE_ENV}={}", mode.label()))
@@ -1031,29 +1123,42 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
         .arg(format!("{BPF_HELPER_OWNER_GID_ENV}={gid}"))
         .arg(&exe)
         .arg("--internal-bpf-helper")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .output()
+        .spawn()
         .context("Failed to spawn sudo BPF helper")?;
 
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        bail!("sudo BPF helper exited with code {code}");
+    let stdin = child
+        .stdin
+        .take()
+        .context("BPF helper stdin was not piped")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("BPF helper stdout was not piped")?;
+    let mut stdout_reader = BufReader::new(stdout);
+
+    let mut ready_line = String::new();
+    let n = stdout_reader
+        .read_line(&mut ready_line)
+        .context("Failed to read ready line from BPF helper")?;
+    if n == 0 {
+        // Helper exited before announcing — most likely BPF setup failed
+        // or sudo itself rejected the invocation.
+        let status = child.wait().context("Failed to reap dead BPF helper")?;
+        let code = status.code().unwrap_or(-1);
+        bail!("sudo BPF helper exited with code {code} before announcing ready");
+    }
+    let trimmed = ready_line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    let Some((magic, path_str)) = trimmed.split_once('\t') else {
+        bail!("Malformed BPF helper ready line: {trimmed}");
+    };
+    if magic != BPF_READY_MAGIC {
+        bail!("Malformed BPF helper ready line: {trimmed}");
     }
 
-    let stdout_str = String::from_utf8(output.stdout)
-        .map_err(|_| crate::error::Error::new("BPF helper produced non-UTF8 output".to_string()))?;
-    let line = stdout_str
-        .lines()
-        .next()
-        .context("BPF helper produced no output")?;
-    let parts: Vec<&str> = line.splitn(2, '\t').collect();
-    if parts.len() != 2 || parts[0] != BPF_READY_MAGIC {
-        bail!("Malformed BPF helper ready line");
-    }
-
-    let path = PathBuf::from(parts[1]);
+    let path = PathBuf::from(path_str);
     if !path.is_dir() {
         bail!(
             "BPF helper returned non-existent cgroup path: {}",
@@ -1061,15 +1166,14 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
         );
     }
 
-    Ok(SandboxHandle { path })
-}
-
-/// `chown` the cgroup directory and `cgroup.procs` so the unprivileged parent
-/// can move processes into the cgroup and clean it up on exit.
-#[cfg(target_os = "linux")]
-fn delegate_cgroup(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    chown_path(path, uid, gid)?;
-    chown_path(&path.join("cgroup.procs"), uid, gid)
+    Ok(SandboxHandle {
+        path,
+        helper: Mutex::new(Some(HelperChannel {
+            child,
+            stdin,
+            stdout: stdout_reader,
+        })),
+    })
 }
 
 #[cfg(target_os = "linux")]
