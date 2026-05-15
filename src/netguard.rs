@@ -145,7 +145,7 @@ impl SandboxHandle {
         if n == 0 {
             bail!("BPF helper closed stdout without responding to PID {pid}");
         }
-        let trimmed = response.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let trimmed = response.trim_end_matches(['\n', '\r']);
         let Some(echoed) = trimmed.strip_prefix("OK\t") else {
             bail!("BPF helper rejected migration of PID {pid}: {trimmed}");
         };
@@ -691,11 +691,16 @@ fn update_v4_allowlist(map_fd: libc::c_int, target: SocketAddrV4) -> Result<()> 
         port: u32,
     }
 
-    // IPv4 octets are in network byte order (big-endian).
-    // The kernel's bpf_sock_addr.user_ip4 field is also in network byte order.
-    // Use from_be_bytes to convert correctly on all architectures.
+    // BPF's `ldx user_ip4 ; stx key+0` preserves the four address bytes in
+    // memory: the kernel's user_ip4 is stored in network byte order and BPF
+    // restores those same bytes into the key. The hash map matches keys
+    // byte-by-byte, so the Rust-side u32 must have those network-order
+    // octets as its in-memory representation. `from_ne_bytes` is the only
+    // conversion that lays the octets out unchanged in memory on both
+    // little- and big-endian hosts; `from_be_bytes` byte-reverses them on
+    // little-endian and silently produces a key that never matches.
     let key = Key {
-        ip: u32::from_be_bytes(target.ip().octets()),
+        ip: u32::from_ne_bytes(target.ip().octets()),
         port: u32::from(target.port().to_be()),
     };
     update_map(map_fd, &key, &1_u8)
@@ -709,15 +714,17 @@ fn update_v6_allowlist(map_fd: libc::c_int, target: SocketAddrV6) -> Result<()> 
         port: u32,
     }
 
-    // IPv6 octets are in network byte order. The kernel's bpf_sock_addr.user_ip6 is also
-    // in network byte order. Use from_be_bytes on each 4-byte chunk.
+    // Same memory-byte preservation as v4 (see `update_v4_allowlist`):
+    // each 4-byte chunk of user_ip6 is copied verbatim by the BPF program,
+    // so we must encode the host-side key with the network-order octets in
+    // memory. `from_ne_bytes` does that on both endiannesses.
     let octets = target.ip().octets();
     let key = Key {
         ip: [
-            u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]),
-            u32::from_be_bytes([octets[4], octets[5], octets[6], octets[7]]),
-            u32::from_be_bytes([octets[8], octets[9], octets[10], octets[11]]),
-            u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]]),
+            u32::from_ne_bytes([octets[0], octets[1], octets[2], octets[3]]),
+            u32::from_ne_bytes([octets[4], octets[5], octets[6], octets[7]]),
+            u32::from_ne_bytes([octets[8], octets[9], octets[10], octets[11]]),
+            u32::from_ne_bytes([octets[12], octets[13], octets[14], octets[15]]),
         ],
         port: u32::from(target.port().to_be()),
     };
@@ -1150,7 +1157,7 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
         let code = status.code().unwrap_or(-1);
         bail!("sudo BPF helper exited with code {code} before announcing ready");
     }
-    let trimmed = ready_line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    let trimmed = ready_line.trim_end_matches(['\n', '\r']);
     let Some((magic, path_str)) = trimmed.split_once('\t') else {
         bail!("Malformed BPF helper ready line: {trimmed}");
     };
