@@ -526,6 +526,50 @@ jobs:
 }
 
 #[test]
+fn sigstore_only_workflow_does_not_emit_no_policy_advisory() {
+    let repo = make_git_repo("oidc_sigstore_only");
+    write_workflow(
+        &repo,
+        "release.yml",
+        "name: Release
+on: push
+permissions:
+  id-token: write
+  contents: write
+  attestations: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/attest-build-provenance@a2bbfa25375f
+        with:
+          subject-path: 'dist/*'
+",
+    );
+    commit_all(&repo, "workflow");
+
+    let o = run(
+        &repo,
+        &[
+            "--dir",
+            ".github/workflows",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+            "--paranoid",
+        ],
+    );
+    let out = combined(&o).to_lowercase();
+    assert!(
+        !out.contains("oidc trust policy not configured"),
+        "Sigstore-only id-token usage must not trigger the configure-policy \
+         advisory, got:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn no_oidc_flag_suppresses_category() {
     let repo = make_git_repo("oidc_noflag");
     write_workflow(

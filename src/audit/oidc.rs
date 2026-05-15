@@ -10,7 +10,7 @@ use yaml_rust2::Yaml;
 
 use crate::oidc::{GlobToken, OidcAcceptance, SubKind, SubPattern};
 
-use super::{AuditFinding, Severity, key_jobs, key_on, key_permissions, key_steps};
+use super::{AuditFinding, Severity, key_jobs, key_on, key_permissions, key_steps, key_uses};
 
 /// Per-workflow facts relevant to OIDC audit.
 #[allow(clippy::struct_excessive_bools)] // trigger/permission flags are inherently boolean
@@ -18,6 +18,13 @@ use super::{AuditFinding, Severity, key_jobs, key_on, key_permissions, key_steps
 struct OidcWorkflowFacts {
     file: PathBuf,
     uses_oidc: bool,
+    /// True when the workflow consumes its `id-token` solely for Sigstore-
+    /// based signing / SLSA provenance (Fulcio identity), rather than for
+    /// AWS/GCP/Azure cloud federation. The "configure a trust policy"
+    /// advisory must not fire on such workflows — Sigstore has no
+    /// cloud-side trust policy to audit, and flagging it would be a false
+    /// positive for the common signing pattern.
+    uses_sigstore: bool,
     /// Triggered by `pull_request` OR `pull_request_target`.
     pr_triggered: bool,
     /// Triggered specifically by `pull_request_target` — the most dangerous
@@ -33,6 +40,24 @@ struct OidcWorkflowFacts {
     branches: HashSet<String>,
     /// `environment:` declarations (from any job).
     environments: HashSet<String>,
+}
+
+/// Action `uses:` references that consume `id-token` for Sigstore Fulcio
+/// signing or SLSA provenance attestation. Match is against the bare
+/// `owner/repo` (or `owner/repo/path`) — version pin stripped before lookup.
+const SIGSTORE_ACTIONS: &[&str] = &[
+    "sigstore/cosign-installer",
+    "sigstore/gh-action-sigstore-python",
+    "sigstore/sigstore-python",
+    "actions/attest",
+    "actions/attest-build-provenance",
+    "actions/attest-sbom",
+];
+
+fn is_sigstore_uses(uses: &str) -> bool {
+    // `owner/repo@ref` → `owner/repo`; also handles `owner/repo/path@ref`.
+    let bare = uses.split_once('@').map_or(uses, |(b, _)| b);
+    SIGSTORE_ACTIONS.contains(&bare)
 }
 
 fn extract_facts(file: &Path, doc: &Yaml) -> OidcWorkflowFacts {
@@ -68,10 +93,16 @@ fn extract_facts(file: &Path, doc: &Yaml) -> OidcWorkflowFacts {
             }
             if let Some(Yaml::Array(steps)) = job_map.get(key_steps()) {
                 for step in steps {
-                    if let Some(step_map) = step.as_hash()
-                        && let Some(env) = step_map.get(&Yaml::String("environment".to_string()))
-                    {
+                    let Some(step_map) = step.as_hash() else {
+                        continue;
+                    };
+                    if let Some(env) = step_map.get(&Yaml::String("environment".to_string())) {
                         collect_environments(env, &mut facts.environments);
+                    }
+                    if let Some(uses) = step_map.get(key_uses()).and_then(Yaml::as_str)
+                        && is_sigstore_uses(uses)
+                    {
+                        facts.uses_sigstore = true;
                     }
                 }
             }
@@ -425,28 +456,29 @@ fn check_pull_request_target_with_oidc(
 /// Informational: a workflow declares `id-token: write` but no trust policy is
 /// configured. We can't audit acceptance breadth without one, so the user
 /// should point hasp at the relevant policy files.
+///
+/// Workflows whose only `id-token: write` consumer is a Sigstore action
+/// (Fulcio signing, SLSA attestation) are excluded — there is no
+/// cloud-side trust policy to audit for that case, and flagging it would
+/// be a false positive against the standard release-signing pattern.
 fn check_oidc_without_trust_policy(
     facts: &[OidcWorkflowFacts],
     findings: &mut Vec<AuditFinding>,
     is_warning: bool,
 ) {
-    let any_oidc = facts.iter().any(|f| f.uses_oidc);
-    if !any_oidc {
+    let Some(culprit) = facts.iter().find(|f| f.uses_oidc && !f.uses_sigstore) else {
         return;
-    }
-    let workflow_file = facts
-        .iter()
-        .find(|f| f.uses_oidc)
-        .map_or_else(PathBuf::new, |f| f.file.clone());
+    };
     findings.push(AuditFinding {
-        file: workflow_file,
+        file: culprit.file.clone(),
         severity: Severity::Medium,
-        title: "oidc trust policy not configured".to_string(),
-        detail: "At least one workflow declares `id-token: write` but no OIDC \
-                 trust policy is configured for hasp to audit. Without a trust \
-                 policy hasp cannot detect over-broad acceptance patterns on the \
-                 cloud side. Pass `--oidc-policy <provider>:<path>` or add an \
-                 `oidc:` section to `.hasp.yml` referencing the AWS/GCP/Azure \
+        title: "OIDC trust policy not configured".to_string(),
+        detail: "At least one workflow declares `id-token: write` (and does not \
+                 appear to use it solely for Sigstore signing or SLSA attestation) \
+                 but no OIDC trust policy is configured for hasp to audit. Without \
+                 a trust policy hasp cannot detect over-broad acceptance patterns \
+                 on the cloud side. Pass `--oidc-policy <provider>:<path>` or add \
+                 an `oidc:` section to `.hasp.yml` referencing the AWS/GCP/Azure \
                  trust policy file(s) you deploy to."
             .to_string(),
         is_warning,
