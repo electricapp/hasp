@@ -24,9 +24,29 @@ use yaml_rust2::Yaml;
 
 use super::{OidcAcceptance, OidcProvider, SubPattern};
 
-const GH_ISSUER_SUFFIX: &str = "token.actions.githubusercontent.com";
+const GH_ISSUER_HOST: &str = "token.actions.githubusercontent.com";
+/// Marker that separates the OIDC-provider component of the ARN from the
+/// issuer host. AWS ARNs are formatted
+/// `arn:aws:iam::<account>:oidc-provider/<host>`.
+const GH_OIDC_PROVIDER_MARKER: &str = ":oidc-provider/";
 const SUB_KEY: &str = "token.actions.githubusercontent.com:sub";
 const AUD_KEY: &str = "token.actions.githubusercontent.com:aud";
+
+/// True iff `arn` is a GitHub OIDC provider ARN with the exact issuer host —
+/// not a look-alike like `evil.token.actions.githubusercontent.com.attacker`.
+///
+/// AWS OIDC provider ARNs are formatted
+/// `arn:aws:iam::<account>:oidc-provider/<host>`. We split on
+/// `:oidc-provider/` and require the trailing segment to equal the issuer host
+/// EXACTLY.
+fn is_github_provider_arn(arn: &str) -> bool {
+    if let Some((_, host)) = arn.rsplit_once(GH_OIDC_PROVIDER_MARKER) {
+        return host == GH_ISSUER_HOST;
+    }
+    // Fallback: a policy author wrote just the bare host (some templates do
+    // this). Accept an exact match.
+    arn == GH_ISSUER_HOST
+}
 
 #[allow(clippy::unnecessary_wraps)] // uniform signature with gcp/azure
 pub(crate) fn parse(doc: &Yaml, path: &Path) -> Result<Vec<OidcAcceptance>> {
@@ -34,11 +54,13 @@ pub(crate) fn parse(doc: &Yaml, path: &Path) -> Result<Vec<OidcAcceptance>> {
         return Ok(Vec::new());
     };
 
-    let statements = map
-        .get(&Yaml::String("Statement".to_string()))
-        .and_then(Yaml::as_vec)
-        .cloned()
-        .unwrap_or_default();
+    // `Statement` may be a JSON array OR a single object — IAM accepts both.
+    // Normalize to a Vec so the rest of the parser is uniform.
+    let statements: Vec<Yaml> = match map.get(&Yaml::String("Statement".to_string())) {
+        Some(Yaml::Array(arr)) => arr.clone(),
+        Some(stmt) if stmt.as_hash().is_some() => vec![stmt.clone()],
+        _ => Vec::new(),
+    };
 
     let mut acceptances = Vec::new();
 
@@ -101,10 +123,10 @@ fn statement_trusts_github(stmt: &yaml_rust2::yaml::Hash) -> bool {
 
     #[allow(clippy::wildcard_enum_match_arm)]
     match federated {
-        Yaml::String(s) => s.contains(GH_ISSUER_SUFFIX),
+        Yaml::String(s) => is_github_provider_arn(s),
         Yaml::Array(arr) => arr
             .iter()
-            .any(|v| v.as_str().is_some_and(|s| s.contains(GH_ISSUER_SUFFIX))),
+            .any(|v| v.as_str().is_some_and(is_github_provider_arn)),
         _ => false,
     }
 }
@@ -241,6 +263,85 @@ mod tests {
         assert_eq!(acceptances.len(), 1);
         assert_eq!(acceptances[0].audiences.len(), 2);
         assert_eq!(acceptances[0].sub_patterns.len(), 2);
+    }
+
+    #[test]
+    fn aws_safe_single_object_statement() {
+        // Single-object form
+        let single = parse_text(
+            r#"{
+              "Version": "2012-10-17",
+              "Statement": {
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+                  "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:*" }
+                }
+              }
+            }"#,
+        );
+        // Equivalent array form
+        let array = parse_text(
+            r#"{
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::123:oidc-provider/token.actions.githubusercontent.com" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+                  "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:*" }
+                }
+              }]
+            }"#,
+        );
+        assert_eq!(single.len(), 1, "single-object Statement was dropped");
+        assert_eq!(single.len(), array.len());
+        assert_eq!(single[0].audiences, array[0].audiences);
+        assert_eq!(single[0].sub_patterns.len(), array[0].sub_patterns.len());
+        assert_eq!(
+            single[0].sub_patterns[0].repo.raw,
+            array[0].sub_patterns[0].repo.raw
+        );
+    }
+
+    #[test]
+    fn rejects_lookalike_github_issuer() {
+        let acceptances = parse_text(
+            r#"{
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::1:oidc-provider/evil.token.actions.githubusercontent.com.attacker.com" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringLike": { "token.actions.githubusercontent.com:sub": "repo:a/b:*" }
+                }
+              }]
+            }"#,
+        );
+        assert!(
+            acceptances.is_empty(),
+            "look-alike host must not be treated as GitHub: {acceptances:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_suffix_lookalike_github_issuer() {
+        let acceptances = parse_text(
+            r#"{
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com.attacker.com" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringLike": { "token.actions.githubusercontent.com:sub": "repo:a/b:*" }
+                }
+              }]
+            }"#,
+        );
+        assert!(acceptances.is_empty());
     }
 
     #[test]

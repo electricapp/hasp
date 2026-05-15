@@ -198,15 +198,11 @@ fn parse_scanner_args(args: &mut Args, mut iter: impl Iterator<Item = String>) {
                     std::process::exit(2);
                 });
                 let Some((provider, path)) = raw.split_once(':') else {
-                    eprintln!(
-                        "hasp: --oidc-policy expects <provider>:<path>, got {raw:?}"
-                    );
+                    eprintln!("hasp: --oidc-policy expects <provider>:<path>, got {raw:?}");
                     std::process::exit(2);
                 };
                 if provider.is_empty() || path.is_empty() {
-                    eprintln!(
-                        "hasp: --oidc-policy expects <provider>:<path>, got {raw:?}"
-                    );
+                    eprintln!("hasp: --oidc-policy expects <provider>:<path>, got {raw:?}");
                     std::process::exit(2);
                 }
                 args.oidc_policies
@@ -345,6 +341,12 @@ OPTIONS:
                       repo root]. Policy enables checks per-action and extends
                       trust lists.
         --no-policy   Ignore .hasp.yml policy file
+        --oidc-policy <PROVIDER>:<PATH>
+                      Audit a cloud OIDC trust policy against the workflows
+                      that mint GitHub OIDC tokens. PROVIDER is one of
+                      aws, gcp, or azure. Repeatable. Also configurable via
+                      the .hasp.yml `oidc:` section.
+        --no-oidc     Skip OIDC trust-policy auditing entirely
         --diff-base <REF>
                       Show upstream changelog for actions whose pinned SHA
                       changed since <REF> (e.g. HEAD~1, main). Compares

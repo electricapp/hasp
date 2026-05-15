@@ -1,0 +1,8 @@
+{
+  "name": "projects/123/locations/global/workloadIdentityPools/p/providers/gh",
+  "oidc": {
+    "issuerUri": "https://token.actions.githubusercontent.com",
+    "allowedAudiences": ["https://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/gh"]
+  },
+  "attributeCondition": "assertion.repository=='*'"
+}

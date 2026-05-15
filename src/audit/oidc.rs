@@ -13,10 +13,19 @@ use crate::oidc::{GlobToken, OidcAcceptance, SubKind, SubPattern};
 use super::{AuditFinding, Severity, key_jobs, key_on, key_permissions, key_steps};
 
 /// Per-workflow facts relevant to OIDC audit.
+#[allow(clippy::struct_excessive_bools)] // trigger/permission flags are inherently boolean
 #[derive(Debug, Clone, Default)]
 struct OidcWorkflowFacts {
+    file: PathBuf,
     uses_oidc: bool,
+    /// Triggered by `pull_request` OR `pull_request_target`.
     pr_triggered: bool,
+    /// Triggered specifically by `pull_request_target` — the most dangerous
+    /// GitHub trigger because it runs in the context of the base repository
+    /// with access to secrets, while checking out attacker-controlled code by
+    /// default. Tracked separately so we can fire an independent finding
+    /// regardless of trust-policy contents.
+    pr_target_triggered: bool,
     #[allow(dead_code)]
     workflow_dispatch: bool,
     /// Branches/tags the workflow can run on (from `on.push.branches`,
@@ -26,8 +35,11 @@ struct OidcWorkflowFacts {
     environments: HashSet<String>,
 }
 
-fn extract_facts(_file: &Path, doc: &Yaml) -> OidcWorkflowFacts {
-    let mut facts = OidcWorkflowFacts::default();
+fn extract_facts(file: &Path, doc: &Yaml) -> OidcWorkflowFacts {
+    let mut facts = OidcWorkflowFacts {
+        file: file.to_path_buf(),
+        ..OidcWorkflowFacts::default()
+    };
     let Some(map) = doc.as_hash() else {
         return facts;
     };
@@ -57,8 +69,7 @@ fn extract_facts(_file: &Path, doc: &Yaml) -> OidcWorkflowFacts {
             if let Some(Yaml::Array(steps)) = job_map.get(key_steps()) {
                 for step in steps {
                     if let Some(step_map) = step.as_hash()
-                        && let Some(env) =
-                            step_map.get(&Yaml::String("environment".to_string()))
+                        && let Some(env) = step_map.get(&Yaml::String("environment".to_string()))
                     {
                         collect_environments(env, &mut facts.environments);
                     }
@@ -111,7 +122,11 @@ fn extract_triggers(on: &Yaml, facts: &mut OidcWorkflowFacts) {
 
 fn classify_trigger(name: &str, facts: &mut OidcWorkflowFacts) {
     match name {
-        "pull_request" | "pull_request_target" => facts.pr_triggered = true,
+        "pull_request" => facts.pr_triggered = true,
+        "pull_request_target" => {
+            facts.pr_triggered = true;
+            facts.pr_target_triggered = true;
+        }
         "workflow_dispatch" => facts.workflow_dispatch = true,
         _ => {}
     }
@@ -119,7 +134,10 @@ fn classify_trigger(name: &str, facts: &mut OidcWorkflowFacts) {
 
 fn collect_branch_filter(map: &yaml_rust2::yaml::Hash, out: &mut HashSet<String>) {
     for key in ["branches", "branches-ignore", "tags", "tags-ignore"] {
-        if let Some(list) = map.get(&Yaml::String(key.to_string())).and_then(Yaml::as_vec) {
+        if let Some(list) = map
+            .get(&Yaml::String(key.to_string()))
+            .and_then(Yaml::as_vec)
+        {
             for v in list {
                 if let Some(s) = v.as_str() {
                     out.insert(s.to_string());
@@ -135,7 +153,9 @@ fn collect_environments(value: &Yaml, out: &mut HashSet<String>) {
         return;
     }
     if let Some(map) = value.as_hash()
-        && let Some(name) = map.get(&Yaml::String("name".to_string())).and_then(Yaml::as_str)
+        && let Some(name) = map
+            .get(&Yaml::String("name".to_string()))
+            .and_then(Yaml::as_str)
     {
         out.insert(name.to_string());
     }
@@ -154,10 +174,7 @@ fn check_missing_audience(
             findings.push(AuditFinding {
                 file: acc.file.clone(),
                 severity: Severity::Medium,
-                title: format!(
-                    "OIDC trust policy ({}) accepts any audience",
-                    acc.provider
-                ),
+                title: format!("OIDC trust policy ({}) accepts any audience", acc.provider),
                 detail: format!(
                     "The trust policy at {} ({}) does not constrain the `aud` \
                      claim of GitHub OIDC tokens. Any GitHub Actions workflow that \
@@ -181,8 +198,7 @@ fn check_pattern_breadth(
     is_warning: bool,
 ) {
     // Only workflows that actually mint OIDC tokens are relevant.
-    let oidc_workflows: Vec<&OidcWorkflowFacts> =
-        facts.iter().filter(|f| f.uses_oidc).collect();
+    let oidc_workflows: Vec<&OidcWorkflowFacts> = facts.iter().filter(|f| f.uses_oidc).collect();
 
     for acc in acceptances {
         for sp in &acc.sub_patterns {
@@ -286,9 +302,16 @@ fn check_pattern_breadth(
     }
 }
 
-/// Check: trust policy accepts PR refs (`refs/pull/*`) but no PR-triggered
-/// workflow declares `id-token: write` — dead entry at best, latent exploit
-/// path at worst.
+/// Check: trust policy accepts PR refs (`refs/pull/*`).
+///
+/// We emit one of two related findings:
+///
+/// * If NO PR-triggered workflow declares `id-token: write`, this is a dead
+///   entry at best, latent exploit path at worst — flag it.
+/// * If a PR-triggered workflow ALSO declares `id-token: write`, the situation
+///   is materially worse: a PR event can mint a federated identity. Flag it
+///   with a louder title. This is the case where the finding matters most,
+///   and previous versions short-circuited it away.
 fn check_pr_ref_accepted(
     acceptances: &[OidcAcceptance],
     facts: &[OidcWorkflowFacts],
@@ -296,25 +319,17 @@ fn check_pr_ref_accepted(
     is_warning: bool,
 ) {
     let pr_oidc_exists = facts.iter().any(|f| f.uses_oidc && f.pr_triggered);
-    if pr_oidc_exists {
-        // PR workflow with id-token: write deserves its own investigation, but
-        // it's not a "dead entry" situation here.
-        return;
-    }
 
     for acc in acceptances {
         for sp in &acc.sub_patterns {
-            if sp.kind == SubKind::PullRequest {
-                emit_pr_ref_finding(acc, sp, findings, is_warning);
-                continue;
-            }
-            if sp.kind == SubKind::Ref
-                && sp
-                    .value
-                    .as_ref()
-                    .is_some_and(|g| g.raw.contains("refs/pull"))
-            {
-                emit_pr_ref_finding(acc, sp, findings, is_warning);
+            let accepts_pr_ref = sp.kind == SubKind::PullRequest
+                || (sp.kind == SubKind::Ref
+                    && sp
+                        .value
+                        .as_ref()
+                        .is_some_and(|g| g.raw.contains("refs/pull")));
+            if accepts_pr_ref {
+                emit_pr_ref_finding(acc, sp, findings, is_warning, pr_oidc_exists);
             }
         }
     }
@@ -325,36 +340,122 @@ fn emit_pr_ref_finding(
     sp: &SubPattern,
     findings: &mut Vec<AuditFinding>,
     is_warning: bool,
+    pr_oidc_exists: bool,
 ) {
+    let (title, detail) = if pr_oidc_exists {
+        (
+            format!(
+                "OIDC trust policy ({}) accepts PR refs and a PR workflow mints OIDC tokens",
+                acc.provider
+            ),
+            format!(
+                "The trust policy at {} ({}) accepts `{}` — a pull-request ref — \
+                 AND a pull-request-triggered workflow in this repository declares \
+                 `id-token: write`. This combination lets a pull request assume the \
+                 federated identity, including PRs from forks. Remove the PR ref \
+                 from the accepted `sub` patterns or restrict the PR workflow's \
+                 `id-token` permission.",
+                acc.file.display(),
+                acc.location,
+                sp.raw,
+            ),
+        )
+    } else {
+        (
+            format!(
+                "OIDC trust policy ({}) accepts PR refs, but no PR workflow mints OIDC tokens",
+                acc.provider
+            ),
+            format!(
+                "The trust policy at {} ({}) accepts `{}` — a pull-request ref — \
+                 but no PR-triggered workflow in this repository declares \
+                 `id-token: write`. Either this is a dead entry (remove it) or an \
+                 attacker-reachable exploit path waiting to be enabled (most \
+                 projects don't want PR events to assume federated identities). \
+                 Remove the PR ref from the accepted `sub` patterns.",
+                acc.file.display(),
+                acc.location,
+                sp.raw,
+            ),
+        )
+    };
     findings.push(AuditFinding {
         file: acc.file.clone(),
         severity: Severity::High,
-        title: format!(
-            "OIDC trust policy ({}) accepts PR refs, but no PR workflow mints OIDC tokens",
-            acc.provider
-        ),
-        detail: format!(
-            "The trust policy at {} ({}) accepts `{}` — a pull-request ref — but no \
-             PR-triggered workflow in this repository declares `id-token: write`. \
-             Either this is a dead entry (remove it) or an attacker-reachable \
-             exploit path waiting to be enabled (most projects don't want PR \
-             events to assume federated identities). Remove the PR ref from the \
-             accepted `sub` patterns.",
-            acc.file.display(),
-            acc.location,
-            sp.raw,
-        ),
+        title,
+        detail,
+        is_warning,
+    });
+}
+
+/// Check: any workflow with `pull_request_target` AND `id-token: write`.
+///
+/// This is independent of trust-policy contents — even with a perfectly safe
+/// trust policy, the combo is itself a strong red flag because
+/// `pull_request_target` runs in the base repo's context (with secrets) while
+/// the PR head is attacker-controlled by default.
+fn check_pull_request_target_with_oidc(
+    facts: &[OidcWorkflowFacts],
+    findings: &mut Vec<AuditFinding>,
+    is_warning: bool,
+) {
+    for f in facts {
+        if f.pr_target_triggered && f.uses_oidc {
+            findings.push(AuditFinding {
+                file: f.file.clone(),
+                severity: Severity::High,
+                title: "pull_request_target with id-token: write".to_string(),
+                detail: format!(
+                    "Workflow {} is triggered by `pull_request_target` AND grants \
+                     `id-token: write`. `pull_request_target` runs with the base \
+                     repository's secrets and tokens while the PR head ref is \
+                     attacker-controlled, so any code path that checks out or \
+                     evaluates the head ref can be made to mint a federated OIDC \
+                     token. Either drop `pull_request_target`, drop `id-token: \
+                     write`, or guard token issuance behind an explicit \
+                     `if:` that excludes fork PRs.",
+                    f.file.display(),
+                ),
+                is_warning,
+            });
+        }
+    }
+}
+
+/// Informational: a workflow declares `id-token: write` but no trust policy is
+/// configured. We can't audit acceptance breadth without one, so the user
+/// should point hasp at the relevant policy files.
+fn check_oidc_without_trust_policy(
+    facts: &[OidcWorkflowFacts],
+    findings: &mut Vec<AuditFinding>,
+    is_warning: bool,
+) {
+    let any_oidc = facts.iter().any(|f| f.uses_oidc);
+    if !any_oidc {
+        return;
+    }
+    let workflow_file = facts
+        .iter()
+        .find(|f| f.uses_oidc)
+        .map_or_else(PathBuf::new, |f| f.file.clone());
+    findings.push(AuditFinding {
+        file: workflow_file,
+        severity: Severity::Medium,
+        title: "oidc trust policy not configured".to_string(),
+        detail: "At least one workflow declares `id-token: write` but no OIDC \
+                 trust policy is configured for hasp to audit. Without a trust \
+                 policy hasp cannot detect over-broad acceptance patterns on the \
+                 cloud side. Pass `--oidc-policy <provider>:<path>` or add an \
+                 `oidc:` section to `.hasp.yml` referencing the AWS/GCP/Azure \
+                 trust policy file(s) you deploy to."
+            .to_string(),
         is_warning,
     });
 }
 
 fn sub_is_universal(sp: &SubPattern) -> bool {
     sp.repo.is_wildcard()
-        && (sp.kind == SubKind::Any
-            || sp
-                .value
-                .as_ref()
-                .is_some_and(GlobToken::is_wildcard))
+        && (sp.kind == SubKind::Any || sp.value.as_ref().is_some_and(GlobToken::is_wildcard))
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -365,14 +466,22 @@ pub(crate) fn run(
     findings: &mut Vec<AuditFinding>,
     level: crate::policy::CheckLevel,
 ) {
-    if level.is_off() || acceptances.is_empty() {
+    if level.is_off() {
         return;
     }
     let is_warning = level.is_warn();
-    let facts: Vec<OidcWorkflowFacts> = docs
-        .iter()
-        .map(|(p, d)| extract_facts(p, d))
-        .collect();
+    let facts: Vec<OidcWorkflowFacts> = docs.iter().map(|(p, d)| extract_facts(p, d)).collect();
+
+    // Fires regardless of whether a trust policy was supplied — the
+    // pull_request_target + id-token: write combo is itself dangerous.
+    check_pull_request_target_with_oidc(&facts, findings, is_warning);
+
+    if acceptances.is_empty() {
+        // Without a trust policy we can't audit cloud-side acceptance breadth.
+        // Surface that gap as a single informational finding.
+        check_oidc_without_trust_policy(&facts, findings, is_warning);
+        return;
+    }
 
     check_missing_audience(acceptances, findings, is_warning);
     check_pattern_breadth(acceptances, &facts, findings, is_warning);
@@ -385,7 +494,7 @@ pub(crate) fn run(
 #[allow(clippy::unwrap_used, clippy::needless_raw_strings)]
 mod tests {
     use super::*;
-    use crate::oidc::{load_trust_policy, OidcProvider};
+    use crate::oidc::{OidcProvider, load_trust_policy};
     use std::io::Write;
     use yaml_rust2::YamlLoader;
 
@@ -442,7 +551,11 @@ mod tests {
         let acc = load_trust_policy(OidcProvider::Aws, &path).unwrap();
         let mut findings = Vec::new();
         run(&[], &acc, &mut findings, crate::policy::CheckLevel::Deny);
-        assert!(findings.iter().any(|f| f.title.contains("wildcard repository")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("wildcard repository"))
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -497,7 +610,11 @@ jobs:
         let acc = load_trust_policy(OidcProvider::Aws, &path).unwrap();
         let mut findings = Vec::new();
         run(&[], &acc, &mut findings, crate::policy::CheckLevel::Deny);
-        assert!(findings.iter().any(|f| f.title.contains("any GitHub repository")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("any GitHub repository"))
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -520,6 +637,192 @@ jobs:
         run(&[], &acc, &mut findings, crate::policy::CheckLevel::Deny);
         assert!(findings.is_empty(), "unexpected findings: {findings:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pull_request_target_with_id_token_fires_independent_finding() {
+        // Trust policy is perfectly safe; the workflow combo alone is the
+        // issue.
+        let path = write_tmp(
+            r#"{
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com" },
+                "Condition": {
+                  "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+                  "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:ref:refs/heads/main" }
+                }
+              }]
+            }"#,
+        );
+        let acc = load_trust_policy(OidcProvider::Aws, &path).unwrap();
+        let docs = vec![workflow(
+            "pr.yml",
+            r"
+on:
+  pull_request_target:
+permissions:
+  id-token: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+",
+        )];
+        let mut findings = Vec::new();
+        run(&docs, &acc, &mut findings, crate::policy::CheckLevel::Deny);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("pull_request_target")),
+            "expected pull_request_target finding, got: {findings:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pull_request_target_job_level_id_token_also_fires() {
+        let docs = vec![workflow(
+            "pr.yml",
+            r"
+on:
+  pull_request_target:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - run: echo hi
+",
+        )];
+        let mut findings = Vec::new();
+        run(&docs, &[], &mut findings, crate::policy::CheckLevel::Deny);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("pull_request_target")),
+            "expected pull_request_target finding, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn plain_pull_request_does_not_fire_pr_target_finding() {
+        // `pull_request` is much less dangerous than `pull_request_target`;
+        // make sure we don't conflate them.
+        let docs = vec![workflow(
+            "pr.yml",
+            r"
+on:
+  pull_request:
+permissions:
+  id-token: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+",
+        )];
+        let mut findings = Vec::new();
+        run(&docs, &[], &mut findings, crate::policy::CheckLevel::Deny);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("pull_request_target")),
+            "pull_request must NOT trigger the pull_request_target finding: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn pr_ref_accepted_with_pr_oidc_workflow_still_fires() {
+        // Previously this case was short-circuited away. Reinstating it is
+        // the whole point of this fix — it's the highest-risk combination.
+        let path = write_tmp(
+            r#"{
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::1:oidc-provider/token.actions.githubusercontent.com" },
+                "Condition": {
+                  "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+                  "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:a/b:ref:refs/pull/*" }
+                }
+              }]
+            }"#,
+        );
+        let acc = load_trust_policy(OidcProvider::Aws, &path).unwrap();
+        let docs = vec![workflow(
+            "pr.yml",
+            r"
+on:
+  pull_request:
+permissions:
+  id-token: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+",
+        )];
+        let mut findings = Vec::new();
+        run(&docs, &acc, &mut findings, crate::policy::CheckLevel::Deny);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("accepts PR refs")
+                    && f.title.contains("PR workflow mints")),
+            "expected combined PR-refs + PR OIDC finding, got: {findings:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oidc_without_trust_policy_emits_medium_advisory() {
+        let docs = vec![workflow(
+            "deploy.yml",
+            r"
+on: push
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+",
+        )];
+        let mut findings = Vec::new();
+        run(&docs, &[], &mut findings, crate::policy::CheckLevel::Deny);
+        let advisories: Vec<_> = findings
+            .iter()
+            .filter(|f| f.title.contains("trust policy not configured"))
+            .collect();
+        assert_eq!(
+            advisories.len(),
+            1,
+            "expected exactly one advisory, got: {findings:?}"
+        );
+        assert_eq!(advisories[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn no_oidc_workflow_means_no_advisory() {
+        let docs = vec![workflow(
+            "build.yml",
+            r"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+",
+        )];
+        let mut findings = Vec::new();
+        run(&docs, &[], &mut findings, crate::policy::CheckLevel::Deny);
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
     }
 
     #[test]

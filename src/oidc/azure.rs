@@ -21,7 +21,28 @@ use yaml_rust2::Yaml;
 
 use super::{OidcAcceptance, OidcProvider, SubPattern};
 
-const GH_ISSUER: &str = "token.actions.githubusercontent.com";
+const GH_ISSUER_HOST: &str = "token.actions.githubusercontent.com";
+
+/// True iff `issuer` is exactly GitHub's OIDC issuer URL. Tight host match —
+/// rejects look-alikes like `https://token.actions.githubusercontent.com.attacker.com`.
+fn is_github_issuer(issuer: &str) -> bool {
+    let after_scheme = issuer
+        .strip_prefix("https://")
+        .or_else(|| issuer.strip_prefix("http://"))
+        .unwrap_or(issuer);
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let host = authority.rsplit_once(':').map_or(authority, |(h, p)| {
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    });
+    host.eq_ignore_ascii_case(GH_ISSUER_HOST)
+}
 
 #[allow(clippy::unnecessary_wraps)] // uniform signature with aws/gcp
 pub(crate) fn parse(doc: &Yaml, path: &Path) -> Result<Vec<OidcAcceptance>> {
@@ -35,7 +56,7 @@ pub(crate) fn parse(doc: &Yaml, path: &Path) -> Result<Vec<OidcAcceptance>> {
             .get(&Yaml::String("issuer".to_string()))
             .and_then(Yaml::as_str)
             .unwrap_or("");
-        if !issuer.contains(GH_ISSUER) {
+        if !is_github_issuer(issuer) {
             continue;
         }
 
@@ -148,6 +169,33 @@ mod tests {
               "issuer": "https://token.actions.gitlab.com",
               "subject": "project:a",
               "audiences": ["aud"]
+            }"#,
+        );
+        assert!(acceptances.is_empty());
+    }
+
+    #[test]
+    fn rejects_lookalike_issuer_subdomain() {
+        let acceptances = parse_text(
+            r#"{
+              "issuer": "https://token.actions.githubusercontent.com.attacker.com",
+              "subject": "repo:my-org/my-repo:environment:prod",
+              "audiences": ["api://AzureADTokenExchange"]
+            }"#,
+        );
+        assert!(
+            acceptances.is_empty(),
+            "look-alike host must not be treated as GitHub: {acceptances:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_evil_subdomain_prefix() {
+        let acceptances = parse_text(
+            r#"{
+              "issuer": "https://evil.token.actions.githubusercontent.com",
+              "subject": "repo:my-org/my-repo:environment:prod",
+              "audiences": ["api://AzureADTokenExchange"]
             }"#,
         );
         assert!(acceptances.is_empty());
