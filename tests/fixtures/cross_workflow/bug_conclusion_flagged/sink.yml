@@ -1,0 +1,13 @@
+name: Sink
+on:
+  workflow_run:
+    workflows: [PR]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  d:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo only-on-success

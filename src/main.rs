@@ -38,6 +38,9 @@ fn scrubbed_subprocess_vars() -> &'static [&'static str] {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    maybe_self_stop_for_sandbox();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("rustls CryptoProvider already installed");
@@ -46,6 +49,62 @@ fn main() {
         eprintln!("hasp: error: {e}");
         std::process::exit(2);
     }
+}
+
+/// If the parent set `HASP_AWAIT_SANDBOX=1` AND the parent process really
+/// is the same `hasp` binary we're running, self-SIGSTOP so the parent
+/// can migrate us into the BPF egress cgroup before any user code runs.
+/// The parent is waiting on us in `waitpid(..., WUNTRACED)` and will
+/// `SIGCONT` after migration. The exec→sandbox window is bounded by ld.so
+/// and the Rust runtime init that precedes `main()`; nothing in that
+/// window touches the network.
+///
+/// The "parent is our binary" check is critical: an attacker who can write
+/// to `$GITHUB_ENV` in an earlier CI step (the exact threat hasp scans
+/// for) could otherwise set `HASP_AWAIT_SANDBOX=1` and cause every
+/// subsequent hasp invocation to SIGSTOP itself with no one to send
+/// SIGCONT — silently hanging the security check until the job times out.
+/// We compare `/proc/<ppid>/exe` to `/proc/self/exe`; on mismatch we
+/// ignore the env var, scrub it, and print a warning.
+#[cfg(target_os = "linux")]
+fn maybe_self_stop_for_sandbox() {
+    if std::env::var_os("HASP_AWAIT_SANDBOX").is_none() {
+        return;
+    }
+    let parent_is_hasp = parent_exe_matches_self().unwrap_or(false);
+    // SAFETY: single-threaded (before rustls/mimalloc init). `remove_var`
+    // and `raise` have no pointer arguments and no aliasing concerns.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::remove_var("HASP_AWAIT_SANDBOX");
+        if parent_is_hasp {
+            libc::raise(libc::SIGSTOP);
+        } else {
+            eprintln!(
+                "hasp: warning: HASP_AWAIT_SANDBOX was set but parent is not hasp; \
+                 ignoring (refusing to self-SIGSTOP for an untrusted parent)."
+            );
+        }
+    }
+}
+
+/// True iff `readlink /proc/<ppid>/exe` resolves to the same path as
+/// `readlink /proc/self/exe`. Returns `None` (which the caller treats as
+/// "don't trust the env var") on any error: missing /proc, permission
+/// denial, dangling exe symlink (parent already exited), or mismatch.
+#[cfg(target_os = "linux")]
+fn parent_exe_matches_self() -> Option<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: getppid is a trivial POSIX syscall with no pointer arguments.
+    #[allow(unsafe_code)]
+    let ppid = unsafe { libc::getppid() };
+    if ppid <= 1 {
+        return None;
+    }
+    let parent_exe = std::fs::read_link(format!("/proc/{ppid}/exe")).ok()?;
+    let self_exe = std::fs::read_link("/proc/self/exe").ok()?;
+    Some(parent_exe.as_os_str().as_bytes() == self_exe.as_os_str().as_bytes())
 }
 
 fn run() -> Result<()> {
@@ -710,7 +769,11 @@ fn run_verify_subprocess(
     apply_env_allowlist(&mut proxy_cmd, &proxy_env);
     drop(proxy_env);
 
-    let mut proxy_child = match netguard::spawn_command(proxy_cmd, proxy_sandbox.as_ref()) {
+    let mut proxy_child = match netguard::spawn_command(
+        proxy_cmd,
+        proxy_sandbox.as_ref(),
+        netguard::StopProtocol::SelfStop,
+    ) {
         Ok(child) => child,
         Err(err) => {
             token::scrub_string(&mut proxy_auth);
@@ -756,7 +819,11 @@ fn run_verify_subprocess(
     ];
     apply_env_allowlist(&mut verifier_cmd, &verifier_env);
     drop(verifier_env);
-    let mut child = match netguard::spawn_command(verifier_cmd, verifier_sandbox.as_ref()) {
+    let mut child = match netguard::spawn_command(
+        verifier_cmd,
+        verifier_sandbox.as_ref(),
+        netguard::StopProtocol::SelfStop,
+    ) {
         Ok(child) => {
             token::scrub_string(&mut proxy_auth);
             child

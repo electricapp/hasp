@@ -1,0 +1,15 @@
+name: Sink
+on:
+  workflow_run:
+    workflows: ['.github/workflows/ci.yml']
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/download-artifact@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        with:
+          name: report

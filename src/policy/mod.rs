@@ -20,6 +20,7 @@ pub(super) const KNOWN_CHECK_NAMES: &[&str] = &[
     "persist-credentials",
     "typosquatting",
     "untrusted-sources",
+    "cross-workflow",
     "reachability",
     "signatures",
     "fresh-commit",
@@ -129,6 +130,7 @@ pub(crate) struct CheckConfig {
     pub(crate) persist_credentials: CheckLevel,
     pub(crate) typosquatting: CheckLevel,
     pub(crate) untrusted_sources: CheckLevel,
+    pub(crate) cross_workflow: CheckLevel,
     pub(crate) provenance: ProvenanceCheckConfig,
 }
 
@@ -145,6 +147,7 @@ impl Default for CheckConfig {
             persist_credentials: CheckLevel::Warn,
             typosquatting: CheckLevel::Deny,
             untrusted_sources: CheckLevel::Warn,
+            cross_workflow: CheckLevel::Deny,
             provenance: ProvenanceCheckConfig::default(),
         }
     }
@@ -164,6 +167,7 @@ pub(super) struct PartialCheckConfig {
     pub(super) persist_credentials: Option<CheckLevel>,
     pub(super) typosquatting: Option<CheckLevel>,
     pub(super) untrusted_sources: Option<CheckLevel>,
+    pub(super) cross_workflow: Option<CheckLevel>,
     pub(super) provenance: Option<PartialProvenanceConfig>,
 }
 
@@ -565,6 +569,7 @@ impl Policy {
             || !c.persist_credentials.is_off()
             || !c.typosquatting.is_off()
             || !c.untrusted_sources.is_off()
+            || !c.cross_workflow.is_off()
             || !c.provenance.reachability.is_off()
             || !c.provenance.signatures.is_off()
             || !c.provenance.fresh_commit.is_off()
@@ -707,6 +712,12 @@ pub(crate) fn detect_policy_drift(old: &Policy, new: &Policy) -> Vec<PolicyDrift
         "untrusted-sources",
         old.checks.untrusted_sources,
         new.checks.untrusted_sources,
+    );
+    drift_check(
+        &mut drifts,
+        "cross-workflow",
+        old.checks.cross_workflow,
+        new.checks.cross_workflow,
     );
 
     // Provenance sub-checks
@@ -937,6 +948,11 @@ fn apply_partial_checks(full: &mut CheckConfig, partial: &PartialCheckConfig) {
         partial.untrusted_sources,
         "untrusted-sources",
     );
+    apply_level(
+        &mut full.cross_workflow,
+        partial.cross_workflow,
+        "cross-workflow",
+    );
     if let Some(prov) = &partial.provenance {
         apply_level(
             &mut full.provenance.reachability,
@@ -992,6 +1008,7 @@ const fn set_all_checks_deny(checks: &mut CheckConfig) {
     checks.persist_credentials = CheckLevel::Deny;
     checks.typosquatting = CheckLevel::Deny;
     checks.untrusted_sources = CheckLevel::Deny;
+    checks.cross_workflow = CheckLevel::Deny;
     checks.provenance.reachability = CheckLevel::Deny;
     checks.provenance.signatures = CheckLevel::Deny;
     checks.provenance.fresh_commit = CheckLevel::Deny;
@@ -1008,6 +1025,15 @@ const fn set_all_checks_deny(checks: &mut CheckConfig) {
 /// possible, `starts_with` is preferred over `contains` to reduce ambiguity.
 pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
     // ── Most-specific patterns first ────────────────────────────────────
+
+    // Cross-workflow: "Cross-workflow artifact flow ...", "workflow_run trigger
+    // without ...", "Workflow reads attacker-controlled github.event.workflow_run ..."
+    if title.starts_with("Cross-workflow")
+        || title.starts_with("workflow_run trigger")
+        || title.contains("github.event.workflow_run")
+    {
+        return "cross-workflow";
+    }
 
     // "Privileged checkout of attacker code in ..."
     if title.starts_with("Privileged checkout") {

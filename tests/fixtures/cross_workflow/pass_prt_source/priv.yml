@@ -1,0 +1,14 @@
+name: Priv
+on:
+  workflow_run:
+    workflows: [PR]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        with:
+          name: blob

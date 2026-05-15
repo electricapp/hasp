@@ -79,6 +79,9 @@ pub(super) fn parse_check_config(val: &Yaml) -> Result<CheckConfig> {
             "untrusted-sources" => {
                 config.untrusted_sources = CheckLevel::parse(yaml_str(value, key_str)?)?;
             }
+            "cross-workflow" => {
+                config.cross_workflow = CheckLevel::parse(yaml_str(value, key_str)?)?;
+            }
             "provenance" => {
                 config.provenance = parse_provenance_config(value)?;
             }
@@ -150,6 +153,9 @@ pub(super) fn parse_partial_checks(val: &Yaml) -> Result<PartialCheckConfig> {
             }
             "untrusted-sources" => {
                 config.untrusted_sources = Some(CheckLevel::parse(yaml_str(value, key_str)?)?);
+            }
+            "cross-workflow" => {
+                config.cross_workflow = Some(CheckLevel::parse(yaml_str(value, key_str)?)?);
             }
             "provenance" => {
                 config.provenance = Some(parse_partial_provenance(value)?);

@@ -1,0 +1,15 @@
+name: Sink
+on:
+  workflow_run:
+    workflows: [PR]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dawidd6/action-download-artifact@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        with:
+          name: results
+          run_id: ${{ github.event.workflow_run.id }}

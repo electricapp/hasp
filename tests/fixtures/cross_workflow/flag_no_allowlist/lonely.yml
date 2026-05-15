@@ -1,0 +1,9 @@
+name: Lonely
+on: workflow_run
+permissions:
+  contents: write
+jobs:
+  d:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi

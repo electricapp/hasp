@@ -59,6 +59,7 @@ jobs:
         run: cargo build --release
 
       - name: Scan own workflows (must pass clean)
+        timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./target/release/hasp --paranoid --allow-unsandboxed

@@ -14,8 +14,6 @@ use std::net::{SocketAddrV4, SocketAddrV6};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 // ─── BPF syscall constants ───────────────────────────────────────────────────
@@ -193,35 +191,113 @@ pub(crate) fn maybe_prepare(
     }
 }
 
-pub(crate) fn spawn_command(mut cmd: Command, sandbox: Option<&SandboxHandle>) -> Result<Child> {
-    #[cfg(not(target_os = "linux"))]
-    let _ = sandbox;
+/// How the parent gets the child into a stopped state so it can be moved
+/// into the cgroup before the child runs any user code.
+#[derive(Clone, Copy)]
+pub(crate) enum StopProtocol {
+    /// Child is hasp's own binary and will `raise(SIGSTOP)` at the top of
+    /// `main()` when it sees `HASP_AWAIT_SANDBOX=1` in its environment.
+    /// Lowest race window — bounded by ld.so + Rust runtime init only.
+    SelfStop,
+    /// Child is an arbitrary user binary (e.g., `hasp exec`'s step
+    /// command). Parent sends SIGSTOP after `spawn()` returns. Race
+    /// window is exec → next syscall in parent, but accepted because we
+    /// can't expect arbitrary binaries to cooperate.
+    ParentStop,
+}
 
+pub(crate) fn spawn_command(
+    mut cmd: Command,
+    sandbox: Option<&SandboxHandle>,
+    protocol: StopProtocol,
+) -> Result<Child> {
+    // The child must be stopped before it runs any user code, so the parent
+    // can migrate its PID into the BPF egress cgroup before any connect().
+    // `SelfStop` (used for hasp's own internal subprocesses) sets
+    // `HASP_AWAIT_SANDBOX=1` on the child env; the child raises(SIGSTOP)
+    // at the top of main() before rustls/mimalloc init, shrinking the
+    // exec→migration race to ld.so + Rust runtime startup. `ParentStop`
+    // (used for `hasp exec`'s arbitrary user binary) sends `kill(SIGSTOP)`
+    // from the parent after spawn returns — the larger race window is
+    // accepted because we can't expect an arbitrary binary to honor the
+    // env-var protocol.
+    //
+    // Why not `pre_exec(SIGSTOP)` or `pre_exec(PTRACE_TRACEME)`?
+    //   * `pre_exec(SIGSTOP)` deadlocks Rust's `Command::spawn`: spawn
+    //     blocks on a CLOEXEC pipe waiting for the child to exec, and
+    //     SIGSTOP before exec means the pipe never closes.
+    //   * `pre_exec(PTRACE_TRACEME)` would close the race window for
+    //     arbitrary binaries (execve itself delivers SIGTRAP under the
+    //     trace), but the seccomp filter applied in `sandbox::
+    //     phase_exec_child` denies `SYS_ptrace` and is inherited by the
+    //     child, so the child's TRACEME call would be killed. Lifting
+    //     that ban needs a larger refactor (moving seccomp install from
+    //     parent to child's pre_exec hook).
     #[cfg(target_os = "linux")]
-    if sandbox.is_some() {
-        // SAFETY: pre_exec runs in the forked child between fork and exec.
-        // We only call async-signal-safe libc functions (kill, getpid).
-        #[allow(unsafe_code)]
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::kill(libc::getpid(), libc::SIGSTOP) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+    if sandbox.is_some() && matches!(protocol, StopProtocol::SelfStop) {
+        cmd.env("HASP_AWAIT_SANDBOX", "1");
     }
 
-    let child = cmd.spawn().context("Failed to spawn child process")?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sandbox;
+        let _ = protocol;
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut child = cmd.spawn().context("Failed to spawn child process")?;
 
     #[cfg(target_os = "linux")]
-    if let Some(sandbox) = sandbox {
-        wait_for_stop(child.id())?;
-        sandbox.move_pid(child.id())?;
-        resume_process(child.id())?;
+    if let Some(sandbox) = sandbox
+        && let Err(err) = stop_and_migrate(&child, sandbox, protocol)
+    {
+        // The child may have been left in a stopped state by a partially
+        // successful `stop_and_migrate`. SIGKILL is delivered to stopped
+        // processes (the kernel forces them out of stopped state), but
+        // sending SIGCONT first makes the process state more predictable
+        // for any wait_with_output()-style observers higher up.
+        if let Ok(pid_t) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill is a standard POSIX syscall, no pointer args.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(pid_t, libc::SIGCONT);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
     }
 
     Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_and_migrate(
+    child: &Child,
+    sandbox: &SandboxHandle,
+    protocol: StopProtocol,
+) -> Result<()> {
+    let pid = child.id();
+    if matches!(protocol, StopProtocol::ParentStop) {
+        // The child is an arbitrary binary that won't self-SIGSTOP. Send
+        // SIGSTOP from the parent immediately after spawn.
+        let pid_t = libc::pid_t::try_from(pid)
+            .map_err(|_| crate::error::Error::new(format!("PID {pid} exceeds pid_t range")))?;
+        // SAFETY: kill is a well-defined POSIX syscall taking pid + signal.
+        #[allow(unsafe_code)]
+        let ret = unsafe { libc::kill(pid_t, libc::SIGSTOP) };
+        if ret != 0 {
+            bail!(
+                "Failed to SIGSTOP sandboxed child: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    // SelfStop case: child raised SIGSTOP at top of main; just wait for it.
+    wait_for_stop(pid)?;
+    sandbox.move_pid(pid)?;
+    resume_process(pid)?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -229,19 +305,29 @@ fn wait_for_stop(pid: u32) -> Result<()> {
     let pid_t = libc::pid_t::try_from(pid)
         .map_err(|_| crate::error::Error::new(format!("PID {pid} exceeds pid_t range")))?;
     let mut status: libc::c_int = 0;
-    // SAFETY: waitpid is a well-defined Linux syscall. `status` is a valid
-    // mutable pointer to a stack-allocated c_int.
-    #[allow(unsafe_code)]
-    let ret = unsafe { libc::waitpid(pid_t, &raw mut status, libc::WUNTRACED) };
-    if ret < 0 {
-        bail!(
-            "waitpid() failed while preparing sandboxed child: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    // waitpid() can return EINTR if our process receives a signal while
+    // blocked. We don't install signal handlers in the launcher, but a
+    // future change might — restart the call rather than failing.
+    let ret = loop {
+        // SAFETY: waitpid is a well-defined Linux syscall. `status` is a
+        // valid mutable pointer to a stack-allocated c_int.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::waitpid(pid_t, &raw mut status, libc::WUNTRACED) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            bail!("waitpid() failed while preparing sandboxed child: {err}");
+        }
+        break r;
+    };
     let stopped = libc::WIFSTOPPED(status);
     if ret == 0 || !stopped {
-        bail!("Sandboxed child did not stop before exec");
+        // Child terminated before reaching the self-SIGSTOP at top of
+        // main(). Common cause: the binary crashed during runtime init,
+        // or the wrong binary was invoked.
+        bail!("Sandboxed child exited before self-SIGSTOP could land");
     }
     Ok(())
 }

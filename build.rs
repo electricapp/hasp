@@ -58,10 +58,8 @@ fn parse_github_slug(url: &str) -> Option<String> {
     let trimmed = url.trim();
     let path = if let Some(rest) = trimmed.strip_prefix("https://github.com/") {
         rest
-    } else if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        rest
     } else {
-        return None;
+        trimmed.strip_prefix("git@github.com:")?
     };
     let cleaned = path.strip_suffix(".git").unwrap_or(path);
     let parts: Vec<&str> = cleaned.splitn(3, '/').collect();

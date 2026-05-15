@@ -144,8 +144,14 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    // 9. Spawn child in BPF cgroup (inherits Landlock + seccomp from step 7)
-    let mut child = match netguard::spawn_command(child_cmd, child_sandbox.as_ref()) {
+    // 9. Spawn child in BPF cgroup (inherits Landlock + seccomp from step 7).
+    //    Use `ParentStop` because the child is an arbitrary user binary —
+    //    it can't be expected to honor `HASP_AWAIT_SANDBOX`.
+    let mut child = match netguard::spawn_command(
+        child_cmd,
+        child_sandbox.as_ref(),
+        netguard::StopProtocol::ParentStop,
+    ) {
         Ok(child) => child,
         Err(err) => {
             scrub_proxy_auths(&mut proxy_infos);
@@ -237,7 +243,13 @@ fn spawn_forward_proxy(
         &upstream_addrs_str,
     );
 
-    let mut proxy_child = match netguard::spawn_command(proxy_cmd, proxy_sandbox.as_ref()) {
+    // Forward proxy is hasp itself (`--internal-forward-proxy`) — use
+    // `SelfStop` for the lowest race window.
+    let mut proxy_child = match netguard::spawn_command(
+        proxy_cmd,
+        proxy_sandbox.as_ref(),
+        netguard::StopProtocol::SelfStop,
+    ) {
         Ok(child) => child,
         Err(err) => {
             token::scrub_string(&mut proxy_auth);

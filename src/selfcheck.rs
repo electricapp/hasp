@@ -87,7 +87,7 @@ pub(crate) fn run() -> Result<()> {
              {artifact}"
         );
         println!("\n  ── SLSA provenance (proves commit, workflow, inputs) ──");
-        println!("  gh attestation verify {artifact} --repo {GITHUB_REPO}",);
+        println!("  gh attestation verify {artifact} --repo {GITHUB_REPO}");
 
         Ok(())
     } else {
