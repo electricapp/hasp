@@ -16,7 +16,7 @@ use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::process::{ChildStdin, ChildStdout, Stdio};
 #[cfg(target_os = "linux")]
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 // ─── BPF syscall constants ───────────────────────────────────────────────────
 // These were removed from the `libc` crate in 0.2.185. Values are from
@@ -100,14 +100,17 @@ impl SandboxMode {
 
 pub(crate) struct SandboxHandle {
     path: PathBuf,
-    /// When the cgroup was set up via the privileged sudo helper, the helper
-    /// stays alive and performs PID migrations on the parent's behalf (the
-    /// unprivileged parent cannot satisfy cgroup v2's common-ancestor
-    /// migration rule on its own — see `prepare_linux_via_sudo`). When the
-    /// unprivileged BPF path succeeded, `helper` is `None` and the parent
-    /// writes `cgroup.procs` directly because it owns the cgroup.
+    /// `Some` when the cgroup was set up via the privileged sudo helper:
+    /// the helper stays alive and performs PID migrations on the parent's
+    /// behalf because cgroup v2 forbids an unprivileged parent from
+    /// satisfying the common-ancestor migration rule (the source cgroup
+    /// is the runner's own, which is root-owned). The inner Mutex
+    /// serializes concurrent migrations so two threads can't interleave
+    /// bytes on the helper's stdin pipe. `None` means the unprivileged
+    /// BPF setup succeeded and the parent owns the cgroup outright — no
+    /// helper, no serialization needed.
     #[cfg(target_os = "linux")]
-    helper: Mutex<Option<HelperChannel>>,
+    helper: Option<Mutex<HelperChannel>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -124,49 +127,57 @@ impl SandboxHandle {
 
     #[cfg(target_os = "linux")]
     fn move_pid(&self, pid: u32) -> Result<()> {
-        let mut guard = self
-            .helper
-            .lock()
-            .map_err(|_| crate::error::Error::new("BPF helper channel poisoned".to_string()))?;
-        let Some(helper) = guard.as_mut() else {
+        let Some(mutex) = self.helper.as_ref() else {
             return std::fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
                 .context("Failed to move process into sandbox cgroup");
         };
-        writeln!(helper.stdin, "{pid}").context("Failed to send PID to BPF helper")?;
-        helper
-            .stdin
-            .flush()
-            .context("Failed to flush PID to BPF helper")?;
-        let mut response = String::new();
-        let n = helper
-            .stdout
-            .read_line(&mut response)
-            .context("Failed to read BPF helper response")?;
-        if n == 0 {
-            bail!("BPF helper closed stdout without responding to PID {pid}");
-        }
-        let trimmed = response.trim_end_matches(['\n', '\r']);
-        let Some(echoed) = trimmed.strip_prefix("OK\t") else {
-            bail!("BPF helper rejected migration of PID {pid}: {trimmed}");
-        };
-        if echoed != pid.to_string() {
-            bail!("BPF helper response PID mismatch: expected {pid}, got {echoed}");
-        }
-        Ok(())
+        let mut helper = mutex
+            .lock()
+            .map_err(|_| crate::error::Error::new("BPF helper channel poisoned".to_string()))?;
+        migrate_via_helper(&mut helper, pid)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn migrate_via_helper(helper: &mut HelperChannel, pid: u32) -> Result<()> {
+    writeln!(helper.stdin, "{pid}").context("Failed to send PID to BPF helper")?;
+    helper
+        .stdin
+        .flush()
+        .context("Failed to flush PID to BPF helper")?;
+    let mut response = String::new();
+    let n = helper
+        .stdout
+        .read_line(&mut response)
+        .context("Failed to read BPF helper response")?;
+    if n == 0 {
+        bail!("BPF helper closed stdout without responding to PID {pid}");
+    }
+    let trimmed = response.trim_end_matches(['\n', '\r']);
+    let Some(echoed) = trimmed.strip_prefix("OK\t") else {
+        bail!("BPF helper rejected migration of PID {pid}: {trimmed}");
+    };
+    if echoed != pid.to_string() {
+        bail!("BPF helper response PID mismatch: expected {pid}, got {echoed}");
+    }
+    Ok(())
 }
 
 impl Drop for SandboxHandle {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Ok(mut guard) = self.helper.lock()
-            && let Some(mut helper) = guard.take()
-        {
-            // Dropping stdin closes the pipe, signaling EOF to the helper.
-            // The helper exits its read loop and returns. Reaping the child
-            // here avoids leaving a zombie.
-            drop(helper.stdin);
-            let _ = helper.child.wait();
+        if let Some(mutex) = self.helper.take() {
+            // `into_inner` consumes the Mutex without acquiring its lock —
+            // safe here because `&mut self` gives us unique ownership.
+            // A poisoned mutex still hands back the inner value so we can
+            // shut down the helper cleanly.
+            let HelperChannel {
+                mut child, stdin, ..
+            } = mutex.into_inner().unwrap_or_else(PoisonError::into_inner);
+            // Closing stdin signals EOF to the helper's read loop; reap
+            // the child so we don't leave a zombie.
+            drop(stdin);
+            let _ = child.wait();
         }
         let _ = std::fs::remove_dir(&self.path);
     }
@@ -588,7 +599,7 @@ fn prepare_linux(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result<SandboxH
 
     Ok(SandboxHandle {
         path: cgroup_path,
-        helper: Mutex::new(None),
+        helper: None,
     })
 }
 
@@ -1076,13 +1087,13 @@ pub(crate) fn run_bpf_helper() -> Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        let response = match trimmed.parse::<u32>() {
-            Ok(pid) => match std::fs::write(&cgroup_procs, format!("{pid}\n")) {
+        let response = trimmed.parse::<u32>().map_or_else(
+            |_| format!("ERR\tinvalid-pid: {trimmed}\n"),
+            |pid| match std::fs::write(&cgroup_procs, format!("{pid}\n")) {
                 Ok(()) => format!("OK\t{pid}\n"),
                 Err(err) => format!("ERR\tcgroup-write: {err}\n"),
             },
-            Err(_) => format!("ERR\tinvalid-pid: {trimmed}\n"),
-        };
+        );
         let mut out = stdout.lock();
         out.write_all(response.as_bytes())
             .context("Failed to write migration response")?;
@@ -1175,7 +1186,7 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
 
     Ok(SandboxHandle {
         path,
-        helper: Mutex::new(Some(HelperChannel {
+        helper: Some(Mutex::new(HelperChannel {
             child,
             stdin,
             stdout: stdout_reader,
