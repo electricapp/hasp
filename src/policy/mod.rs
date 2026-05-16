@@ -21,6 +21,7 @@ pub(super) const KNOWN_CHECK_NAMES: &[&str] = &[
     "typosquatting",
     "untrusted-sources",
     "cross-workflow",
+    "oidc",
     "reachability",
     "signatures",
     "fresh-commit",
@@ -131,6 +132,7 @@ pub(crate) struct CheckConfig {
     pub(crate) typosquatting: CheckLevel,
     pub(crate) untrusted_sources: CheckLevel,
     pub(crate) cross_workflow: CheckLevel,
+    pub(crate) oidc: CheckLevel,
     pub(crate) provenance: ProvenanceCheckConfig,
 }
 
@@ -148,6 +150,7 @@ impl Default for CheckConfig {
             typosquatting: CheckLevel::Deny,
             untrusted_sources: CheckLevel::Warn,
             cross_workflow: CheckLevel::Deny,
+            oidc: CheckLevel::Deny,
             provenance: ProvenanceCheckConfig::default(),
         }
     }
@@ -168,6 +171,7 @@ pub(super) struct PartialCheckConfig {
     pub(super) typosquatting: Option<CheckLevel>,
     pub(super) untrusted_sources: Option<CheckLevel>,
     pub(super) cross_workflow: Option<CheckLevel>,
+    pub(super) oidc: Option<CheckLevel>,
     pub(super) provenance: Option<PartialProvenanceConfig>,
 }
 
@@ -247,6 +251,12 @@ pub(crate) struct ResolvedPolicy {
 // ─── Policy ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+pub(crate) struct OidcPolicyRef {
+    pub(crate) provider: String,
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Policy {
     pub(crate) pin: PinPolicy,
     pub(crate) min_sha_age_seconds: Option<i64>,
@@ -254,6 +264,7 @@ pub(crate) struct Policy {
     pub(crate) max_transitive_depth: Option<u8>,
     pub(crate) checks: CheckConfig,
     pub(crate) trust: TrustConfig,
+    pub(crate) oidc_policies: Vec<OidcPolicyRef>,
     actions: Vec<ActionOverride>,
     suppressions: Vec<Suppression>,
 }
@@ -267,6 +278,7 @@ impl Default for Policy {
             max_transitive_depth: None,
             checks: CheckConfig::default(),
             trust: TrustConfig::default(),
+            oidc_policies: Vec::new(),
             actions: Vec::new(),
             suppressions: Vec::new(),
         }
@@ -313,6 +325,7 @@ impl Policy {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse(text: &str, path: &Path) -> Result<Self> {
         let docs = YamlLoader::load_from_str(text)
             .context(format!("Invalid YAML in {}", path.display()))?;
@@ -394,6 +407,27 @@ impl Policy {
             }
         }
 
+        // oidc trust-policy references
+        let oidc_key = Yaml::String("oidc".to_string());
+        if let Some(oidc_val) = map.get(&oidc_key).and_then(|v| v.as_vec()) {
+            for item in oidc_val {
+                let entry = item.as_hash().context("oidc entries must be mappings")?;
+                let provider = entry
+                    .get(&Yaml::String("provider".to_string()))
+                    .and_then(|v| v.as_str())
+                    .context("oidc entry requires `provider`")?
+                    .to_string();
+                let raw_path = entry
+                    .get(&Yaml::String("path".to_string()))
+                    .and_then(|v| v.as_str())
+                    .context("oidc entry requires `path`")?;
+                policy.oidc_policies.push(OidcPolicyRef {
+                    provider,
+                    path: PathBuf::from(raw_path),
+                });
+            }
+        }
+
         // Reject unknown top-level keys
         let known_keys: &[&str] = &[
             "version",
@@ -405,6 +439,7 @@ impl Policy {
             "trust",
             "actions",
             "ignore",
+            "oidc",
         ];
         for key in map.keys() {
             if let Some(k) = key.as_str()
@@ -570,6 +605,7 @@ impl Policy {
             || !c.typosquatting.is_off()
             || !c.untrusted_sources.is_off()
             || !c.cross_workflow.is_off()
+            || !c.oidc.is_off()
             || !c.provenance.reachability.is_off()
             || !c.provenance.signatures.is_off()
             || !c.provenance.fresh_commit.is_off()
@@ -719,6 +755,7 @@ pub(crate) fn detect_policy_drift(old: &Policy, new: &Policy) -> Vec<PolicyDrift
         old.checks.cross_workflow,
         new.checks.cross_workflow,
     );
+    drift_check(&mut drifts, "oidc", old.checks.oidc, new.checks.oidc);
 
     // Provenance sub-checks
     drift_check(
@@ -953,6 +990,7 @@ fn apply_partial_checks(full: &mut CheckConfig, partial: &PartialCheckConfig) {
         partial.cross_workflow,
         "cross-workflow",
     );
+    apply_level(&mut full.oidc, partial.oidc, "oidc");
     if let Some(prov) = &partial.provenance {
         apply_level(
             &mut full.provenance.reachability,
@@ -1009,6 +1047,7 @@ const fn set_all_checks_deny(checks: &mut CheckConfig) {
     checks.typosquatting = CheckLevel::Deny;
     checks.untrusted_sources = CheckLevel::Deny;
     checks.cross_workflow = CheckLevel::Deny;
+    checks.oidc = CheckLevel::Deny;
     checks.provenance.reachability = CheckLevel::Deny;
     checks.provenance.signatures = CheckLevel::Deny;
     checks.provenance.fresh_commit = CheckLevel::Deny;
@@ -1033,6 +1072,11 @@ pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
         || title.contains("github.event.workflow_run")
     {
         return "cross-workflow";
+    }
+
+    // OIDC: "OIDC trust policy (aws/gcp/azure) ..."
+    if title.starts_with("OIDC trust policy") {
+        return "oidc";
     }
 
     // "Privileged checkout of attacker code in ..."

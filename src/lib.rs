@@ -31,6 +31,7 @@ pub(crate) mod integrity;
 pub(crate) mod ipc;
 pub(crate) mod manifest;
 pub(crate) mod netguard;
+pub(crate) mod oidc;
 pub(crate) mod policy;
 pub(crate) mod proxy;
 pub(crate) mod report;
