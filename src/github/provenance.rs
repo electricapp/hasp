@@ -392,22 +392,24 @@ fn check_provenance_with_api_at(
                     }
                 }
                 Ok(None) => {
-                    findings.push(AuditFinding {
-                        file: result.action_ref.file.clone(),
-                        severity: Severity::Medium,
-                        title: format!(
-                            "No SLSA attestation published for {target}"
-                        ),
-                        detail: format!(
-                            "GitHub has no build attestation for commit {short_sha} in \
-                             {target}. SLSA attestations provide positive evidence that \
-                             the pinned SHA was produced by an advertised CI workflow. \
-                             Actions that ship SLSA attestations (via \
-                             `actions/attest-build-provenance`) give stronger provenance \
-                             guarantees than pinning alone."
-                        ),
-                        is_warning: provenance_config.slsa_attestation.is_warn(),
-                    });
+                    if !audit::is_trusted_owner(&result.action_ref.owner) {
+                        findings.push(AuditFinding {
+                            file: result.action_ref.file.clone(),
+                            severity: Severity::Medium,
+                            title: format!(
+                                "No SLSA attestation published for {target}"
+                            ),
+                            detail: format!(
+                                "GitHub has no build attestation for commit {short_sha} in \
+                                 {target}. SLSA attestations provide positive evidence that \
+                                 the pinned SHA was produced by an advertised CI workflow. \
+                                 Actions that ship SLSA attestations (via \
+                                 `actions/attest-build-provenance`) give stronger provenance \
+                                 guarantees than pinning alone."
+                            ),
+                            is_warning: provenance_config.slsa_attestation.is_warn(),
+                        });
+                    }
                 }
                 Err(e) => {
                     eprintln!(
