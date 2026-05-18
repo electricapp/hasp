@@ -21,7 +21,6 @@ use crate::scanner;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiffFormat {
@@ -140,8 +139,11 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
     let delta = compute_delta(&base, &base_findings, &head_findings);
     emit(&delta, format);
 
-    drop(worktree); // Explicit for clarity; Drop removes the temp worktree.
+    // Clear the signal-handler target BEFORE Drop removes the worktree so a
+    // signal landing between the two doesn't trip the handler into removing
+    // an already-removed path.
     clear_cleanup_path();
+    drop(worktree);
 
     let code = delta.exit_code();
     if code != 0 {
@@ -177,17 +179,34 @@ fn scan_and_audit(scan_dir: &Path, scan_root: &Path, policy: &Policy) -> Result<
             &owners,
         );
     }
-    // Canonicalize scan_root the same way the scanner does, so strip_prefix
-    // succeeds against the absolute paths the scanner emitted.
+    strip_scan_root(&mut findings, scan_root);
+    Ok(findings)
+}
+
+/// Strip the (canonicalized) scan-root prefix from every place a path can
+/// hide in a finding — `file`, plus the user-facing `title` / `detail` strings
+/// because some audits (`cross_workflow`, `oidc`) embed `path.display()`
+/// directly. Without this rewrite, base and head scans running under different
+/// worktree paths produce non-matching `FindingKey` for the same logical issue,
+/// and every persistent finding shows up as both `new` and `fixed`.
+fn strip_scan_root(findings: &mut [AuditFinding], scan_root: &Path) {
     let canonical_root = scan_root
         .canonicalize()
         .unwrap_or_else(|_| scan_root.to_path_buf());
-    for f in &mut findings {
+    let mut prefix = canonical_root.to_string_lossy().into_owned();
+    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+        prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    let strip_text = !prefix.is_empty() && prefix != std::path::MAIN_SEPARATOR.to_string();
+    for f in findings {
         if let Ok(rel) = f.file.strip_prefix(&canonical_root) {
             f.file = rel.to_path_buf();
         }
+        if strip_text {
+            f.title = f.title.replace(&prefix, "");
+            f.detail = f.detail.replace(&prefix, "");
+        }
     }
-    Ok(findings)
 }
 
 fn compute_delta(
@@ -579,18 +598,20 @@ fn cleanup_worktree(path: &Path, repo_root: &Path) {
 
 // ─── signal cleanup ─────────────────────────────────────────────────────────
 
-static CLEANUP_TARGET: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+// Target is set once per process (diff mode runs a single scan), then an
+// atomic flag gates whether the handler should act. `OnceLock` + `AtomicBool`
+// keep the handler lock-free, so a signal landing during register/clear
+// can't deadlock against the main thread.
+static CLEANUP_TARGET: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+static CLEANUP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn register_cleanup_path(path: &Path, repo_root: &Path) {
-    if let Ok(mut g) = CLEANUP_TARGET.lock() {
-        *g = Some((path.to_path_buf(), repo_root.to_path_buf()));
-    }
+    let _ = CLEANUP_TARGET.set((path.to_path_buf(), repo_root.to_path_buf()));
+    CLEANUP_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn clear_cleanup_path() {
-    if let Ok(mut g) = CLEANUP_TARGET.lock() {
-        *g = None;
-    }
+    CLEANUP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(unix)]
@@ -622,10 +643,8 @@ const fn install_signal_cleanup_once() {
 
 #[cfg(unix)]
 extern "C" fn signal_handler(sig: libc::c_int) {
-    // Grab the registered target, if any, and tear it down. Using
-    // try_lock keeps us from blocking inside a signal handler.
-    if let Ok(guard) = CLEANUP_TARGET.try_lock()
-        && let Some((path, repo_root)) = guard.as_ref()
+    if CLEANUP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some((path, repo_root)) = CLEANUP_TARGET.get()
     {
         cleanup_worktree(path, repo_root);
     }
@@ -689,6 +708,47 @@ mod tests {
         );
         assert_eq!(delta.unchanged_count, 1);
         assert_eq!(delta.exit_code(), 0);
+    }
+
+    #[test]
+    fn strip_scan_root_rewrites_file_title_and_detail() {
+        // Findings produced by cross_workflow / oidc audits embed absolute
+        // paths into title and detail strings via `path.display()`. Base and
+        // head scans run under different worktree roots, so the same logical
+        // finding would key differently unless we strip the prefix everywhere.
+        let temp = std::env::temp_dir().join("hasp-scan-root-test-XXX");
+        std::fs::create_dir_all(&temp).unwrap();
+        let inside = temp.join(".github/workflows/ci.yml");
+        let canonical = temp.canonicalize().unwrap_or_else(|_| temp.clone());
+        let canonical_inside = canonical.join(".github/workflows/ci.yml");
+
+        let mut findings = vec![AuditFinding {
+            file: canonical_inside.clone(),
+            severity: Severity::High,
+            title: format!("flow from `{}`", canonical_inside.display()),
+            detail: format!(
+                "consumer {} downloads artifact produced by {}",
+                canonical_inside.display(),
+                canonical_inside.display()
+            ),
+            is_warning: false,
+        }];
+        strip_scan_root(&mut findings, &temp);
+
+        let f = &findings[0];
+        assert_eq!(f.file, Path::new(".github/workflows/ci.yml"));
+        assert!(
+            !f.title.contains(&*canonical.to_string_lossy()),
+            "title still contains scan root: {}",
+            f.title
+        );
+        assert!(
+            !f.detail.contains(&*canonical.to_string_lossy()),
+            "detail still contains scan root: {}",
+            f.detail
+        );
+        let _ = std::fs::remove_dir_all(inside.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

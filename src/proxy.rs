@@ -16,9 +16,11 @@ pub(crate) const GITHUB_ADDRS_ENV: &str = "HASP_GITHUB_ADDRS";
 pub(crate) const READY_MAGIC: &str = "HASP_PROXY_READY_V1";
 
 const MAX_MESSAGE_BYTES: usize = 4096;
-/// Cap for multi-KB responses (SLSA attestation bundles).  Applied only on the
+/// Cap for multi-KB responses (SLSA attestation bundles). Applied only on the
 /// client side for commands that explicitly opt into the large-response path.
-const MAX_LARGE_MESSAGE_BYTES: usize = 256 * 1024;
+/// Sized to accommodate repos with several Sigstore-bundle attestations on a
+/// single SHA; bump if real-world GitHub responses approach this.
+const MAX_LARGE_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_API_CALLS_PER_RUN: u32 = 300;
 const MAX_AUTH_FAILURES: u32 = 5;
 const MAX_CONNECTIONS: u32 = 1000;

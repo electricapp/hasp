@@ -95,28 +95,41 @@ pub(crate) fn verify_attestation_response(body: &str, expected_sha: &str) -> Res
         return Ok(AttestationVerdict::Missing);
     }
 
-    // First attestation wins for the verification verdict. If any subsequent
-    // attestation verifies successfully, that promotes the overall verdict.
-    let mut first_verdict: Option<AttestationVerdict> = None;
+    // Verified always wins. Otherwise we report the strongest negative signal
+    // across all attestations: a SubjectMismatch (tampered binding) outranks an
+    // UntrustedBuilder, which outranks an UnknownPredicate, which outranks a
+    // MalformedAttestation (raw parse failure carries the least signal).
+    let mut best_negative: Option<AttestationVerdict> = None;
     for attestation in attestations {
         match verify_single_attestation(attestation, expected_sha) {
             Ok(verdict @ AttestationVerdict::Verified { .. }) => {
                 return Ok(verdict);
             }
             Ok(other) => {
-                if first_verdict.is_none() {
-                    first_verdict = Some(other);
+                if verdict_rank(&other) > best_negative.as_ref().map_or(0, verdict_rank) {
+                    best_negative = Some(other);
                 }
             }
             Err(e) => {
-                if first_verdict.is_none() {
-                    first_verdict = Some(AttestationVerdict::MalformedAttestation(e.to_string()));
+                let v = AttestationVerdict::MalformedAttestation(e.to_string());
+                if verdict_rank(&v) > best_negative.as_ref().map_or(0, verdict_rank) {
+                    best_negative = Some(v);
                 }
             }
         }
     }
 
-    Ok(first_verdict.unwrap_or(AttestationVerdict::Missing))
+    Ok(best_negative.unwrap_or(AttestationVerdict::Missing))
+}
+
+const fn verdict_rank(v: &AttestationVerdict) -> u8 {
+    match v {
+        AttestationVerdict::SubjectMismatch { .. } => 4,
+        AttestationVerdict::UntrustedBuilder { .. } => 3,
+        AttestationVerdict::UnknownPredicate { .. } => 2,
+        AttestationVerdict::MalformedAttestation(_) => 1,
+        AttestationVerdict::Verified { .. } | AttestationVerdict::Missing => 0,
+    }
 }
 
 fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<AttestationVerdict> {
@@ -190,6 +203,13 @@ fn extract_in_toto_statement(
     Ok(Ok(statement_docs.into_iter().next().unwrap_or(Yaml::Null)))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectedHash {
+    Sha1,
+    Sha256,
+    Other,
+}
+
 /// Return `Some(SubjectMismatch)` if no subject's sha1/gitCommit/sha256 digest
 /// matches `expected_sha`. Returns `None` on a successful binding.
 fn check_subject_binding(
@@ -203,6 +223,18 @@ fn check_subject_binding(
         .unwrap_or_default();
     let mut observed = Vec::new();
     let mut bound = false;
+    // A 40-hex expected_sha is a git commit SHA; accept only digest types that
+    // legitimately key git commit hashes (sha1 / gitCommit). A 64-hex value
+    // means the caller is binding a SHA-256 (artifact or commit). Cross-type
+    // matches (e.g., binding a sha1 expectation against a sha256-keyed digest)
+    // would otherwise pass on accidentally-equal hex prefixes.
+    let expected_kind = if expected_sha.len() == 40 {
+        ExpectedHash::Sha1
+    } else if expected_sha.len() == 64 {
+        ExpectedHash::Sha256
+    } else {
+        ExpectedHash::Other
+    };
     for subj in &subjects {
         let Some(digest) = subj
             .as_hash()
@@ -217,7 +249,13 @@ fn check_subject_binding(
                 .and_then(Yaml::as_str)
             {
                 observed.push(format!("{key}:{value}"));
-                if value.eq_ignore_ascii_case(expected_sha) {
+                let key_compatible = matches!(
+                    (expected_kind, key),
+                    (ExpectedHash::Sha1, "sha1" | "gitCommit")
+                        | (ExpectedHash::Sha256, "sha256")
+                        | (ExpectedHash::Other, _)
+                );
+                if key_compatible && value.eq_ignore_ascii_case(expected_sha) {
                     bound = true;
                 }
             }

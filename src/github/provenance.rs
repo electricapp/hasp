@@ -15,6 +15,15 @@ struct ProvenanceSnapshot {
     reachability: ReachabilityStatus,
     signed: bool,
     commit_date: Option<String>,
+    slsa: SlsaCheckOutcome,
+}
+
+#[derive(Clone)]
+enum SlsaCheckOutcome {
+    NoAttestation,
+    FetchFailed,
+    ParseFailed(String),
+    Verdict(super::slsa::AttestationVerdict),
 }
 
 pub(crate) fn check_provenance_with_api(
@@ -95,12 +104,40 @@ fn check_provenance_with_api_at(
                 )
                 .unwrap_or(None);
 
+            let slsa = match client.get_attestation(
+                &result.action_ref.owner,
+                &result.action_ref.repo,
+                &result.action_ref.ref_str,
+            ) {
+                Ok(Some(body)) => {
+                    match super::slsa::verify_attestation_response(
+                        &body,
+                        &result.action_ref.ref_str,
+                    ) {
+                        Ok(verdict) => SlsaCheckOutcome::Verdict(verdict),
+                        Err(e) => SlsaCheckOutcome::ParseFailed(e.to_string()),
+                    }
+                }
+                Ok(None) => SlsaCheckOutcome::NoAttestation,
+                Err(e) => {
+                    eprintln!(
+                        "hasp: warning: SLSA attestation lookup failed for {}/{}@{}: {e}",
+                        result.action_ref.owner,
+                        result.action_ref.repo,
+                        &result.action_ref.ref_str
+                            [..result.action_ref.ref_str.len().min(12)]
+                    );
+                    SlsaCheckOutcome::FetchFailed
+                }
+            };
+
             checked.insert(
                 key.clone(),
                 ProvenanceSnapshot {
                     reachability,
                     signed,
                     commit_date,
+                    slsa,
                 },
             );
         }
@@ -354,68 +391,51 @@ fn check_provenance_with_api_at(
 
         // ── SLSA attestation ───────────────────────────────────────────
         if !provenance_config.slsa_attestation.is_off() {
-            match client.get_attestation(
-                &result.action_ref.owner,
-                &result.action_ref.repo,
-                &result.action_ref.ref_str,
-            ) {
-                Ok(Some(body)) => {
-                    match super::slsa::verify_attestation_response(
-                        &body,
-                        &result.action_ref.ref_str,
-                    ) {
-                        Ok(verdict) => emit_slsa_finding(
-                            &verdict,
-                            result,
-                            target.as_str(),
-                            short_sha,
-                            provenance_config.slsa_attestation,
-                            &mut findings,
+            match &snapshot.slsa {
+                SlsaCheckOutcome::Verdict(verdict) => emit_slsa_finding(
+                    verdict,
+                    result,
+                    target.as_str(),
+                    short_sha,
+                    provenance_config.slsa_attestation,
+                    &mut findings,
+                ),
+                SlsaCheckOutcome::ParseFailed(e) => {
+                    findings.push(AuditFinding {
+                        file: result.action_ref.file.clone(),
+                        severity: Severity::Medium,
+                        title: format!(
+                            "SLSA attestation for {target} could not be parsed"
                         ),
-                        Err(e) => {
-                            // Bad bundle — surface as MED so it's visible but
-                            // doesn't block on network-flakiness-shaped errors.
-                            findings.push(AuditFinding {
-                                file: result.action_ref.file.clone(),
-                                severity: Severity::Medium,
-                                title: format!(
-                                    "SLSA attestation for {target} could not be parsed"
-                                ),
-                                detail: format!(
-                                    "GitHub returned an attestation bundle for \
-                                     {short_sha} in {target} but we couldn't parse it: \
-                                     {e}. This may indicate an unsupported bundle format."
-                                ),
-                                is_warning: true,
-                            });
-                        }
-                    }
+                        detail: format!(
+                            "GitHub returned an attestation bundle for \
+                             {short_sha} in {target} but we couldn't parse it: \
+                             {e}. This may indicate an unsupported bundle format."
+                        ),
+                        is_warning: provenance_config.slsa_attestation.is_warn(),
+                    });
                 }
-                Ok(None) => {
-                    if !audit::is_trusted_owner(&result.action_ref.owner) {
-                        findings.push(AuditFinding {
-                            file: result.action_ref.file.clone(),
-                            severity: Severity::Medium,
-                            title: format!(
-                                "No SLSA attestation published for {target}"
-                            ),
-                            detail: format!(
-                                "GitHub has no build attestation for commit {short_sha} in \
-                                 {target}. SLSA attestations provide positive evidence that \
-                                 the pinned SHA was produced by an advertised CI workflow. \
-                                 Actions that ship SLSA attestations (via \
-                                 `actions/attest-build-provenance`) give stronger provenance \
-                                 guarantees than pinning alone."
-                            ),
-                            is_warning: provenance_config.slsa_attestation.is_warn(),
-                        });
-                    }
+                SlsaCheckOutcome::NoAttestation
+                    if !audit::is_trusted_owner(&result.action_ref.owner) =>
+                {
+                    findings.push(AuditFinding {
+                        file: result.action_ref.file.clone(),
+                        severity: Severity::Medium,
+                        title: format!(
+                            "No SLSA attestation published for {target}"
+                        ),
+                        detail: format!(
+                            "GitHub has no build attestation for commit {short_sha} in \
+                             {target}. SLSA attestations provide positive evidence that \
+                             the pinned SHA was produced by an advertised CI workflow. \
+                             Actions that ship SLSA attestations (via \
+                             `actions/attest-build-provenance`) give stronger provenance \
+                             guarantees than pinning alone."
+                        ),
+                        is_warning: provenance_config.slsa_attestation.is_warn(),
+                    });
                 }
-                Err(e) => {
-                    eprintln!(
-                        "hasp: warning: SLSA attestation lookup failed for {target}@{short_sha}: {e}"
-                    );
-                }
+                SlsaCheckOutcome::NoAttestation | SlsaCheckOutcome::FetchFailed => {}
             }
         }
     }
@@ -436,6 +456,9 @@ fn emit_slsa_finding(
     match verdict {
         AttestationVerdict::Verified { .. } | AttestationVerdict::Missing => {}
         AttestationVerdict::SubjectMismatch { observed, .. } => {
+            // Tampered binding is positive evidence of attack; always deny
+            // regardless of `slsa_attestation` policy level (which exists to
+            // soften the "no attestation present yet" finding).
             findings.push(AuditFinding {
                 file: result.action_ref.file.clone(),
                 severity: Severity::Critical,
@@ -449,7 +472,7 @@ fn emit_slsa_finding(
                      different SHA, or a bug in the publisher's release pipeline. \
                      Investigate before trusting the pinned SHA."
                 ),
-                is_warning,
+                is_warning: false,
             });
         }
         AttestationVerdict::UntrustedBuilder { builder_id } => {

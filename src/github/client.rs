@@ -608,7 +608,7 @@ impl Client {
         repo: &str,
         sha: &str,
     ) -> Result<Option<String>> {
-        const MAX_ATTESTATION_BYTES: u64 = 256 * 1024;
+        const MAX_ATTESTATION_BYTES: u64 = 1024 * 1024;
         let url = api_url(&format!("repos/{owner}/{repo}/attestations/{sha}"));
         let resp = match self.get(&url)?.call() {
             Ok(resp) => resp,
