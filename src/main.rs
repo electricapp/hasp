@@ -4,6 +4,7 @@ mod diff;
 mod error;
 mod exec;
 mod forward_proxy;
+mod git_util;
 mod github;
 mod integrity;
 mod ipc;
@@ -279,43 +280,10 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
 }
 
 fn load_policy(args: &cli::Args, canonical_dir: &Path) -> Result<policy::Policy> {
-    let pol = if args.no_policy {
-        if args.paranoid {
-            let mut p = policy::Policy::default();
-            p.merge_cli(args);
-            p
-        } else {
-            policy::Policy::default()
-        }
-    } else if let Some(path) = &args.policy_path {
-        let canonical = path
-            .canonicalize()
-            .context(format!("Cannot resolve policy path {}", path.display()))?;
-        let mut p = policy::Policy::load_from(&canonical)?;
-        p.merge_cli(args);
-        eprintln!("hasp: loaded policy from {}", canonical.display());
-        p
-    } else {
-        // Try to find .hasp.yml by walking up from the workflow dir
-        let repo_root = find_repo_root(canonical_dir);
-        policy::Policy::load(&repo_root)?.map_or_else(
-            || {
-                let mut p = policy::Policy::default();
-                if args.paranoid {
-                    p.merge_cli(args);
-                }
-                p
-            },
-            |mut p| {
-                p.merge_cli(args);
-                eprintln!(
-                    "hasp: loaded policy from {}",
-                    policy::Policy::policy_path(&repo_root).display()
-                );
-                p
-            },
-        )
-    };
+    let (pol, loaded_from) = policy::Policy::resolve(args, canonical_dir)?;
+    if let Some(path) = loaded_from {
+        eprintln!("hasp: loaded policy from {}", path.display());
+    }
 
     if !pol.has_any_enabled_check() {
         eprintln!("hasp: warning: policy disables all security checks");
@@ -336,7 +304,7 @@ fn load_policy(args: &cli::Args, canonical_dir: &Path) -> Result<policy::Policy>
 /// PRs that weaken the policy file as part of the same change they're scanning.
 fn check_policy_drift(diff_base: &str, current: &policy::Policy, workflow_dir: &Path) {
     // Find repo root to locate .hasp.yml
-    let repo_root = find_repo_root(workflow_dir);
+    let repo_root = git_util::find_repo_root(workflow_dir);
     let policy_path = policy::Policy::policy_path(&repo_root);
     let relative = policy_path.strip_prefix(&repo_root).unwrap_or(&policy_path);
     let git_path = format!("{diff_base}:{}", relative.display());
@@ -377,20 +345,6 @@ fn check_policy_drift(diff_base: &str, current: &policy::Policy, workflow_dir: &
     eprintln!();
 }
 
-fn find_repo_root(start: &Path) -> PathBuf {
-    let mut dir = start.to_path_buf();
-    let mut depth = 0_u32;
-    loop {
-        if dir.join(".git").exists() || dir.join(".hasp.yml").exists() {
-            return dir;
-        }
-        depth += 1;
-        if depth > 10 || !dir.pop() {
-            return start.to_path_buf();
-        }
-    }
-}
-
 /// Collect OIDC acceptances from both CLI `--oidc-policy` flags and
 /// `.hasp.yml`'s `oidc:` section, resolved against the repo root. Failures
 /// degrade to warnings so a typo in one policy path doesn't block the scan.
@@ -405,7 +359,7 @@ fn load_oidc_acceptances(
     policy: &policy::Policy,
     workflow_dir: &Path,
 ) -> Vec<oidc::OidcAcceptance> {
-    let repo_root = find_repo_root(workflow_dir);
+    let repo_root = git_util::find_repo_root(workflow_dir);
     let canonical_root = match repo_root.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -500,16 +454,9 @@ fn compute_diff_base_changes(
 ) -> Vec<scanner::ActionRefChange> {
     // Validate the ref to prevent git option injection and path traversal.
     // Command::args() prevents shell injection, but git itself interprets
-    // leading dashes as options.  We also reject control characters and
-    // enforce a length limit consistent with git's own ref constraints.
-    if diff_base.is_empty()
-        || diff_base.len() > 256
-        || diff_base.starts_with('-')
-        || diff_base.contains('\0')
-        || diff_base.contains("..")
-        || diff_base.contains('\\')
-        || diff_base.bytes().any(|b| b.is_ascii_control())
-    {
+    // leading dashes as options. The shared check also rejects control
+    // characters, path-traversal, backslashes, and enforces a length limit.
+    if !git_util::is_sane_git_ref(diff_base) {
         eprintln!("hasp: warning: invalid diff-base ref — skipping");
         return Vec::new();
     }

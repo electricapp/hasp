@@ -531,9 +531,8 @@ impl Policy {
                 let target: &str = if file_filter.contains('/') {
                     &file_str
                 } else {
-                    file.file_name().map_or(&*file_str, |n| {
-                        n.to_str().unwrap_or(&file_str)
-                    })
+                    file.file_name()
+                        .map_or(&*file_str, |n| n.to_str().unwrap_or(&file_str))
                 };
                 if !glob_match(file_filter, target) {
                     continue;
@@ -649,9 +648,9 @@ impl Policy {
     /// many findings (permissions, github-env-writes, etc.) carry no action
     /// context and can only be matched by `*`.
     pub(crate) fn has_broad_suppressions(&self) -> bool {
-        self.suppressions.iter().any(|s| {
-            (s.pattern == "*" || s.pattern == "*/*") && s.file.is_none()
-        })
+        self.suppressions
+            .iter()
+            .any(|s| (s.pattern == "*" || s.pattern == "*/*") && s.file.is_none())
     }
 
     /// Parse a policy from text content (for drift comparison against base branch).
@@ -662,6 +661,51 @@ impl Policy {
     /// Path to the policy file (for display only).
     pub(crate) fn policy_path(dir: &Path) -> PathBuf {
         dir.join(".hasp.yml")
+    }
+
+    /// Resolve the effective policy for a CLI invocation, honoring
+    /// `--no-policy`, `--policy <path>`, and `--paranoid`. Walks up from
+    /// `canonical_dir` to find a default `.hasp.yml` when neither flag is
+    /// given. Returns `(policy, loaded_path)` where `loaded_path` is `Some`
+    /// for the explicit `--policy` case and for an auto-discovered
+    /// `.hasp.yml`, and `None` when no policy file was used.
+    ///
+    /// This is the single source of truth for both the launcher (`main`)
+    /// and `hasp diff`; the caller decides whether to emit any user-facing
+    /// messages about where the policy came from.
+    pub(crate) fn resolve(
+        args: &crate::cli::Args,
+        canonical_dir: &Path,
+    ) -> Result<(Self, Option<PathBuf>)> {
+        if args.no_policy {
+            let mut p = Self::default();
+            if args.paranoid {
+                p.merge_cli(args);
+            }
+            return Ok((p, None));
+        }
+        if let Some(path) = &args.policy_path {
+            let canonical = path
+                .canonicalize()
+                .context(format!("Cannot resolve policy path {}", path.display()))?;
+            let mut p = Self::load_from(&canonical)?;
+            p.merge_cli(args);
+            return Ok((p, Some(canonical)));
+        }
+        let repo_root = crate::git_util::find_repo_root(canonical_dir);
+        Self::load(&repo_root)?.map_or_else(
+            || {
+                let mut p = Self::default();
+                if args.paranoid {
+                    p.merge_cli(args);
+                }
+                Ok((p, None))
+            },
+            |mut p| {
+                p.merge_cli(args);
+                Ok((p, Some(Self::policy_path(&repo_root))))
+            },
+        )
     }
 }
 
@@ -1198,10 +1242,7 @@ pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
     // "Missing top-level permissions block" / "write-all permissions at ..."
     // / "...: ...: write" (granular permission findings, e.g.
     // "jobs.release: contents: write")
-    if title.contains("permissions")
-        || title.contains("write-all")
-        || title.ends_with(": write")
-    {
+    if title.contains("permissions") || title.contains("write-all") || title.ends_with(": write") {
         return "permissions";
     }
 
