@@ -1,4 +1,6 @@
 /target
 .claude/
 
-docs/.DS_Store
+# macOS cruft
+.DS_Store
+._*
