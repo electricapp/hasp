@@ -145,7 +145,8 @@ pub(crate) fn verify_attestation_response(body: &str, expected_sha: &str) -> Res
 
 const fn verdict_rank(v: &AttestationVerdict) -> u8 {
     match v {
-        AttestationVerdict::SignatureInvalid { .. } => 6,
+        AttestationVerdict::SignatureInvalid { .. } => 7,
+        AttestationVerdict::ChainInvalid { .. } => 6,
         AttestationVerdict::SubjectMismatch { .. } => 5,
         AttestationVerdict::UntrustedIssuer { .. } => 4,
         AttestationVerdict::UntrustedBuilder { .. } => 3,
