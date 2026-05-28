@@ -99,6 +99,41 @@ pub(crate) trait Api {
     fn get_attestation(&self, _owner: &str, _repo: &str, _sha: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Combined commit-existence + signing + authored-date lookup. The real
+    /// `Client` impl hits `/commits/{sha}` once and parses all three fields
+    /// from the same response. Default impl falls back to the existing trio
+    /// of calls so test mocks keep working unchanged.
+    fn get_commit_signals(&self, owner: &str, repo: &str, sha: &str) -> Result<CommitSignals> {
+        let exists = self.verify_commit(owner, repo, sha)?;
+        if !exists {
+            return Ok(CommitSignals::missing());
+        }
+        let signed = self.is_commit_signed(owner, repo, sha)?;
+        let authored_date = self.get_commit_date(owner, repo, sha)?;
+        Ok(CommitSignals {
+            exists,
+            signed,
+            authored_date,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitSignals {
+    pub(crate) exists: bool,
+    pub(crate) signed: bool,
+    pub(crate) authored_date: Option<String>,
+}
+
+impl CommitSignals {
+    pub(crate) const fn missing() -> Self {
+        Self {
+            exists: false,
+            signed: false,
+            authored_date: None,
+        }
+    }
 }
 
 // ─── Internal types ──────────────────────────────────────────────────────────
@@ -880,5 +915,21 @@ impl Api for Client {
         validate_component(repo, "repo")?;
         validate_sha_param(sha)?;
         Self::get_attestation(self, owner, repo, sha)
+    }
+
+    /// One HTTP fetch against `/commits/{sha}` populates all three fields,
+    /// replacing the 3 separate hits that the default trait impl would do.
+    fn get_commit_signals(&self, owner: &str, repo: &str, sha: &str) -> Result<CommitSignals> {
+        validate_component(owner, "owner")?;
+        validate_component(repo, "repo")?;
+        validate_sha_param(sha)?;
+        let Some(meta) = Self::get_commit_metadata(self, owner, repo, sha)? else {
+            return Ok(CommitSignals::missing());
+        };
+        Ok(CommitSignals {
+            exists: true,
+            signed: meta.verified,
+            authored_date: meta.authored_date,
+        })
     }
 }

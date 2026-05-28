@@ -348,6 +348,10 @@ fn signals_tags(signals: &TrustSignals) -> String {
     }
     if matches!(signals.slsa_verified, Some(true)) {
         parts.push("slsa");
+    } else if matches!(signals.slsa_verified, Some(false)) {
+        // Distinct from None ("we didn't check / API errored"): publisher
+        // queried, no attestation published.
+        parts.push("no-slsa");
     }
     if matches!(signals.reachable, Some(true)) {
         parts.push("reachable");
@@ -473,7 +477,10 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
         .context("Cannot resolve workflow dir")?;
     let scan = crate::scanner::scan_directory(&canonical_dir)?;
 
-    let policy = match crate::policy::Policy::load(&canonical_dir) {
+    // Load policy from the repo root so a `.hasp.yml` at the top of the repo
+    // is honored when --dir points at a subdirectory (matches launcher/diff).
+    let policy_root = crate::git_util::find_repo_root(&canonical_dir);
+    let policy = match crate::policy::Policy::load(&policy_root) {
         Ok(Some(p)) => p,
         Ok(None) => crate::policy::Policy::default(),
         Err(e) => {
@@ -600,9 +607,23 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
             ..TrustSignals::default()
         };
 
-        signals.sha_exists = client
-            .verify_commit(&key.owner, &key.repo, &key.sha)
+        // One fetch against /commits/{sha} populates exists/signed/date
+        // instead of three separate calls hitting the same endpoint.
+        let commit = client
+            .get_commit_signals(&key.owner, &key.repo, &key.sha)
             .ok();
+        signals.sha_exists = commit.as_ref().map(|c| c.exists);
+        if let Some(c) = commit.as_ref()
+            && c.exists
+        {
+            signals.signed = Some(c.signed);
+            if let Some(date) = c.authored_date.as_deref()
+                && let Some(commit_secs) = parse_iso8601_utc(date)
+                && now > 0
+            {
+                signals.commit_age_days = Some(((now - commit_secs) / 86_400).max(0));
+            }
+        }
 
         let repo_info = repo_cache
             .entry((key.owner.clone(), key.repo.clone()))
@@ -614,8 +635,6 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
                 && let Some(created_secs) = parse_iso8601_utc(created_at)
                 && now > 0
             {
-                // Clamp to >= 0 so a future-dated commit / clock skew doesn't
-                // trip the `< 30` "recent repo" penalty in score_signals.
                 signals.repo_age_days = Some(((now - created_secs) / 86_400).max(0));
             }
             if signals.sha_exists == Some(true) {
@@ -632,15 +651,6 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
         }
 
         if signals.sha_exists == Some(true) {
-            signals.signed = client
-                .is_commit_signed(&key.owner, &key.repo, &key.sha)
-                .ok();
-            if let Ok(Some(date)) = client.get_commit_date(&key.owner, &key.repo, &key.sha)
-                && let Some(commit_secs) = parse_iso8601_utc(&date)
-                && now > 0
-            {
-                signals.commit_age_days = Some(((now - commit_secs) / 86_400).max(0));
-            }
             // Three-way:
             //   Ok(Some) → run the verifier, Some(true)/Some(false) by verdict.
             //   Ok(None) → no attestation published, Some(false).
@@ -663,11 +673,11 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
     out
 }
 
-/// Per-ref API cost in `collect_online_signals_with_api`: `verify_commit`,
+/// Per-ref API cost in `collect_online_signals_with_api`: `get_commit_signals`
+/// (one fetch against `/commits/{sha}` for exists+signed+date),
 /// `get_repo_info` (cached per repo, amortizes to ~1 over many refs),
-/// `is_commit_reachable`, `is_commit_signed`, `get_commit_date`,
-/// `get_attestation`.
-const PER_REF_CALL_COST: usize = 6;
+/// `is_commit_reachable`, `get_attestation`.
+const PER_REF_CALL_COST: usize = 4;
 /// Hard cap on GitHub API calls per `hasp tree` run. Sized for ~80 unique
 /// refs without letting a pathological repo spin.
 const TREE_CALL_BUDGET: usize = 500;

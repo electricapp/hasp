@@ -508,6 +508,11 @@ OPTIONS:
                                    therefore always pass.
     --no-verify                    Skip all online (GitHub API) signals;
                                    render the graph from offline data only
+
+NOTE:
+    `hasp tree` always runs the static audit at the policy-configured
+    levels to populate `findings_here`. `--paranoid` and `--no-oidc`
+    are honored by `hasp` / `hasp diff` but do not affect tree output.
     -d, --dir <DIR>                Workflow directory [default: .github/workflows]
         --allow-unsandboxed        Skip sandbox preflight (dev mode)
     -h, --help                     Print this help
