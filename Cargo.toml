@@ -112,16 +112,20 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1.0"
 yaml-rust2 = "0.11"
 # TODO: bump to ureq 3 — feature renamed (`tls` → `rustls`) and API overhauled
-# (`AgentBuilder`, `Resolver` trait, `Error::Status` removed). Requires rewriting
-# src/github/client.rs and src/selfcheck.rs.
+# (`AgentBuilder`, `Resolver` trait, `Error::Status` removed). Also drops support
+# for custom `ServerCertVerifier`, so the SPKI-pinning logic in
+# `src/github/client.rs` needs a custom `Connector` impl to survive the bump.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 sha1 = "0.11"                  # SHA-1 for git blob hash (workflow integrity check)
 sha2 = "0.11"                  # SHA-256 for --self-check binary verification
 
+# Unix-side libc bindings (signal handlers in `diff`, sandbox/netguard on Linux).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Landlock filesystem sandboxing — Linux-only, thin wrapper over syscalls
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-libc = "0.2"
 
 # ─── Dev / test dependencies ──────────────────────────────────────────────────
 [dev-dependencies]

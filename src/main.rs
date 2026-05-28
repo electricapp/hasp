@@ -1,8 +1,10 @@
 mod audit;
 mod cli;
+mod diff;
 mod error;
 mod exec;
 mod forward_proxy;
+mod git_util;
 mod github;
 mod integrity;
 mod ipc;
@@ -118,6 +120,7 @@ fn run() -> Result<()> {
 
     match args.mode {
         Mode::Launcher => run_launcher(&args),
+        Mode::Diff => diff::run(&args),
         Mode::Exec => exec::run_exec(&args),
         Mode::InternalScan => run_internal_scan(&args),
         Mode::InternalVerify => run_internal_verify(&args),
@@ -277,43 +280,10 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
 }
 
 fn load_policy(args: &cli::Args, canonical_dir: &Path) -> Result<policy::Policy> {
-    let pol = if args.no_policy {
-        if args.paranoid {
-            let mut p = policy::Policy::default();
-            p.merge_cli(args);
-            p
-        } else {
-            policy::Policy::default()
-        }
-    } else if let Some(path) = &args.policy_path {
-        let canonical = path
-            .canonicalize()
-            .context(format!("Cannot resolve policy path {}", path.display()))?;
-        let mut p = policy::Policy::load_from(&canonical)?;
-        p.merge_cli(args);
-        eprintln!("hasp: loaded policy from {}", canonical.display());
-        p
-    } else {
-        // Try to find .hasp.yml by walking up from the workflow dir
-        let repo_root = find_repo_root(canonical_dir);
-        policy::Policy::load(&repo_root)?.map_or_else(
-            || {
-                let mut p = policy::Policy::default();
-                if args.paranoid {
-                    p.merge_cli(args);
-                }
-                p
-            },
-            |mut p| {
-                p.merge_cli(args);
-                eprintln!(
-                    "hasp: loaded policy from {}",
-                    policy::Policy::policy_path(&repo_root).display()
-                );
-                p
-            },
-        )
-    };
+    let (pol, loaded_from) = policy::Policy::resolve(args, canonical_dir)?;
+    if let Some(path) = loaded_from {
+        eprintln!("hasp: loaded policy from {}", path.display());
+    }
 
     if !pol.has_any_enabled_check() {
         eprintln!("hasp: warning: policy disables all security checks");
@@ -334,12 +304,12 @@ fn load_policy(args: &cli::Args, canonical_dir: &Path) -> Result<policy::Policy>
 /// PRs that weaken the policy file as part of the same change they're scanning.
 fn check_policy_drift(diff_base: &str, current: &policy::Policy, workflow_dir: &Path) {
     // Find repo root to locate .hasp.yml
-    let repo_root = find_repo_root(workflow_dir);
+    let repo_root = git_util::find_repo_root(workflow_dir);
     let policy_path = policy::Policy::policy_path(&repo_root);
     let relative = policy_path.strip_prefix(&repo_root).unwrap_or(&policy_path);
     let git_path = format!("{diff_base}:{}", relative.display());
 
-    let output = Command::new("git").args(["show", &git_path]).output();
+    let output = git_util::git_cmd().args(["show", &git_path]).output();
 
     let Ok(output) = output else { return };
     if !output.status.success() {
@@ -375,99 +345,12 @@ fn check_policy_drift(diff_base: &str, current: &policy::Policy, workflow_dir: &
     eprintln!();
 }
 
-fn find_repo_root(start: &Path) -> PathBuf {
-    let mut dir = start.to_path_buf();
-    let mut depth = 0_u32;
-    loop {
-        if dir.join(".git").exists() || dir.join(".hasp.yml").exists() {
-            return dir;
-        }
-        depth += 1;
-        if depth > 10 || !dir.pop() {
-            return start.to_path_buf();
-        }
-    }
-}
-
-/// Collect OIDC acceptances from both CLI `--oidc-policy` flags and
-/// `.hasp.yml`'s `oidc:` section, resolved against the repo root. Failures
-/// degrade to warnings so a typo in one policy path doesn't block the scan.
-///
-/// Policy paths from BOTH sources are constrained to live inside the repo
-/// root after canonicalization. Canonicalization follows symlinks, which is
-/// intentional: an attacker who can plant a `.hasp.yml` referencing
-/// `oidc: [{ provider: aws, path: ../../../../etc/passwd }]` (or a symlink
-/// pointing outside the repo) must not be able to read arbitrary files.
 fn load_oidc_acceptances(
     args: &cli::Args,
     policy: &policy::Policy,
     workflow_dir: &Path,
 ) -> Vec<oidc::OidcAcceptance> {
-    let repo_root = find_repo_root(workflow_dir);
-    let canonical_root = match repo_root.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "hasp: warning: cannot canonicalize repo root {}: {e} — skipping OIDC policy loading",
-                repo_root.display()
-            );
-            return Vec::new();
-        }
-    };
-    let mut entries: Vec<(String, PathBuf)> = args.oidc_policies.clone();
-    for p in &policy.oidc_policies {
-        entries.push((p.provider.clone(), repo_root.join(&p.path)));
-    }
-    let mut out = Vec::new();
-    for (provider_str, path) in entries {
-        let Some(resolved) = resolve_oidc_policy_path(&path, &canonical_root) else {
-            continue;
-        };
-        let provider = match oidc::OidcProvider::parse(&provider_str) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "hasp: warning: skipping OIDC policy {}: {e}",
-                    resolved.display()
-                );
-                continue;
-            }
-        };
-        match oidc::load_trust_policy(provider, &resolved) {
-            Ok(acceptances) => out.extend(acceptances),
-            Err(e) => {
-                eprintln!(
-                    "hasp: warning: failed to load OIDC policy {} ({provider}): {e}",
-                    resolved.display()
-                );
-            }
-        }
-    }
-    out
-}
-
-/// Canonicalize an OIDC policy path and confirm it lives inside the repo.
-/// Returns `None` (with a warning printed) on escape or unresolvable path.
-fn resolve_oidc_policy_path(path: &Path, canonical_root: &Path) -> Option<PathBuf> {
-    let canonical = match path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "hasp: warning: cannot resolve OIDC policy path {}: {e} — skipping",
-                path.display()
-            );
-            return None;
-        }
-    };
-    if !canonical.starts_with(canonical_root) {
-        eprintln!(
-            "hasp: warning: OIDC policy path {} resolves outside repo root {} — refusing to load (path traversal guard)",
-            canonical.display(),
-            canonical_root.display()
-        );
-        return None;
-    }
-    Some(canonical)
+    oidc::load_policy_acceptances(&args.oidc_policies, &policy.oidc_policies, workflow_dir)
 }
 
 fn apply_suppressions(policy: &policy::Policy, findings: &mut Vec<audit::AuditFinding>) -> usize {
@@ -498,16 +381,9 @@ fn compute_diff_base_changes(
 ) -> Vec<scanner::ActionRefChange> {
     // Validate the ref to prevent git option injection and path traversal.
     // Command::args() prevents shell injection, but git itself interprets
-    // leading dashes as options.  We also reject control characters and
-    // enforce a length limit consistent with git's own ref constraints.
-    if diff_base.is_empty()
-        || diff_base.len() > 256
-        || diff_base.starts_with('-')
-        || diff_base.contains('\0')
-        || diff_base.contains("..")
-        || diff_base.contains('\\')
-        || diff_base.bytes().any(|b| b.is_ascii_control())
-    {
+    // leading dashes as options. The shared check also rejects control
+    // characters, path-traversal, backslashes, and enforces a length limit.
+    if !git_util::is_sane_git_ref(diff_base) {
         eprintln!("hasp: warning: invalid diff-base ref — skipping");
         return Vec::new();
     }
@@ -528,7 +404,7 @@ fn compute_diff_base_changes(
     };
 
     // Get repo root for relative path calculation
-    let repo_root = Command::new("git")
+    let repo_root = git_util::git_cmd()
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()
@@ -550,7 +426,7 @@ fn compute_diff_base_changes(
     // Verify the ref actually resolves; otherwise `git show` will silently
     // miss every file and we'd report "no SHA changes" for what is really a
     // typo in the diff-base ref.
-    let resolved = Command::new("git")
+    let resolved = git_util::git_cmd()
         .args(["rev-parse", "--verify", "--quiet", diff_base])
         .current_dir(&repo_root)
         .output();
@@ -571,7 +447,7 @@ fn compute_diff_base_changes(
         let relative = file.strip_prefix(&repo_root).unwrap_or(file);
         let git_path = format!("{diff_base}:{}", relative.display());
 
-        let output = Command::new("git").args(["show", &git_path]).output();
+        let output = git_util::git_cmd().args(["show", &git_path]).output();
 
         let Ok(output) = output else {
             continue; // git show failed, skip

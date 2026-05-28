@@ -22,7 +22,7 @@ pub(crate) struct AuditFinding {
     pub(crate) is_warning: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Severity {
     Critical,
     High,

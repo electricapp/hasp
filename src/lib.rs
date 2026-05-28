@@ -23,9 +23,11 @@
 
 pub(crate) mod audit;
 pub(crate) mod cli;
+pub(crate) mod diff;
 pub(crate) mod error;
 pub(crate) mod exec;
 pub(crate) mod forward_proxy;
+pub(crate) mod git_util;
 pub(crate) mod github;
 pub(crate) mod integrity;
 pub(crate) mod ipc;

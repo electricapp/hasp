@@ -30,6 +30,7 @@ pub(super) const KNOWN_CHECK_NAMES: &[&str] = &[
     "recent-repo",
     "transitive",
     "hidden-execution",
+    "slsa-attestation",
 ];
 
 // ─── Check level ─────────────────────────────────────────────────────────────
@@ -102,6 +103,7 @@ pub(crate) struct ProvenanceCheckConfig {
     pub(crate) recent_repo: CheckLevel,
     pub(crate) transitive: CheckLevel,
     pub(crate) hidden_execution: CheckLevel,
+    pub(crate) slsa_attestation: CheckLevel,
 }
 
 impl Default for ProvenanceCheckConfig {
@@ -115,6 +117,10 @@ impl Default for ProvenanceCheckConfig {
             recent_repo: CheckLevel::Deny,
             transitive: CheckLevel::Deny,
             hidden_execution: CheckLevel::Deny,
+            // Default Warn: when the SLSA audit is enabled, a missing
+            // attestation for a known-good action (like actions/checkout)
+            // should warn, not block — many actions haven't adopted SLSA yet.
+            slsa_attestation: CheckLevel::Warn,
         }
     }
 }
@@ -185,6 +191,7 @@ pub(super) struct PartialProvenanceConfig {
     pub(super) recent_repo: Option<CheckLevel>,
     pub(super) transitive: Option<CheckLevel>,
     pub(super) hidden_execution: Option<CheckLevel>,
+    pub(super) slsa_attestation: Option<CheckLevel>,
 }
 
 // ─── Trust configuration ─────────────────────────────────────────────────────
@@ -524,9 +531,8 @@ impl Policy {
                 let target: &str = if file_filter.contains('/') {
                     &file_str
                 } else {
-                    file.file_name().map_or(&*file_str, |n| {
-                        n.to_str().unwrap_or(&file_str)
-                    })
+                    file.file_name()
+                        .map_or(&*file_str, |n| n.to_str().unwrap_or(&file_str))
                 };
                 if !glob_match(file_filter, target) {
                     continue;
@@ -614,6 +620,7 @@ impl Policy {
             || !c.provenance.recent_repo.is_off()
             || !c.provenance.transitive.is_off()
             || !c.provenance.hidden_execution.is_off()
+            || !c.provenance.slsa_attestation.is_off()
     }
 
     /// Returns true if any provenance sub-check is enabled.
@@ -627,6 +634,7 @@ impl Policy {
             || !p.recent_repo.is_off()
             || !p.transitive.is_off()
             || !p.hidden_execution.is_off()
+            || !p.slsa_attestation.is_off()
     }
 
     /// Returns true if the policy has any suppressions configured.
@@ -640,9 +648,9 @@ impl Policy {
     /// many findings (permissions, github-env-writes, etc.) carry no action
     /// context and can only be matched by `*`.
     pub(crate) fn has_broad_suppressions(&self) -> bool {
-        self.suppressions.iter().any(|s| {
-            (s.pattern == "*" || s.pattern == "*/*") && s.file.is_none()
-        })
+        self.suppressions
+            .iter()
+            .any(|s| (s.pattern == "*" || s.pattern == "*/*") && s.file.is_none())
     }
 
     /// Parse a policy from text content (for drift comparison against base branch).
@@ -653,6 +661,51 @@ impl Policy {
     /// Path to the policy file (for display only).
     pub(crate) fn policy_path(dir: &Path) -> PathBuf {
         dir.join(".hasp.yml")
+    }
+
+    /// Resolve the effective policy for a CLI invocation, honoring
+    /// `--no-policy`, `--policy <path>`, and `--paranoid`. Walks up from
+    /// `canonical_dir` to find a default `.hasp.yml` when neither flag is
+    /// given. Returns `(policy, loaded_path)` where `loaded_path` is `Some`
+    /// for the explicit `--policy` case and for an auto-discovered
+    /// `.hasp.yml`, and `None` when no policy file was used.
+    ///
+    /// This is the single source of truth for both the launcher (`main`)
+    /// and `hasp diff`; the caller decides whether to emit any user-facing
+    /// messages about where the policy came from.
+    pub(crate) fn resolve(
+        args: &crate::cli::Args,
+        canonical_dir: &Path,
+    ) -> Result<(Self, Option<PathBuf>)> {
+        if args.no_policy {
+            let mut p = Self::default();
+            if args.paranoid {
+                p.merge_cli(args);
+            }
+            return Ok((p, None));
+        }
+        if let Some(path) = &args.policy_path {
+            let canonical = path
+                .canonicalize()
+                .context(format!("Cannot resolve policy path {}", path.display()))?;
+            let mut p = Self::load_from(&canonical)?;
+            p.merge_cli(args);
+            return Ok((p, Some(canonical)));
+        }
+        let repo_root = crate::git_util::find_repo_root(canonical_dir);
+        Self::load(&repo_root)?.map_or_else(
+            || {
+                let mut p = Self::default();
+                if args.paranoid {
+                    p.merge_cli(args);
+                }
+                Ok((p, None))
+            },
+            |mut p| {
+                p.merge_cli(args);
+                Ok((p, Some(Self::policy_path(&repo_root))))
+            },
+        )
     }
 }
 
@@ -805,6 +858,12 @@ pub(crate) fn detect_policy_drift(old: &Policy, new: &Policy) -> Vec<PolicyDrift
         "provenance.hidden-execution",
         old.checks.provenance.hidden_execution,
         new.checks.provenance.hidden_execution,
+    );
+    drift_check(
+        &mut drifts,
+        "provenance.slsa-attestation",
+        old.checks.provenance.slsa_attestation,
+        new.checks.provenance.slsa_attestation,
     );
 
     // Suppressions added
@@ -1032,6 +1091,11 @@ fn apply_partial_checks(full: &mut CheckConfig, partial: &PartialCheckConfig) {
             prov.hidden_execution,
             "hidden-execution",
         );
+        apply_level(
+            &mut full.provenance.slsa_attestation,
+            prov.slsa_attestation,
+            "slsa-attestation",
+        );
     }
 }
 
@@ -1056,6 +1120,7 @@ const fn set_all_checks_deny(checks: &mut CheckConfig) {
     checks.provenance.recent_repo = CheckLevel::Deny;
     checks.provenance.transitive = CheckLevel::Deny;
     checks.provenance.hidden_execution = CheckLevel::Deny;
+    checks.provenance.slsa_attestation = CheckLevel::Deny;
 }
 
 /// Map a finding title to its policy check name for suppression matching.
@@ -1156,6 +1221,12 @@ pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
         return "hidden-execution";
     }
 
+    // SLSA attestation: "No SLSA attestation ...", "SLSA attestation tampered",
+    // "SLSA attestation signed by untrusted builder", etc.
+    if title.contains("SLSA attestation") {
+        return "slsa-attestation";
+    }
+
     // ── Broader patterns (checked after specific ones) ──────────────────
 
     // "Script injection via ..." / "Potential injection in action input via ..."
@@ -1171,10 +1242,7 @@ pub(crate) fn check_name_for_finding(title: &str) -> &'static str {
     // "Missing top-level permissions block" / "write-all permissions at ..."
     // / "...: ...: write" (granular permission findings, e.g.
     // "jobs.release: contents: write")
-    if title.contains("permissions")
-        || title.contains("write-all")
-        || title.ends_with(": write")
-    {
+    if title.contains("permissions") || title.contains("write-all") || title.ends_with(": write") {
         return "permissions";
     }
 

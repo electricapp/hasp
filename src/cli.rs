@@ -3,6 +3,7 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Launcher,
+    Diff,
     Exec,
     InternalScan,
     InternalVerify,
@@ -30,9 +31,13 @@ pub(crate) struct Args {
     pub(crate) policy_path: Option<PathBuf>,
     pub(crate) no_policy: bool,
     pub(crate) max_transitive_depth: u8,
+    /// Launcher-mode `--diff-base <ref>` (policy drift + SHA-change check).
     pub(crate) diff_base: Option<String>,
+    /// `hasp diff <base>` positional argument.
+    pub(crate) diff_subcommand_base: Option<String>,
     pub(crate) oidc_policies: Vec<(String, PathBuf)>,
     pub(crate) no_oidc: bool,
+    pub(crate) diff_format: Option<crate::diff::DiffFormat>,
     pub(crate) mode: Mode,
     pub(crate) exec: Option<ExecArgs>,
 }
@@ -52,8 +57,10 @@ impl Default for Args {
             no_policy: false,
             max_transitive_depth: 3,
             diff_base: None,
+            diff_subcommand_base: None,
             oidc_policies: Vec::new(),
             no_oidc: false,
+            diff_format: None,
             mode: Mode::Launcher,
             exec: None,
         }
@@ -72,14 +79,79 @@ pub(crate) fn parse() -> Args {
 
     // Peek at the first argument to detect subcommands
     let first = iter.next();
-    if let Some(ref first_arg) = first
-        && first_arg == "exec"
-    {
-        return parse_exec(args, iter);
+    if let Some(ref first_arg) = first {
+        if first_arg == "exec" {
+            return parse_exec(args, iter);
+        }
+        if first_arg == "diff" {
+            return parse_diff(args, iter);
+        }
     }
     // If not a subcommand, re-process the first argument in the normal loop
     let replay = first.into_iter().chain(iter);
     parse_scanner_args(&mut args, replay);
+    args
+}
+
+fn parse_diff(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+    args.mode = Mode::Diff;
+    let mut positional: Vec<String> = Vec::new();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--format" => {
+                let raw = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp diff: --format requires a value (terse|markdown|json)");
+                    std::process::exit(2);
+                });
+                args.diff_format = Some(crate::diff::DiffFormat::parse(&raw).unwrap_or_else(|e| {
+                    eprintln!("hasp diff: {e}");
+                    std::process::exit(2);
+                }));
+            }
+            "-d" | "--dir" => {
+                args.dir = PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp diff: --dir requires a value");
+                    std::process::exit(2);
+                }));
+            }
+            "--policy" => {
+                args.policy_path = Some(PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp diff: --policy requires a value");
+                    std::process::exit(2);
+                })));
+            }
+            "--no-policy" => args.no_policy = true,
+            "--paranoid" => args.paranoid = true,
+            "--allow-unsandboxed" => args.allow_unsandboxed = true,
+            "-h" | "--help" => {
+                print_diff_help();
+                std::process::exit(0);
+            }
+            other => {
+                // First non-flag positional is the base ref.
+                if other.starts_with('-') {
+                    eprintln!("hasp diff: unknown option: {other}");
+                    eprintln!("Try 'hasp diff --help' for usage.");
+                    std::process::exit(2);
+                }
+                positional.push(other.to_string());
+            }
+        }
+    }
+    if positional.is_empty() {
+        eprintln!("hasp diff: missing <base> argument (e.g. main, HEAD~1)");
+        eprintln!("Usage: hasp diff <base> [--format terse|markdown|json]");
+        std::process::exit(2);
+    }
+    if positional.len() > 1 {
+        eprintln!(
+            "hasp diff: expected 1 base ref, got {} ({:?})",
+            positional.len(),
+            positional
+        );
+        std::process::exit(2);
+    }
+    args.diff_subcommand_base = Some(positional.remove(0));
     args
 }
 
@@ -275,6 +347,39 @@ fn parse_duration(raw: &str) -> Option<i64> {
         _ => return None,
     };
     value.checked_mul(multiplier)
+}
+
+fn print_diff_help() {
+    println!(
+        "\
+hasp diff {}
+Show the audit-finding delta between a base git ref and HEAD.
+
+USAGE:
+    hasp diff <base> [OPTIONS]
+
+ARGS:
+    <base>      Base git ref (e.g. main, HEAD~1, v1.2.3)
+
+OPTIONS:
+    --format terse|markdown|json   Output format [default: terse]
+        markdown: PR-comment-friendly GitHub-flavored markdown
+        json:     machine-readable for CI consumption
+    -d, --dir <DIR>                Workflow directory [default: .github/workflows]
+        --policy <PATH>            Path to .hasp.yml policy file
+        --no-policy                Ignore .hasp.yml
+        --paranoid                 Enable all checks during the compare
+        --allow-unsandboxed        Skip sandbox preflight (dev mode)
+    -h, --help                     Print this help
+
+EXIT CODES:
+    0   No new blocking findings introduced
+    1   At least one new deny-level finding in the head branch
+
+EXAMPLE:
+    hasp diff main --format markdown | gh pr comment --body-file -",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn print_exec_help() {
