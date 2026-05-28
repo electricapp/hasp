@@ -139,11 +139,11 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
     let delta = compute_delta(&base, &base_findings, &head_findings);
     emit(&delta, format);
 
-    // Clear the signal-handler target BEFORE Drop removes the worktree so a
-    // signal landing between the two doesn't trip the handler into removing
-    // an already-removed path.
-    clear_cleanup_path();
+    // Drop runs first so the worktree teardown actually happens; clearing the
+    // signal target after is safe because `cleanup_worktree` is idempotent
+    // (a signal landing between the two only triggers a no-op second pass).
     drop(worktree);
+    clear_cleanup_path();
 
     let code = delta.exit_code();
     if code != 0 {
@@ -179,6 +179,20 @@ fn scan_and_audit(scan_dir: &Path, scan_root: &Path, policy: &Policy) -> Result<
             &owners,
         );
     }
+    if !policy.checks.oidc.is_off() {
+        // diff mode reads OIDC acceptances from `.hasp.yml` only — CLI
+        // `--oidc-policy` flags aren't exposed by `parse_diff`. Both base and
+        // head scans see the same policy file content, so divergence between
+        // them is a real OIDC-policy change worth flagging.
+        let acceptances =
+            crate::oidc::load_policy_acceptances(&[], &policy.oidc_policies, scan_dir);
+        audit::oidc::run(
+            &scan.workflow_docs,
+            &acceptances,
+            &mut findings,
+            policy.checks.oidc,
+        );
+    }
     strip_scan_root(&mut findings, scan_root);
     Ok(findings)
 }
@@ -197,14 +211,20 @@ fn strip_scan_root(findings: &mut [AuditFinding], scan_root: &Path) {
     if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
         prefix.push(std::path::MAIN_SEPARATOR);
     }
-    let strip_text = !prefix.is_empty() && prefix != std::path::MAIN_SEPARATOR.to_string();
+    // Skip text rewriting when the prefix is empty or just a bare separator —
+    // either means canonicalize failed in a way that would replace far too much.
+    let strip_text = prefix.len() > 1;
     for f in findings {
         if let Ok(rel) = f.file.strip_prefix(&canonical_root) {
             f.file = rel.to_path_buf();
         }
         if strip_text {
-            f.title = f.title.replace(&prefix, "");
-            f.detail = f.detail.replace(&prefix, "");
+            if f.title.contains(&prefix) {
+                f.title = f.title.replace(&prefix, "");
+            }
+            if f.detail.contains(&prefix) {
+                f.detail = f.detail.replace(&prefix, "");
+            }
         }
     }
 }
@@ -512,11 +532,17 @@ impl BaseWorktree {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        // Do the checkout in a second step so worktree creation itself stays
-        // cheap (--no-checkout) and we can surface checkout errors distinctly.
+        // Construct Self before running checkout so a checkout failure still
+        // triggers Drop and tears down the just-registered worktree entry.
+        let this = Self {
+            repo_root: repo_root.to_path_buf(),
+            path,
+        };
+        // Checkout is a second step so creation stays cheap (--no-checkout)
+        // and checkout errors surface distinctly.
         let checkout = git_util::git_cmd()
             .args(["checkout", sha])
-            .current_dir(&path)
+            .current_dir(&this.path)
             .output()
             .context("Failed to checkout base worktree")?;
         if !checkout.status.success() {
@@ -525,10 +551,7 @@ impl BaseWorktree {
                 String::from_utf8_lossy(&checkout.stderr).trim()
             );
         }
-        Ok(Self {
-            repo_root: repo_root.to_path_buf(),
-            path,
-        })
+        Ok(this)
     }
 
     fn path(&self) -> &Path {
@@ -598,20 +621,29 @@ fn cleanup_worktree(path: &Path, repo_root: &Path) {
 
 // ─── signal cleanup ─────────────────────────────────────────────────────────
 
-// Target is set once per process (diff mode runs a single scan), then an
-// atomic flag gates whether the handler should act. `OnceLock` + `AtomicBool`
-// keep the handler lock-free, so a signal landing during register/clear
-// can't deadlock against the main thread.
-static CLEANUP_TARGET: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+// The atomic flag is the handler's fast path — it can short-circuit without
+// acquiring the mutex when no worktree is registered. The mutex protects the
+// target itself so repeat registrations (e.g. a future multi-base diff loop)
+// can swap targets without losing protection. The handler uses `try_lock`
+// to stay async-signal-safe; in the worst case (concurrent register/clear)
+// it skips cleanup, which matches the old "leak the temp dir, don't deadlock"
+// failure mode.
+static CLEANUP_TARGET: std::sync::Mutex<Option<(PathBuf, PathBuf)>> =
+    std::sync::Mutex::new(None);
 static CLEANUP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn register_cleanup_path(path: &Path, repo_root: &Path) {
-    let _ = CLEANUP_TARGET.set((path.to_path_buf(), repo_root.to_path_buf()));
+    if let Ok(mut g) = CLEANUP_TARGET.lock() {
+        *g = Some((path.to_path_buf(), repo_root.to_path_buf()));
+    }
     CLEANUP_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn clear_cleanup_path() {
     CLEANUP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut g) = CLEANUP_TARGET.lock() {
+        *g = None;
+    }
 }
 
 #[cfg(unix)]
@@ -644,7 +676,8 @@ const fn install_signal_cleanup_once() {
 #[cfg(unix)]
 extern "C" fn signal_handler(sig: libc::c_int) {
     if CLEANUP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-        && let Some((path, repo_root)) = CLEANUP_TARGET.get()
+        && let Ok(guard) = CLEANUP_TARGET.try_lock()
+        && let Some((path, repo_root)) = guard.as_ref()
     {
         cleanup_worktree(path, repo_root);
     }

@@ -121,9 +121,8 @@ fn check_provenance_with_api_at(
                 Ok(None) => SlsaCheckOutcome::NoAttestation,
                 Err(e) => {
                     eprintln!(
-                        "hasp: warning: SLSA attestation lookup failed for {}/{}@{}: {e}",
-                        result.action_ref.owner,
-                        result.action_ref.repo,
+                        "hasp: warning: SLSA attestation lookup failed for {}@{}: {e}",
+                        result.action_ref.target(),
                         &result.action_ref.ref_str
                             [..result.action_ref.ref_str.len().min(12)]
                     );

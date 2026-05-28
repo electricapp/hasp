@@ -249,11 +249,14 @@ fn check_subject_binding(
                 .and_then(Yaml::as_str)
             {
                 observed.push(format!("{key}:{value}"));
+                // Reject cross-digest-type matches: a 40-hex (sha1) expected
+                // SHA must bind via sha1/gitCommit; a 64-hex (sha256) must
+                // bind via sha256. The scanner enforces 40-hex for FullSha
+                // refs, so `ExpectedHash::Other` never matches here.
                 let key_compatible = matches!(
                     (expected_kind, key),
                     (ExpectedHash::Sha1, "sha1" | "gitCommit")
                         | (ExpectedHash::Sha256, "sha256")
-                        | (ExpectedHash::Other, _)
                 );
                 if key_compatible && value.eq_ignore_ascii_case(expected_sha) {
                     bound = true;

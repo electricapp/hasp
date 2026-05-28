@@ -196,6 +196,86 @@ pub(crate) fn load_trust_policy(
     }
 }
 
+/// Collect OIDC acceptances from CLI-supplied `--oidc-policy` entries plus the
+/// `oidc:` block of the resolved policy, with path-traversal containment
+/// enforced relative to the repo root. Failures degrade to warnings so a typo
+/// in one policy path doesn't block the rest of the scan.
+///
+/// Canonicalization follows symlinks intentionally — an attacker who can plant
+/// a `.hasp.yml` referencing `path: ../../../../etc/passwd` (or a symlink
+/// pointing outside) must not be able to read arbitrary files.
+pub(crate) fn load_policy_acceptances(
+    cli_policies: &[(String, PathBuf)],
+    policy_refs: &[crate::policy::OidcPolicyRef],
+    workflow_dir: &Path,
+) -> Vec<OidcAcceptance> {
+    let repo_root = crate::git_util::find_repo_root(workflow_dir);
+    let canonical_root = match repo_root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "hasp: warning: cannot canonicalize repo root {}: {e} — skipping OIDC policy loading",
+                repo_root.display()
+            );
+            return Vec::new();
+        }
+    };
+    let mut entries: Vec<(String, PathBuf)> = cli_policies.to_vec();
+    for p in policy_refs {
+        entries.push((p.provider.clone(), repo_root.join(&p.path)));
+    }
+    let mut out = Vec::new();
+    for (provider_str, path) in entries {
+        let Some(resolved) = resolve_policy_path(&path, &canonical_root) else {
+            continue;
+        };
+        let provider = match OidcProvider::parse(&provider_str) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "hasp: warning: skipping OIDC policy {}: {e}",
+                    resolved.display()
+                );
+                continue;
+            }
+        };
+        match load_trust_policy(provider, &resolved) {
+            Ok(acceptances) => out.extend(acceptances),
+            Err(e) => {
+                eprintln!(
+                    "hasp: warning: failed to load OIDC policy {} ({provider}): {e}",
+                    resolved.display()
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Canonicalize an OIDC policy path and confirm it lives inside the repo.
+/// Returns `None` (with a warning printed) on escape or unresolvable path.
+fn resolve_policy_path(path: &Path, canonical_root: &Path) -> Option<PathBuf> {
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "hasp: warning: cannot resolve OIDC policy path {}: {e} — skipping",
+                path.display()
+            );
+            return None;
+        }
+    };
+    if !canonical.starts_with(canonical_root) {
+        eprintln!(
+            "hasp: warning: OIDC policy path {} resolves outside repo root {} — refusing to load (path traversal guard)",
+            canonical.display(),
+            canonical_root.display()
+        );
+        return None;
+    }
+    Some(canonical)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
