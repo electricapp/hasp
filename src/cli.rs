@@ -500,8 +500,11 @@ USAGE:
 
 OPTIONS:
     --format ascii|json            Output format [default: ascii]
-    --min-score <SCORE>            Fail with exit 1 if any root score is
-                                   below this threshold (0.0-1.0)
+    --min-score <SCORE>            Fail with exit 1 if any node score
+                                   (workflow or pinned action) is below
+                                   this threshold (0.0-1.0). Workflows
+                                   with no pinned `uses:` score 1.0 and
+                                   therefore always pass.
     -d, --dir <DIR>                Workflow directory [default: .github/workflows]
         --allow-unsandboxed        Skip sandbox preflight (dev mode)
     -h, --help                     Print this help

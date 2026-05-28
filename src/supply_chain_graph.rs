@@ -8,7 +8,7 @@
 
 use crate::audit::AuditFinding;
 use crate::scanner::{ActionRef, RefKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -112,8 +112,6 @@ pub(crate) fn score_signals(signals: &TrustSignals) -> f32 {
     if matches!(signals.repo_age_days, Some(days) if days < 30) {
         score -= 0.2;
     }
-    let finding_penalty = 0.05 * f32::from(u16::try_from(signals.findings_here.min(6)).unwrap_or(0));
-    score -= finding_penalty;
 
     score.clamp(0.0, 1.0)
 }
@@ -150,6 +148,7 @@ pub(crate) fn build(
 ) -> ActionGraph {
     let mut nodes: Vec<ActionNode> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    let mut edge_keys: HashSet<(NodeId, NodeId)> = HashSet::new();
     let mut roots: Vec<NodeId> = Vec::new();
 
     let findings_by_file = count_findings_by_file(findings);
@@ -158,11 +157,11 @@ pub(crate) fn build(
     let mut workflow_ids: HashMap<PathBuf, NodeId> = HashMap::new();
     for file in workflow_files {
         let id = nodes.len();
-        let label = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("workflow")
-            .to_string();
+        let label = sanitize_label(
+            file.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workflow"),
+        );
         let signals = TrustSignals {
             findings_here: findings_by_file.get(file).copied().unwrap_or(0),
             ..TrustSignals::default()
@@ -170,8 +169,8 @@ pub(crate) fn build(
         // Workflows start at 1.0 (no positive-signal dimensions apply to them)
         // and only carry the finding penalty. The aggregate with children then
         // determines the displayed root score.
-        let finding_penalty =
-            0.1 * f32::from(u16::try_from(signals.findings_here.min(10)).unwrap_or(0));
+        let capped_findings = signals.findings_here.min(10);
+        let finding_penalty = 0.1 * f32::from(capped_findings as u16);
         let score = (1.0_f32 - finding_penalty).clamp(0.0, 1.0);
         nodes.push(ActionNode {
             id,
@@ -216,14 +215,13 @@ pub(crate) fn build(
             id
         };
 
-        if let Some(&workflow_id) = workflow_ids.get(&r.file) {
-            // Avoid duplicate edges (workflow → same action listed twice).
-            if !edges.iter().any(|e| e.from == workflow_id && e.to == node_id) {
-                edges.push(Edge {
-                    from: workflow_id,
-                    to: node_id,
-                });
-            }
+        if let Some(&workflow_id) = workflow_ids.get(&r.file)
+            && edge_keys.insert((workflow_id, node_id))
+        {
+            edges.push(Edge {
+                from: workflow_id,
+                to: node_id,
+            });
         }
     }
 
@@ -243,6 +241,17 @@ pub(crate) fn build(
         edges,
         roots,
     }
+}
+
+/// Replace any non-`ascii_graphic` byte in a node label with `?`. Workflow
+/// filenames come from disk and can contain control bytes / ANSI escapes;
+/// the scanner already enforces `ascii_graphic` for action `owner`/`repo`/
+/// `path` components, so this brings workflow labels in line and keeps
+/// `render_ascii` output safe to print.
+fn sanitize_label(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .collect()
 }
 
 fn count_findings_by_file(findings: &[AuditFinding]) -> HashMap<PathBuf, u32> {
@@ -275,15 +284,25 @@ impl From<&ActionRef> for RefKey {
 // ─── Renderers ──────────────────────────────────────────────────────────────
 
 pub(crate) fn render_ascii(graph: &ActionGraph) -> String {
+    let adjacency = build_adjacency(graph);
     let mut out = String::new();
     for &root in &graph.roots {
-        render_ascii_node(graph, root, "", true, &mut out);
+        render_ascii_node(graph, &adjacency, root, "", true, &mut out);
     }
     out
 }
 
+fn build_adjacency(graph: &ActionGraph) -> HashMap<NodeId, Vec<NodeId>> {
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for edge in &graph.edges {
+        adjacency.entry(edge.from).or_default().push(edge.to);
+    }
+    adjacency
+}
+
 fn render_ascii_node(
     graph: &ActionGraph,
+    adjacency: &HashMap<NodeId, Vec<NodeId>>,
     id: NodeId,
     prefix: &str,
     is_root: bool,
@@ -302,12 +321,8 @@ fn render_ascii_node(
         let _ = writeln!(out, "{prefix}{label}  {score_str}{signals_suffix}");
     }
 
-    let children: Vec<NodeId> = graph
-        .edges
-        .iter()
-        .filter(|e| e.from == id)
-        .map(|e| e.to)
-        .collect();
+    let empty = Vec::new();
+    let children = adjacency.get(&id).unwrap_or(&empty);
     let last_idx = children.len().saturating_sub(1);
     for (i, child) in children.iter().enumerate() {
         let is_last = i == last_idx;
@@ -319,7 +334,7 @@ fn render_ascii_node(
             format!("{prefix}{segment}")
         };
         let line_prefix = format!("{child_prefix}{marker}");
-        render_ascii_node(graph, *child, &line_prefix, false, out);
+        render_ascii_node(graph, adjacency, *child, &line_prefix, false, out);
     }
 }
 
@@ -413,14 +428,13 @@ fn json_str(s: &str) -> String {
     out
 }
 
-/// Minimum score across all root nodes, used with `--min-score` to fail a
-/// run if any workflow's aggregate supply-chain trust dips below a threshold.
-pub(crate) fn min_root_score(graph: &ActionGraph) -> Option<f32> {
-    graph
-        .roots
-        .iter()
-        .map(|&id| graph.nodes[id].score)
-        .fold(None, |acc, s| Some(acc.map_or(s, |prev| prev.min(s))))
+/// Minimum score across every node in the graph. Used with `--min-score`
+/// to fail a run if any pinned action — or any aggregate root — dips below
+/// the threshold. Checking every node (rather than just roots) means a
+/// single low-trust dependency can't hide behind clean siblings via the
+/// `mean(child scores)` aggregate.
+pub(crate) fn min_node_score(graph: &ActionGraph) -> Option<f32> {
+    graph.nodes.iter().map(|n| n.score).reduce(f32::min)
 }
 
 // ─── Entry point for `hasp tree` ────────────────────────────────────────────
@@ -486,11 +500,11 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
     }
 
     if let Some(min) = args.tree_min_score
-        && let Some(actual) = min_root_score(&graph)
+        && let Some(actual) = min_node_score(&graph)
         && actual < min
     {
         eprintln!(
-            "hasp tree: lowest root score {actual:.2} is below --min-score {min:.2}"
+            "hasp tree: lowest node score {actual:.2} is below --min-score {min:.2}"
         );
         std::process::exit(1);
     }
@@ -527,7 +541,7 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
 
     // Deduplicate by RefKey and only look up pinned full-SHA refs.
     let mut keys: Vec<RefKey> = Vec::new();
-    let mut seen: std::collections::HashSet<RefKey> = std::collections::HashSet::new();
+    let mut seen: HashSet<RefKey> = HashSet::new();
     for r in refs {
         if r.ref_kind != RefKind::FullSha {
             continue;
@@ -832,9 +846,9 @@ mod tests {
     // ─── MockApi + collect_online_signals tests ──────────────────────
 
     struct MockApi {
-        verified_shas: std::collections::HashSet<String>,
-        signed_shas: std::collections::HashSet<String>,
-        reachable_shas: std::collections::HashSet<String>,
+        verified_shas: HashSet<String>,
+        signed_shas: HashSet<String>,
+        reachable_shas: HashSet<String>,
         commit_dates: HashMap<String, String>,
         attestation_bodies: HashMap<String, String>,
         repo_info: HashMap<(String, String), crate::github::RepoInfo>,
@@ -940,11 +954,11 @@ mod tests {
     }
 
     fn mock_api() -> MockApi {
-        let mut verified = std::collections::HashSet::new();
+        let mut verified = HashSet::new();
         verified.insert("a".repeat(40));
-        let mut signed = std::collections::HashSet::new();
+        let mut signed = HashSet::new();
         signed.insert("a".repeat(40));
-        let mut reachable = std::collections::HashSet::new();
+        let mut reachable = HashSet::new();
         reachable.insert("a".repeat(40));
         let mut commit_dates = HashMap::new();
         commit_dates.insert("a".repeat(40), "2024-01-01T00:00:00Z".to_string());
@@ -1064,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn min_root_score_returns_the_minimum() {
+    fn min_node_score_returns_the_minimum_across_all_nodes() {
         let wf1 = PathBuf::from("a.yml");
         let wf2 = PathBuf::from("b.yml");
         let refs = vec![
@@ -1072,8 +1086,55 @@ mod tests {
             r("random", "stuff", "mutable", "b.yml", RefKind::Mutable),
         ];
         let graph = build(&[wf1, wf2], &refs, &[], &HashMap::new());
-        let minimum = min_root_score(&graph).unwrap();
-        // b.yml's child is mutable -> child score 0.0 -> root score 0.0
+        let minimum = min_node_score(&graph).unwrap();
+        // Mutable action node carries score 0.0; the gate sees it directly.
         assert!((minimum - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn min_node_score_catches_low_action_hidden_by_aggregate_mean() {
+        // 9 strong children + 1 mutable child: aggregate root is ~0.9 but
+        // the mutable child's own score is 0.0 — that's what should gate.
+        let wf = PathBuf::from("ci.yml");
+        let sha_a = "a".repeat(40);
+        let mut refs: Vec<ActionRef> = (0..9)
+            .map(|i| {
+                let mut rf = r("actions", "checkout", &sha_a, "ci.yml", RefKind::FullSha);
+                rf.repo = format!("repo{i}");
+                rf
+            })
+            .collect();
+        refs.push(r("evil", "evil", "mutable", "ci.yml", RefKind::Mutable));
+        let mut signals: HashMap<RefKey, TrustSignals> = HashMap::new();
+        for rf in &refs[..9] {
+            signals.insert(
+                RefKey::from(rf),
+                TrustSignals {
+                    pinned_full_sha: true,
+                    sha_exists: Some(true),
+                    reachable: Some(true),
+                    signed: Some(true),
+                    slsa_verified: Some(true),
+                    repo_age_days: Some(365),
+                    repo_stars: Some(100),
+                    ..TrustSignals::default()
+                },
+            );
+        }
+        let graph = build(&[wf], &refs, &[], &signals);
+        let minimum = min_node_score(&graph).unwrap();
+        assert!(minimum < 0.5, "min should reflect the mutable child, got {minimum}");
+    }
+
+    #[test]
+    fn sanitize_label_replaces_control_bytes_and_escapes() {
+        // Workflow filenames that contain ANSI escapes or control bytes must
+        // not reach the ASCII renderer unfiltered — they would otherwise
+        // recolor or rewrite terminal output of `hasp tree`.
+        let raw = "wf\x1b[31mevil.yml\x00trailing";
+        let safe = sanitize_label(raw);
+        assert!(!safe.contains('\x1b'));
+        assert!(!safe.contains('\x00'));
+        assert!(safe.starts_with("wf?"));
     }
 }
