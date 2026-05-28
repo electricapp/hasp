@@ -405,6 +405,7 @@ fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
                 }));
             }
             "--allow-unsandboxed" => args.allow_unsandboxed = true,
+            "--no-verify" => args.no_verify = true,
             "-h" | "--help" => {
                 print_tree_help();
                 std::process::exit(0);
@@ -505,6 +506,8 @@ OPTIONS:
                                    this threshold (0.0-1.0). Workflows
                                    with no pinned `uses:` score 1.0 and
                                    therefore always pass.
+    --no-verify                    Skip all online (GitHub API) signals;
+                                   render the graph from offline data only
     -d, --dir <DIR>                Workflow directory [default: .github/workflows]
         --allow-unsandboxed        Skip sandbox preflight (dev mode)
     -h, --help                     Print this help

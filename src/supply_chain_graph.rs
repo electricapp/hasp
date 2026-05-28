@@ -457,14 +457,30 @@ impl TreeFormat {
 
 pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
     use crate::error::Context;
+
+    if !args.allow_unsandboxed {
+        eprintln!(
+            "hasp tree: this runs an unsandboxed inline scan and may make \
+             outbound API calls. Pass --allow-unsandboxed to acknowledge."
+        );
+        std::process::exit(2);
+    }
+    eprintln!("hasp tree: running unsandboxed inline scan");
+
     let canonical_dir = args
         .dir
         .canonicalize()
         .context("Cannot resolve workflow dir")?;
     let scan = crate::scanner::scan_directory(&canonical_dir)?;
 
-    // Load policy for consistent audit behavior (reuses diff helper).
-    let policy = crate::policy::Policy::load(&canonical_dir)?.unwrap_or_default();
+    let policy = match crate::policy::Policy::load(&canonical_dir) {
+        Ok(Some(p)) => p,
+        Ok(None) => crate::policy::Policy::default(),
+        Err(e) => {
+            eprintln!("hasp tree: warning: failed to load policy: {e} — using defaults");
+            crate::policy::Policy::default()
+        }
+    };
     let mut findings = crate::audit::run(&scan.workflow_docs, &scan.action_refs, &policy.checks);
     if !policy.checks.untrusted_sources.is_off() {
         let owners = crate::policy::Policy::effective_list(
@@ -499,14 +515,21 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
         TreeFormat::Json => println!("{}", render_json(&graph)),
     }
 
-    if let Some(min) = args.tree_min_score
-        && let Some(actual) = min_node_score(&graph)
-        && actual < min
-    {
-        eprintln!(
-            "hasp tree: lowest node score {actual:.2} is below --min-score {min:.2}"
-        );
-        std::process::exit(1);
+    if let Some(min) = args.tree_min_score {
+        match min_node_score(&graph) {
+            Some(actual) if actual < min => {
+                eprintln!(
+                    "hasp tree: lowest node score {actual:.2} is below --min-score {min:.2}"
+                );
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!(
+                    "hasp tree: no workflows or pinned actions found; --min-score check skipped"
+                );
+            }
+            Some(_) => {}
+        }
     }
 
     Ok(())
@@ -555,6 +578,18 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
         return out;
     }
 
+    // 6 API calls per unique ref against TREE_CALL_BUDGET — warn up front
+    // when the workload is large enough to exhaust it, since partial scoring
+    // looks like a transient network problem and is easy to miss.
+    if keys.len() * PER_REF_CALL_COST > TREE_CALL_BUDGET {
+        eprintln!(
+            "hasp tree: warning: {} unique action refs may exceed the {}-call \
+             API budget; later refs will render with partial signals",
+            keys.len(),
+            TREE_CALL_BUDGET
+        );
+    }
+
     // Cache per-repo lookups (repo_info reused across many refs in the same repo).
     let mut repo_cache: HashMap<(String, String), Option<crate::github::RepoInfo>> =
         HashMap::new();
@@ -579,7 +614,9 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
                 && let Some(created_secs) = parse_iso8601_utc(created_at)
                 && now > 0
             {
-                signals.repo_age_days = Some((now - created_secs) / 86_400);
+                // Clamp to >= 0 so a future-dated commit / clock skew doesn't
+                // trip the `< 30` "recent repo" penalty in score_signals.
+                signals.repo_age_days = Some(((now - created_secs) / 86_400).max(0));
             }
             if signals.sha_exists == Some(true) {
                 signals.reachable = client
@@ -602,20 +639,22 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
                 && let Some(commit_secs) = parse_iso8601_utc(&date)
                 && now > 0
             {
-                signals.commit_age_days = Some((now - commit_secs) / 86_400);
+                signals.commit_age_days = Some(((now - commit_secs) / 86_400).max(0));
             }
-            if let Ok(Some(body)) = client.get_attestation(&key.owner, &key.repo, &key.sha) {
-                match crate::github::slsa::verify_attestation_response(&body, &key.sha) {
-                    Ok(crate::github::slsa::AttestationVerdict::Verified { .. }) => {
-                        signals.slsa_verified = Some(true);
-                    }
-                    Ok(_) | Err(_) => {
-                        signals.slsa_verified = Some(false);
-                    }
-                }
-            } else {
-                signals.slsa_verified = Some(false);
-            }
+            // Three-way:
+            //   Ok(Some) → run the verifier, Some(true)/Some(false) by verdict.
+            //   Ok(None) → no attestation published, Some(false).
+            //   Err(_)   → API call failed (budget, network, 403); leave None
+            //              so a transient error doesn't masquerade as
+            //              "publisher has no SLSA" and skew the score.
+            signals.slsa_verified = match client.get_attestation(&key.owner, &key.repo, &key.sha) {
+                Ok(Some(body)) => match crate::github::slsa::verify_attestation_response(&body, &key.sha) {
+                    Ok(crate::github::slsa::AttestationVerdict::Verified { .. }) => Some(true),
+                    Ok(_) | Err(_) => Some(false),
+                },
+                Ok(None) => Some(false),
+                Err(_) => None,
+            };
         }
 
         out.insert(key, signals);
@@ -623,6 +662,15 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
 
     out
 }
+
+/// Per-ref API cost in `collect_online_signals_with_api`: `verify_commit`,
+/// `get_repo_info` (cached per repo, amortizes to ~1 over many refs),
+/// `is_commit_reachable`, `is_commit_signed`, `get_commit_date`,
+/// `get_attestation`.
+const PER_REF_CALL_COST: usize = 6;
+/// Hard cap on GitHub API calls per `hasp tree` run. Sized for ~80 unique
+/// refs without letting a pathological repo spin.
+const TREE_CALL_BUDGET: usize = 500;
 
 fn build_tree_client() -> crate::error::Result<crate::github::Client> {
     use crate::error::Context as _;
@@ -634,9 +682,7 @@ fn build_tree_client() -> crate::error::Result<crate::github::Client> {
         token,
         &addrs,
         std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        // Cap at 500 API calls for a single tree run — enough for ~80 unique
-        // refs (6 calls each) without letting a pathological repo spin.
-        500,
+        u32::try_from(TREE_CALL_BUDGET).unwrap_or(u32::MAX),
     )
 }
 
