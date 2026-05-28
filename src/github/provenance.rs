@@ -455,9 +455,7 @@ fn emit_slsa_finding(
     match verdict {
         AttestationVerdict::Verified { .. } | AttestationVerdict::Missing => {}
         AttestationVerdict::SubjectMismatch { observed, .. } => {
-            // Tampered binding is positive evidence of attack; always deny
-            // regardless of `slsa_attestation` policy level (which exists to
-            // soften the "no attestation present yet" finding).
+            // Tampered binding always denies, regardless of policy level.
             findings.push(AuditFinding {
                 file: result.action_ref.file.clone(),
                 severity: Severity::Critical,

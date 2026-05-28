@@ -31,7 +31,10 @@ pub(crate) struct Args {
     pub(crate) policy_path: Option<PathBuf>,
     pub(crate) no_policy: bool,
     pub(crate) max_transitive_depth: u8,
+    /// Launcher-mode `--diff-base <ref>` (policy drift + SHA-change check).
     pub(crate) diff_base: Option<String>,
+    /// `hasp diff <base>` positional argument.
+    pub(crate) diff_subcommand_base: Option<String>,
     pub(crate) oidc_policies: Vec<(String, PathBuf)>,
     pub(crate) no_oidc: bool,
     pub(crate) diff_format: Option<crate::diff::DiffFormat>,
@@ -54,6 +57,7 @@ impl Default for Args {
             no_policy: false,
             max_transitive_depth: 3,
             diff_base: None,
+            diff_subcommand_base: None,
             oidc_policies: Vec::new(),
             no_oidc: false,
             diff_format: None,
@@ -147,7 +151,7 @@ fn parse_diff(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
         );
         std::process::exit(2);
     }
-    args.diff_base = Some(positional.remove(0));
+    args.diff_subcommand_base = Some(positional.remove(0));
     args
 }
 

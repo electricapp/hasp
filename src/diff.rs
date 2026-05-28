@@ -60,7 +60,7 @@ impl DeltaReport {
 
 pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
     let base = args
-        .diff_base
+        .diff_subcommand_base
         .as_ref()
         .context("hasp diff requires a base ref")?
         .clone();
@@ -124,7 +124,7 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
     // Temp worktree for base. SIGINT/SIGTERM handler installed once.
     install_signal_cleanup_once();
     let worktree = BaseWorktree::create(&repo_root, &base_sha)?;
-    register_cleanup_path(worktree.path(), &repo_root);
+    register_cleanup_path(worktree.path(), &worktree.parent, &repo_root);
     let base_scan_root = worktree.path().join(&relative_dir);
     let base_findings = if base_scan_root.is_dir() {
         // Integrity-check the base worktree too: catches files git couldn't
@@ -139,9 +139,7 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
     let delta = compute_delta(&base, &base_findings, &head_findings);
     emit(&delta, format);
 
-    // Drop runs first so the worktree teardown actually happens; clearing the
-    // signal target after is safe because `cleanup_worktree` is idempotent
-    // (a signal landing between the two only triggers a no-op second pass).
+    // Drop tears the worktree down; clear after — cleanup is idempotent.
     drop(worktree);
     clear_cleanup_path();
 
@@ -180,10 +178,8 @@ fn scan_and_audit(scan_dir: &Path, scan_root: &Path, policy: &Policy) -> Result<
         );
     }
     if !policy.checks.oidc.is_off() {
-        // diff mode reads OIDC acceptances from `.hasp.yml` only — CLI
-        // `--oidc-policy` flags aren't exposed by `parse_diff`. Both base and
-        // head scans see the same policy file content, so divergence between
-        // them is a real OIDC-policy change worth flagging.
+        // Diff mode has no CLI `--oidc-policy` surface; acceptances come from
+        // `.hasp.yml` only.
         let acceptances =
             crate::oidc::load_policy_acceptances(&[], &policy.oidc_policies, scan_dir);
         audit::oidc::run(
@@ -504,23 +500,30 @@ fn json_string(s: &str) -> String {
 
 // ─── base worktree ──────────────────────────────────────────────────────────
 
-/// Temp worktree that is torn down on Drop so failed runs don't leak
-/// git-worktree directories.
+/// Temp worktree torn down on Drop. The 0700 `parent` containing it keeps
+/// a co-resident user from racing a symlink in before `git worktree add`.
 struct BaseWorktree {
     repo_root: PathBuf,
+    parent: PathBuf,
     path: PathBuf,
 }
 
 impl BaseWorktree {
     fn create(repo_root: &Path, sha: &str) -> Result<Self> {
-        let path = unique_worktree_path()?;
+        let layout = unique_worktree_layout()?;
+        // Construct Self before any git call so Drop cleans up on bail.
+        let this = Self {
+            repo_root: repo_root.to_path_buf(),
+            parent: layout.parent,
+            path: layout.worktree,
+        };
         let out = git_util::git_cmd()
             .args([
                 "worktree",
                 "add",
                 "--detach",
                 "--no-checkout",
-                path.to_string_lossy().as_ref(),
+                this.path.to_string_lossy().as_ref(),
                 sha,
             ])
             .current_dir(repo_root)
@@ -532,14 +535,6 @@ impl BaseWorktree {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        // Construct Self before running checkout so a checkout failure still
-        // triggers Drop and tears down the just-registered worktree entry.
-        let this = Self {
-            repo_root: repo_root.to_path_buf(),
-            path,
-        };
-        // Checkout is a second step so creation stays cheap (--no-checkout)
-        // and checkout errors surface distinctly.
         let checkout = git_util::git_cmd()
             .args(["checkout", sha])
             .current_dir(&this.path)
@@ -562,15 +557,56 @@ impl BaseWorktree {
 impl Drop for BaseWorktree {
     fn drop(&mut self) {
         cleanup_worktree(&self.path, &self.repo_root);
+        let _ = std::fs::remove_dir(&self.parent);
     }
 }
 
-/// Pick an exclusive path under `temp_dir()`. We seed the suffix with high-
-/// resolution time + pid + process-local counter so a local attacker can't
-/// reliably pre-create the path to `DoS` the run, and we use `create_dir`
-/// (atomic on EEXIST) to confirm exclusivity before removing the dir again
-/// so git can populate it.
-fn unique_worktree_path() -> Result<PathBuf> {
+/// A 0700 parent directory we own, plus the worktree path inside it that
+/// `git worktree add` will populate.
+struct WorktreeLayout {
+    parent: PathBuf,
+    worktree: PathBuf,
+}
+
+fn unique_worktree_layout() -> Result<WorktreeLayout> {
+    let parent = create_owned_temp_dir()?;
+    let worktree = parent.join("wt");
+    Ok(WorktreeLayout { parent, worktree })
+}
+
+#[cfg(unix)]
+fn create_owned_temp_dir() -> Result<PathBuf> {
+    use std::ffi::{CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let mut template_path = std::env::temp_dir();
+    template_path.push("hasp-diff-XXXXXX");
+    let template_bytes = template_path.as_os_str().as_bytes();
+    let mut buf = Vec::with_capacity(template_bytes.len() + 1);
+    buf.extend_from_slice(template_bytes);
+    buf.push(0);
+    let c_template = CString::from_vec_with_nul(buf)
+        .map_err(|e| crate::error::Error::new(format!("mkdtemp template invalid: {e}")))?;
+    let raw = c_template.into_raw();
+    // SAFETY: mkdtemp mutates the template in place (the trailing XXXXXX is
+    // overwritten) and returns the same pointer on success or NULL on error.
+    // We retake ownership via `CString::from_raw` in both branches.
+    #[allow(unsafe_code)]
+    let result_ptr = unsafe { libc::mkdtemp(raw) };
+    if result_ptr.is_null() {
+        let errno = std::io::Error::last_os_error();
+        // SAFETY: reclaim ownership of the buffer we leaked via `into_raw`.
+        #[allow(unsafe_code)]
+        let _ = unsafe { CString::from_raw(raw) };
+        bail!("mkdtemp failed: {errno}");
+    }
+    // SAFETY: same buffer reclaimed; mkdtemp wrote the resolved name into it.
+    #[allow(unsafe_code)]
+    let owned = unsafe { CString::from_raw(raw) };
+    Ok(PathBuf::from(OsStr::from_bytes(owned.as_bytes())))
+}
+
+#[cfg(not(unix))]
+fn create_owned_temp_dir() -> Result<PathBuf> {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static C: AtomicU32 = AtomicU32::new(0);
@@ -579,24 +615,17 @@ fn unique_worktree_path() -> Result<PathBuf> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
         let counter = C.fetch_add(1, Ordering::Relaxed);
-        // Mix in a coarse hash of pid + nanos + counter to spread the suffix.
         let suffix =
             (u64::from(std::process::id()) << 32) ^ (u64::from(nanos) << 16) ^ u64::from(counter);
-        let path = std::env::temp_dir().join(format!("hasp-diff-worktree-{suffix:016x}"));
-        #[allow(clippy::create_dir)] // we *want* the EEXIST failure path
+        let path = std::env::temp_dir().join(format!("hasp-diff-{suffix:016x}"));
+        #[allow(clippy::create_dir)]
         match std::fs::create_dir(&path) {
-            Ok(()) => {
-                // git worktree add requires the destination to not already
-                // exist. Remove the placeholder dir now that we've proven
-                // the name is exclusively ours.
-                let _ = std::fs::remove_dir(&path);
-                return Ok(path);
-            }
+            Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => bail!("Could not reserve temp worktree path: {e}"),
+            Err(e) => bail!("Could not reserve temp worktree parent: {e}"),
         }
     }
-    bail!("Exhausted 64 attempts reserving a unique temp worktree path")
+    bail!("Exhausted 64 attempts reserving a unique temp worktree parent")
 }
 
 fn cleanup_worktree(path: &Path, repo_root: &Path) {
@@ -621,20 +650,20 @@ fn cleanup_worktree(path: &Path, repo_root: &Path) {
 
 // ─── signal cleanup ─────────────────────────────────────────────────────────
 
-// The atomic flag is the handler's fast path — it can short-circuit without
-// acquiring the mutex when no worktree is registered. The mutex protects the
-// target itself so repeat registrations (e.g. a future multi-base diff loop)
-// can swap targets without losing protection. The handler uses `try_lock`
-// to stay async-signal-safe; in the worst case (concurrent register/clear)
-// it skips cleanup, which matches the old "leak the temp dir, don't deadlock"
-// failure mode.
-static CLEANUP_TARGET: std::sync::Mutex<Option<(PathBuf, PathBuf)>> =
+// Active flag is the handler's lock-free fast path; the mutex is touched
+// only on register/clear. Handler uses `try_lock` so it never blocks.
+// Tuple: (worktree path, owned parent dir, repo root).
+static CLEANUP_TARGET: std::sync::Mutex<Option<(PathBuf, PathBuf, PathBuf)>> =
     std::sync::Mutex::new(None);
 static CLEANUP_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn register_cleanup_path(path: &Path, repo_root: &Path) {
+fn register_cleanup_path(path: &Path, parent: &Path, repo_root: &Path) {
     if let Ok(mut g) = CLEANUP_TARGET.lock() {
-        *g = Some((path.to_path_buf(), repo_root.to_path_buf()));
+        *g = Some((
+            path.to_path_buf(),
+            parent.to_path_buf(),
+            repo_root.to_path_buf(),
+        ));
     }
     CLEANUP_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -677,9 +706,10 @@ const fn install_signal_cleanup_once() {
 extern "C" fn signal_handler(sig: libc::c_int) {
     if CLEANUP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
         && let Ok(guard) = CLEANUP_TARGET.try_lock()
-        && let Some((path, repo_root)) = guard.as_ref()
+        && let Some((path, parent, repo_root)) = guard.as_ref()
     {
         cleanup_worktree(path, repo_root);
+        let _ = std::fs::remove_dir(parent);
     }
     // SAFETY: `_exit` is async-signal-safe and immediately terminates the
     // process. 128 + signo follows the POSIX shell convention.
@@ -912,9 +942,22 @@ mod tests {
     }
 
     #[test]
-    fn unique_worktree_paths_are_distinct() {
-        let a = unique_worktree_path().unwrap();
-        let b = unique_worktree_path().unwrap();
-        assert_ne!(a, b);
+    fn unique_worktree_layouts_are_distinct_and_owned() {
+        let a = unique_worktree_layout().unwrap();
+        let b = unique_worktree_layout().unwrap();
+        assert_ne!(a.parent, b.parent);
+        assert_ne!(a.worktree, b.worktree);
+        assert!(a.parent.is_dir());
+        assert!(b.parent.is_dir());
+        assert!(a.worktree.starts_with(&a.parent));
+        assert!(b.worktree.starts_with(&b.parent));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a.parent).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "parent must be 0700, got {mode:o}");
+        }
+        let _ = std::fs::remove_dir(&a.parent);
+        let _ = std::fs::remove_dir(&b.parent);
     }
 }
