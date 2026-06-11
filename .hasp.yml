@@ -50,3 +50,16 @@ ignore:
       CC_* to $GITHUB_ENV so the subsequent cargo build step picks them
       up. Inputs are static literals — no untrusted data flows into the
       write.
+
+  - check: hidden-execution
+    match: "*"
+    file: "*.yml"
+    reason: >
+      The only hidden execution path in this repo's dependencies is
+      actions/checkout's `post` hook, which removes the credentials the
+      action wrote during checkout — reviewed at the pinned SHA. Every
+      action used here is pinned to a verified commit from the
+      GitHub-maintained `actions` org. The file glob is deliberate: the
+      finding is deduplicated per action and attributed to whichever
+      workflow is verified first, so a single-file filter would be
+      order-dependent.

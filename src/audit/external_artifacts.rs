@@ -8,6 +8,9 @@
 //!
 //! Zizmor does not audit this today because it focuses on `uses:` references;
 //! cross-repo downloads happen inside `run:` shell commands.
+//!
+//! Downloads verified against an inline digest (`sha256sum --check`,
+//! `gpg --verify`, `cosign verify`) are treated as pinned.
 
 use std::path::{Path, PathBuf};
 use yaml_rust2::Yaml;
@@ -116,7 +119,7 @@ fn check_run_block(
     let lower = run.to_ascii_lowercase();
     let mut hit: Option<&'static str> = None;
     for (needle, label) in EXTERNAL_DOWNLOAD_PATTERNS {
-        if lower.contains(needle) {
+        if contains_word_bounded(&lower, needle) {
             hit = Some(label);
             break;
         }
@@ -126,6 +129,13 @@ fn check_run_block(
     // Bail if the run: is pulling a GitHub raw URL that's SHA-pinned; the
     // pinning already provides provenance equivalent to `uses:@<sha>`.
     if is_github_sha_pinned(&lower) {
+        return;
+    }
+
+    // Bail if the block verifies the artifact against an inline digest --
+    // exactly the remediation this check recommends. A tampered upstream
+    // fails the comparison and the step aborts before execution.
+    if has_inline_digest_verification(&lower) {
         return;
     }
 
@@ -153,6 +163,52 @@ fn check_run_block(
         ),
         is_warning,
     });
+}
+
+/// Substring match that refuses hits embedded inside a larger word, so
+/// `cargo install` does not match the `go install ` pattern and
+/// `| sha256sum` does not match `| sh`. A boundary is only enforced on a
+/// side where the needle itself starts/ends with a word character.
+fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
+    const fn is_word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+    let needle_starts_word = needle.as_bytes().first().copied().is_some_and(is_word);
+    let needle_ends_word = needle.as_bytes().last().copied().is_some_and(is_word);
+
+    let mut search_from = 0;
+    while let Some(pos) = haystack[search_from..].find(needle) {
+        let start = search_from + pos;
+        let end = start + needle.len();
+        let before_ok =
+            !needle_starts_word || start == 0 || !is_word(haystack.as_bytes()[start - 1]);
+        let after_ok =
+            !needle_ends_word || end == haystack.len() || !is_word(haystack.as_bytes()[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+/// Detect an inline digest check covering the downloaded artifact: a
+/// `*sum`/`shasum` invocation with `--check`/`-c` on the same line, or a
+/// signature verification (`gpg --verify`, `cosign verify*`). These abort
+/// the step on mismatch, which is the pinning this audit asks for.
+fn has_inline_digest_verification(lower_run: &str) -> bool {
+    const SUM_TOOLS: &[&str] = &["sha256sum", "sha384sum", "sha512sum", "shasum", "b2sum"];
+    for line in lower_run.lines() {
+        if line.contains("gpg --verify") || line.contains("cosign verify") {
+            return true;
+        }
+        if SUM_TOOLS.iter().any(|tool| line.contains(tool))
+            && (line.contains("--check") || line.contains(" -c"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_github_sha_pinned(lower_run: &str) -> bool {
@@ -337,6 +393,99 @@ jobs:
         assert!(
             findings.iter().any(|f| f.title.contains("go install")),
             "expected go-install finding, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_cargo_install_from_registry() {
+        // `cargo install <crate>` must not substring-match the `go install `
+        // pattern ("car[go install ]cargo-audit").
+        let doc = parse(
+            "
+on: pull_request
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo install cargo-audit --locked
+",
+        );
+        let findings = run_check(&doc);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("external artifact download")),
+            "registry cargo install should not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_checksum_verified_curl_download() {
+        let doc = parse(
+            r#"
+on: push
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl -sL "https://github.com/sigstore/cosign/releases/download/v2.4.3/cosign-linux-amd64" -o cosign
+          echo "caaad125acef1cb81d58dcdc454a1e429d09a750d1e9e2b3ed1aed8964454708  cosign" | sha256sum --check --strict
+          chmod +x cosign
+"#,
+        );
+        let findings = run_check(&doc);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.title.contains("external artifact download")),
+            "checksum-verified download should not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_pipe_to_sha256sum_as_pipe_sh() {
+        // `| sha256sum` must not match the `| sh` pattern.
+        let doc = parse(
+            r#"
+on: push
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "abc  file" | sha256sum
+"#,
+        );
+        let findings = run_check(&doc);
+        assert!(
+            findings.is_empty(),
+            "pipe to sha256sum should not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn still_flags_curl_pipe_sh() {
+        let doc = parse(
+            "
+on: push
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl https://example.com/install.sh | sh
+",
+        );
+        let findings = run_check(&doc);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("external artifact download")),
+            "curl | sh should still be flagged: {findings:?}"
         );
     }
 
