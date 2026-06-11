@@ -53,12 +53,16 @@ impl ActionRef {
     pub(crate) fn short_ref(&self) -> &str {
         match self.ref_kind {
             RefKind::FullSha => {
-                // FullSha should always be 40 hex chars, but be defensive
-                if self.ref_str.len() >= 12 {
-                    &self.ref_str[..12]
-                } else {
-                    &self.ref_str
-                }
+                // FullSha should always be 40 hex (ASCII) chars, but a ref
+                // decoded from the IPC stream could carry arbitrary UTF-8.
+                // Slice on a char boundary (the 12th char's byte offset) so a
+                // multibyte sequence at byte 12 can't panic.
+                let end = self
+                    .ref_str
+                    .char_indices()
+                    .nth(12)
+                    .map_or(self.ref_str.len(), |(i, _)| i);
+                &self.ref_str[..end]
             }
             RefKind::Mutable => &self.ref_str,
         }
@@ -84,6 +88,83 @@ pub(crate) struct ActionRefChange {
     pub(crate) new_comment: Option<String>,
 }
 
+/// Parse YAML after rejecting documents whose anchor/alias graph would expand
+/// to an absurd number of nodes ("billion laughs").
+///
+/// yaml-rust2 resolves each alias by deep-cloning the anchored node, so a tiny
+/// document with nested aliases can expand exponentially during
+/// `load_from_str`. The `MAX_FILE_BYTES` cap does not help — the blow-up
+/// happens at parse time, not from input size. We first walk the parser's
+/// event stream (which yields aliases *without* expanding them, so it is linear
+/// in input size) and compute the would-be expanded node count, bailing past a
+/// cap before handing the content to the expanding loader.
+pub(crate) fn load_yaml_guarded(content: &str) -> Result<Vec<Yaml>> {
+    guard_yaml_expansion(content)?;
+    Ok(YamlLoader::load_from_str(content)?)
+}
+
+fn guard_yaml_expansion(content: &str) -> Result<()> {
+    use yaml_rust2::parser::{Event, Parser};
+
+    // A normal 1 MiB workflow stays far under this; an alias bomb blows past it
+    // almost immediately, so the walk stays cheap in both cases.
+    const MAX_NODES: u64 = 5_000_000;
+
+    fn bump(stack: &mut [(u64, usize)], by: u64) -> Result<()> {
+        if let Some(top) = stack.last_mut() {
+            top.0 = top.0.saturating_add(by);
+            if top.0 > MAX_NODES {
+                bail!(
+                    "YAML alias expansion exceeds the {MAX_NODES}-node limit (possible alias bomb)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut parser = Parser::new_from_str(content);
+    // Expanded node count of each fully-parsed anchor, keyed by anchor id.
+    let mut anchor_size: HashMap<usize, u64> = HashMap::new();
+    // (accumulated count, anchor id to register on close) for the document root
+    // and each currently-open sequence/mapping.
+    let mut stack: Vec<(u64, usize)> = vec![(0, 0)];
+
+    loop {
+        let (event, _) = parser
+            .next_token()
+            .map_err(|e| crate::error::Error::new(format!("YAML parse error: {e}")))?;
+        // Event has many structural variants (Stream/Document start/end, etc.)
+        // we deliberately ignore — only nodes affect the expansion estimate.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match event {
+            Event::StreamEnd => break,
+            Event::Scalar(_, _, anchor_id, _) => {
+                if anchor_id != 0 {
+                    anchor_size.insert(anchor_id, 1);
+                }
+                bump(&mut stack, 1)?;
+            }
+            Event::Alias(id) => {
+                let cost = anchor_size.get(&id).copied().unwrap_or(1);
+                bump(&mut stack, cost)?;
+            }
+            Event::SequenceStart(anchor_id, _) | Event::MappingStart(anchor_id, _) => {
+                // The container node itself counts as one.
+                stack.push((1, anchor_id));
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                let (total, anchor_id) = stack.pop().unwrap_or((1, 0));
+                if anchor_id != 0 {
+                    anchor_size.insert(anchor_id, total);
+                }
+                bump(&mut stack, total)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Extract action refs from in-memory YAML content (no filesystem access).
 /// Used by `--diff-base` to parse old file versions from `git show`.
 ///
@@ -97,9 +178,22 @@ pub(crate) fn extract_action_refs_from_content(
     content: &str,
     file: &Path,
 ) -> Result<Vec<ActionRef>> {
-    let comment_map = extract_version_comments(content);
-    let docs = YamlLoader::load_from_str(content)?;
+    let docs = load_yaml_guarded(content)?;
     let doc = docs.into_iter().next().unwrap_or(Yaml::Null);
+    Ok(extract_action_refs_from_doc(content, &doc, file))
+}
+
+/// Same as [`extract_action_refs_from_content`] but operates on an
+/// already-parsed document, so callers that have parsed the YAML for other
+/// reasons (e.g. replay's historical audit) don't pay for a second parse.
+/// `content` is still needed for the version-comment scan, which reads the raw
+/// source text rather than the parsed AST.
+pub(crate) fn extract_action_refs_from_doc(
+    content: &str,
+    doc: &Yaml,
+    file: &Path,
+) -> Vec<ActionRef> {
+    let comment_map = extract_version_comments(content);
 
     // Use a dummy repo root that won't resolve any local refs —
     // we only care about remote SHA-pinned actions.
@@ -108,7 +202,7 @@ pub(crate) fn extract_action_refs_from_content(
 
     // Errors here are from local ref resolution against the dummy root;
     // all remote refs were already collected before the failure point.
-    if let Err(e) = extract_uses(&doc, file, dummy_root, &comment_map, &mut state) {
+    if let Err(e) = extract_uses(doc, file, dummy_root, &comment_map, &mut state) {
         eprintln!(
             "hasp: note: partial parse of {}: {e} (remote refs still collected)",
             file.display()
@@ -117,7 +211,7 @@ pub(crate) fn extract_action_refs_from_content(
 
     // Only keep FullSha refs (mutable refs aren't relevant for diff-base)
     state.action_refs.retain(|r| r.ref_kind == RefKind::FullSha);
-    Ok(state.action_refs)
+    state.action_refs
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +271,15 @@ struct ScanState {
     skipped_refs: Vec<SkippedRef>,
     container_refs: Vec<ContainerRef>,
     visited_yaml_files: HashSet<PathBuf>,
+    /// Expected committed (`HEAD`) blob hashes, keyed by path relative to the
+    /// scan root. When present, each scanned workflow's read bytes are verified
+    /// against this map, closing the TOCTOU between the launcher's integrity
+    /// read and the scanner's read. `None` disables verification.
+    expected_hashes: Option<HashMap<String, String>>,
+    /// Scan root, used to derive the relative key into `expected_hashes`.
+    scan_root: PathBuf,
+    /// Files whose scanned bytes did not match `HEAD` (integrity violations).
+    integrity_mismatches: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -186,17 +289,44 @@ enum DocumentKind {
 }
 
 pub(crate) fn scan_directory(dir: &Path) -> Result<ScanResult> {
+    scan_directory_with_integrity(dir, None)
+}
+
+/// Scan `dir`, optionally verifying each workflow's scanned bytes against the
+/// committed (`HEAD`) blob hashes in `expected_hashes` (keyed by path relative
+/// to `dir`). Verifying the *scanned* bytes — rather than re-reading from disk
+/// in a separate step — closes the TOCTOU window a prior CI step could exploit
+/// by swapping content between the integrity check and the scan.
+pub(crate) fn scan_directory_with_integrity(
+    dir: &Path,
+    expected_hashes: Option<HashMap<String, String>>,
+) -> Result<ScanResult> {
     let canonical_dir = dir
         .canonicalize()
         .context("Cannot canonicalize workflow directory")?;
     let repo_root = infer_repo_root(&canonical_dir);
 
-    let mut state = ScanState::default();
+    let mut state = ScanState {
+        expected_hashes,
+        scan_root: canonical_dir.clone(),
+        ..ScanState::default()
+    };
 
     // Recurse into subdirectories so that custom --dir usage picks
     // up YAML files in nested folders (GitHub only uses the top-level
     // .github/workflows/, but other callers may point at wider trees).
     scan_directory_recursive(&canonical_dir, &canonical_dir, &repo_root, 0, &mut state)?;
+
+    if !state.integrity_mismatches.is_empty() {
+        let detail = state.integrity_mismatches.join("\n");
+        bail!(
+            "CRITICAL: workflow file integrity check failed during scan!\n\
+             The following files differ from what git tracks:\n\
+             {detail}\n\
+             This may indicate a prior CI step tampered with workflow files after checkout.\n\
+             Pass --allow-unsandboxed to skip this check (development only)."
+        );
+    }
 
     Ok(ScanResult {
         action_refs: state.action_refs,
@@ -287,6 +417,26 @@ fn scan_directory_recursive(
     Ok(())
 }
 
+/// If `expected_hashes` is set and `path` (relative to the scan root) is a
+/// tracked workflow file, verify its scanned bytes match the committed `HEAD`
+/// blob hash; record a mismatch otherwise. Files not in the map are skipped.
+fn verify_scanned_integrity(path: &Path, content: &[u8], state: &mut ScanState) {
+    let Ok(rel) = path.strip_prefix(&state.scan_root) else {
+        return;
+    };
+    let rel = rel.to_string_lossy().into_owned();
+    let expected_hash = match state.expected_hashes.as_ref().and_then(|m| m.get(&rel)) {
+        Some(h) => h.clone(),
+        None => return,
+    };
+    let actual = crate::integrity::git_blob_hash(content);
+    if actual != expected_hash {
+        state
+            .integrity_mismatches
+            .push(format!("  {rel} (git: {expected_hash}, disk: {actual})"));
+    }
+}
+
 /// `path` must already be canonicalized by the caller.
 fn scan_yaml_file(
     path: &Path,
@@ -304,17 +454,25 @@ fn scan_yaml_file(
     }
 
     let content = std::fs::read_to_string(path).context("Cannot read file")?;
+    // Verify the *scanned* bytes against the committed hash (when provided),
+    // so we audit exactly what we attest — not a separately-read copy.
+    verify_scanned_integrity(path, content.as_bytes(), state);
     let comment_map = extract_version_comments(&content);
-    let docs = YamlLoader::load_from_str(&content)?;
+    let docs = load_yaml_guarded(&content)?;
     let doc = docs.into_iter().next().unwrap_or(Yaml::Null);
 
     if kind == DocumentKind::Workflow {
         extract_container_refs(&doc, path, &mut state.container_refs);
-        state.workflow_docs.push((path.to_path_buf(), doc.clone()));
     }
 
     extract_uses(&doc, path, repo_root, &comment_map, state)?;
     enforce_ref_limit(state)?;
+
+    // Move (don't clone) the parsed document into the workflow set now that
+    // both readers above are done with it — the AST can be up to 1 MiB.
+    if kind == DocumentKind::Workflow {
+        state.workflow_docs.push((path.to_path_buf(), doc));
+    }
     Ok(())
 }
 
@@ -331,6 +489,19 @@ fn enforce_ref_limit(state: &ScanState) -> Result<()> {
 
 /// Extract `# vX.Y.Z` comments from `uses:` lines.
 /// Returns a map from `owner/repo@ref` → `vX.Y.Z`.
+/// Strip a single matching pair of surrounding single or double quotes, so a
+/// quoted `uses:` value keys identically to its YAML-parsed (unquoted) form.
+fn strip_yaml_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
 fn extract_version_comments(content: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
 
@@ -349,7 +520,12 @@ fn extract_version_comments(content: &str) -> HashMap<String, String> {
         };
 
         if let Some(hash_pos) = after_uses.find('#') {
-            let uses_value = after_uses[..hash_pos].trim();
+            // Strip surrounding YAML quotes so the key matches the *parsed*
+            // value used at lookup time. Without this, `uses: "owner/repo@sha"
+            // # v4` keys the map on the quoted string while the lookup uses the
+            // unquoted parsed value — they never match and the comment-vs-tag
+            // mismatch check is silently skipped for quoted refs.
+            let uses_value = strip_yaml_quotes(after_uses[..hash_pos].trim());
             let comment = after_uses[hash_pos + 1..].trim();
 
             if let Some(ver) = extract_version_from_comment(comment) {
@@ -692,7 +868,7 @@ fn is_safe_github_subpath(path: &str) -> bool {
 }
 
 pub(crate) fn parse_composite_uses(yaml: &str) -> Vec<String> {
-    let Ok(docs) = YamlLoader::load_from_str(yaml) else {
+    let Ok(docs) = load_yaml_guarded(yaml) else {
         return Vec::new();
     };
     let doc = docs.into_iter().next().unwrap_or(Yaml::Null);

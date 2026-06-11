@@ -151,7 +151,17 @@ impl Args {
 
 pub(crate) fn parse() -> Args {
     let args = Args::default();
-    let mut iter = std::env::args().skip(1);
+    // Read argv via args_os so a non-UTF-8 byte produces a clean usage error
+    // rather than the panic `std::env::args()` raises on invalid Unicode.
+    let Ok(os_args) = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<String>, _>>()
+    else {
+        eprintln!("hasp: error: arguments must be valid UTF-8");
+        std::process::exit(2);
+    };
+    let mut iter = os_args.into_iter();
 
     // Peek at the first argument to detect subcommands. Dispatch is exact-match
     // only: no prefix abbreviations (so adding a subcommand can never change
@@ -234,7 +244,7 @@ fn print_help_for(name: Option<&str>) -> ! {
     std::process::exit(0);
 }
 
-fn parse_diff(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_diff(mut args: Args, mut iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Diff;
     let mut positional: Vec<String> = Vec::new();
     while let Some(arg) = iter.next() {
@@ -308,7 +318,7 @@ fn parse_diff(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
     args
 }
 
-fn parse_exec(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_exec(mut args: Args, mut iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Exec;
     let mut manifest: Option<PathBuf> = None;
     let mut writable_dirs: Vec<PathBuf> = Vec::new();
@@ -546,7 +556,7 @@ fn parse_duration(raw: &str) -> Option<i64> {
     value.checked_mul(multiplier)
 }
 
-fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_tree(mut args: Args, mut iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Tree;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -555,8 +565,8 @@ fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
                     eprintln!("hasp tree: --format requires a value (ascii|json)");
                     std::process::exit(2);
                 });
-                let format = crate::supply_chain_graph::TreeFormat::parse(&raw)
-                    .unwrap_or_else(|e| {
+                let format =
+                    crate::supply_chain_graph::TreeFormat::parse(&raw).unwrap_or_else(|e| {
                         eprintln!("hasp tree: {e}");
                         std::process::exit(2);
                     });
@@ -610,7 +620,7 @@ fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
     args
 }
 
-fn parse_replay(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_replay(mut args: Args, mut iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Replay;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -653,7 +663,7 @@ fn parse_replay(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Ar
     args
 }
 
-fn parse_doctor(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_doctor(mut args: Args, mut iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Doctor;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -689,7 +699,7 @@ fn parse_doctor(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Ar
     args
 }
 
-fn parse_docs(mut args: Args, iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_docs(mut args: Args, iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Docs;
     let mut positional: Vec<String> = Vec::new();
     for arg in iter {
@@ -714,7 +724,7 @@ fn parse_docs(mut args: Args, iter: std::iter::Skip<std::env::Args>) -> Args {
     args
 }
 
-fn parse_completion(mut args: Args, iter: std::iter::Skip<std::env::Args>) -> Args {
+fn parse_completion(mut args: Args, iter: impl Iterator<Item = String>) -> Args {
     args.mode = Mode::Completion;
     let mut positional: Vec<String> = Vec::new();
     for arg in iter {

@@ -225,13 +225,18 @@ pub(crate) fn build(
         }
     }
 
-    // Roll up child scores into each root's aggregate.
+    // Roll up child scores into each root's aggregate. Group edges by source in
+    // one pass (O(E)) rather than re-scanning every edge per root (O(roots × E),
+    // which is ~10⁶ iterations on a monorepo with hundreds of workflows).
+    let mut children_of: HashMap<usize, Vec<usize>> = HashMap::new();
+    for e in &edges {
+        children_of.entry(e.from).or_default().push(e.to);
+    }
     for &root_id in &roots {
-        let child_scores: Vec<f32> = edges
-            .iter()
-            .filter(|e| e.from == root_id)
-            .map(|e| nodes[e.to].score)
-            .collect();
+        let child_scores: Vec<f32> = children_of
+            .get(&root_id)
+            .map(|tos| tos.iter().map(|&to| nodes[to].score).collect())
+            .unwrap_or_default();
         let self_score = nodes[root_id].score;
         nodes[root_id].score = aggregate_score(self_score, &child_scores);
     }
@@ -454,7 +459,9 @@ impl TreeFormat {
         match s {
             "ascii" | "text" => Ok(Self::Ascii),
             "json" => Ok(Self::Json),
-            other => Err(format!("Invalid --format `{other}`: expected ascii or json")),
+            other => Err(format!(
+                "Invalid --format `{other}`: expected ascii or json"
+            )),
         }
     }
 }
@@ -502,11 +509,7 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
         );
     }
 
-    let workflow_files: Vec<PathBuf> = scan
-        .workflow_docs
-        .iter()
-        .map(|(p, _)| p.clone())
-        .collect();
+    let workflow_files: Vec<PathBuf> = scan.workflow_docs.iter().map(|(p, _)| p.clone()).collect();
 
     let per_ref_signals = if args.no_verify {
         HashMap::new()
@@ -518,7 +521,12 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
         )
     };
 
-    let graph = build(&workflow_files, &scan.action_refs, &findings, &per_ref_signals);
+    let graph = build(
+        &workflow_files,
+        &scan.action_refs,
+        &findings,
+        &per_ref_signals,
+    );
 
     let format = args.tree_format.unwrap_or(TreeFormat::Ascii);
     match format {
@@ -529,9 +537,7 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
     if let Some(min) = args.tree_min_score {
         match min_node_score(&graph) {
             Some(actual) if actual < min => {
-                eprintln!(
-                    "hasp tree: lowest node score {actual:.2} is below --min-score {min:.2}"
-                );
+                eprintln!("hasp tree: lowest node score {actual:.2} is below --min-score {min:.2}");
                 std::process::exit(1);
             }
             None => {
@@ -602,10 +608,21 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
     }
 
     // Cache per-repo lookups (repo_info reused across many refs in the same repo).
-    let mut repo_cache: HashMap<(String, String), Option<crate::github::RepoInfo>> =
-        HashMap::new();
+    let mut repo_cache: HashMap<(String, String), Option<crate::github::RepoInfo>> = HashMap::new();
+    // Cache the full signal set per (owner, repo, sha). TrustSignals depends
+    // only on the commit, never the action's subdirectory path, so monorepo
+    // actions pinned to the same SHA (e.g. github/codeql-action/{init,analyze,
+    // upload-sarif}) share one set of commit/reachability/attestation lookups
+    // (and the sigstore verification) instead of repeating them per path.
+    let mut commit_cache: HashMap<(String, String, String), TrustSignals> = HashMap::new();
 
     for key in keys {
+        let triple = (key.owner.clone(), key.repo.clone(), key.sha.clone());
+        if let Some(cached) = commit_cache.get(&triple) {
+            out.insert(key, *cached);
+            continue;
+        }
+
         let mut signals = TrustSignals {
             pinned_full_sha: true,
             ..TrustSignals::default()
@@ -643,12 +660,7 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
             }
             if signals.sha_exists == Some(true) {
                 signals.reachable = client
-                    .is_commit_reachable(
-                        &key.owner,
-                        &key.repo,
-                        &key.sha,
-                        &info.default_branch,
-                    )
+                    .is_commit_reachable(&key.owner, &key.repo, &key.sha, &info.default_branch)
                     .ok()
                     .map(|status| matches!(status, crate::github::ReachabilityStatus::Reachable));
             }
@@ -662,15 +674,18 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
             //              so a transient error doesn't masquerade as
             //              "publisher has no SLSA" and skew the score.
             signals.slsa_verified = match client.get_attestation(&key.owner, &key.repo, &key.sha) {
-                Ok(Some(body)) => match crate::github::slsa::verify_attestation_response(&body, &key.sha) {
-                    Ok(crate::github::slsa::AttestationVerdict::Verified { .. }) => Some(true),
-                    Ok(_) | Err(_) => Some(false),
-                },
+                Ok(Some(body)) => {
+                    match crate::github::slsa::verify_attestation_response(&body, &key.sha) {
+                        Ok(crate::github::slsa::AttestationVerdict::Verified { .. }) => Some(true),
+                        Ok(_) | Err(_) => Some(false),
+                    }
+                }
                 Ok(None) => Some(false),
                 Err(_) => None,
             };
         }
 
+        commit_cache.insert(triple, signals);
         out.insert(key, signals);
     }
 
@@ -702,8 +717,8 @@ fn build_tree_client(timeout_secs: u64) -> crate::error::Result<crate::github::C
 }
 
 fn now_unix_seconds() -> crate::error::Result<i64> {
-    use std::time::{SystemTime, UNIX_EPOCH};
     use crate::error::Context as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock before Unix epoch")?;
@@ -764,7 +779,11 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
         return None;
     }
     let year_adj = year - i64::from(month <= 2);
-    let era = if year_adj >= 0 { year_adj } else { year_adj - 399 } / 400;
+    let era = if year_adj >= 0 {
+        year_adj
+    } else {
+        year_adj - 399
+    } / 400;
     let yoe = year_adj - era * 400;
     let month_prime = month + if month > 2 { -3 } else { 9 };
     let doy = (153 * month_prime + 2) / 5 + day - 1;
@@ -855,9 +874,27 @@ mod tests {
             PathBuf::from("/repo/.github/workflows/release.yml"),
         ];
         let refs = vec![
-            r("actions", "checkout", "aaaa", "/repo/.github/workflows/ci.yml", RefKind::FullSha),
-            r("actions", "checkout", "aaaa", "/repo/.github/workflows/release.yml", RefKind::FullSha),
-            r("actions", "setup-node", "bbbb", "/repo/.github/workflows/ci.yml", RefKind::FullSha),
+            r(
+                "actions",
+                "checkout",
+                "aaaa",
+                "/repo/.github/workflows/ci.yml",
+                RefKind::FullSha,
+            ),
+            r(
+                "actions",
+                "checkout",
+                "aaaa",
+                "/repo/.github/workflows/release.yml",
+                RefKind::FullSha,
+            ),
+            r(
+                "actions",
+                "setup-node",
+                "bbbb",
+                "/repo/.github/workflows/ci.yml",
+                RefKind::FullSha,
+            ),
         ];
         let graph = build(&workflows, &refs, &[], &HashMap::new());
         assert_eq!(graph.roots.len(), 2);
@@ -916,7 +953,12 @@ mod tests {
     }
 
     impl crate::github::Api for MockApi {
-        fn verify_commit(&self, _owner: &str, _repo: &str, sha: &str) -> crate::error::Result<bool> {
+        fn verify_commit(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+        ) -> crate::error::Result<bool> {
             Ok(self.verified_shas.contains(sha))
         }
         fn resolve_tag(
@@ -1084,15 +1126,12 @@ mod tests {
 
     #[test]
     fn collect_online_signals_skips_mutable_refs() {
-        let refs = vec![r(
-            "actions",
-            "checkout",
-            "v4",
-            "ci.yml",
-            RefKind::Mutable,
-        )];
+        let refs = vec![r("actions", "checkout", "v4", "ci.yml", RefKind::Mutable)];
         let signals_map = collect_online_signals_with_api(&refs, &mock_api(), 0);
-        assert!(signals_map.is_empty(), "mutable refs should be skipped entirely");
+        assert!(
+            signals_map.is_empty(),
+            "mutable refs should be skipped entirely"
+        );
     }
 
     #[test]
@@ -1101,8 +1140,20 @@ mod tests {
         // We can't directly assert call count without adding counters; instead
         // verify signals all land the same repo-level data.
         let refs = vec![
-            r("actions", "checkout", &"a".repeat(40), "ci.yml", RefKind::FullSha),
-            r("actions", "checkout", &"a".repeat(40), "release.yml", RefKind::FullSha),
+            r(
+                "actions",
+                "checkout",
+                &"a".repeat(40),
+                "ci.yml",
+                RefKind::FullSha,
+            ),
+            r(
+                "actions",
+                "checkout",
+                &"a".repeat(40),
+                "release.yml",
+                RefKind::FullSha,
+            ),
         ];
         let signals_map = collect_online_signals_with_api(&refs, &mock_api(), 0);
         // Dedup by RefKey collapses them to one entry.
@@ -1184,7 +1235,10 @@ mod tests {
         }
         let graph = build(&[wf], &refs, &[], &signals);
         let minimum = min_node_score(&graph).unwrap();
-        assert!(minimum < 0.5, "min should reflect the mutable child, got {minimum}");
+        assert!(
+            minimum < 0.5,
+            "min should reflect the mutable child, got {minimum}"
+        );
     }
 
     #[test]

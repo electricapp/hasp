@@ -41,11 +41,7 @@ struct HistoricalHit {
 }
 
 pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
-    let since = args
-        .replay_since
-        .as_deref()
-        .unwrap_or("30d")
-        .to_string();
+    let since = args.replay_since.as_deref().unwrap_or("30d").to_string();
     let format = args.replay_format.unwrap_or(ReplayFormat::Terse);
 
     if !is_sane_since(&since) {
@@ -116,14 +112,15 @@ fn audit_historical_content(content: &str, file: &Path, policy: &Policy) -> Vec<
     // Parse the historical YAML content. We only have a single file at a
     // single revision, so reuse extract_action_refs_from_content + run the
     // static audits against its parsed form.
-    let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(content) else {
+    let Ok(docs) = scanner::load_yaml_guarded(content) else {
         return Vec::new();
     };
     let Some(doc) = docs.into_iter().next() else {
         return Vec::new();
     };
+    // Extract refs from the already-parsed doc to avoid re-parsing the file.
+    let refs = scanner::extract_action_refs_from_doc(content, &doc, file);
     let doc_pair = vec![(file.to_path_buf(), doc)];
-    let refs = scanner::extract_action_refs_from_content(content, file).unwrap_or_default();
     let mut findings = audit::run(&doc_pair, &refs, &policy.checks);
     if !policy.checks.untrusted_sources.is_off() {
         let owners = Policy::effective_list(
@@ -151,7 +148,9 @@ fn print_report(format: ReplayFormat, since: &str, hits: &[HistoricalHit], total
 }
 
 fn print_terse(since: &str, hits: &[HistoricalHit], total_audited: usize) {
-    println!("hasp replay: scanned {total_audited} historical workflow state(s) from the last {since}");
+    println!(
+        "hasp replay: scanned {total_audited} historical workflow state(s) from the last {since}"
+    );
     if hits.is_empty() {
         println!("  all past workflow states pass the current audit rules");
         return;
@@ -179,7 +178,10 @@ fn print_markdown(since: &str, hits: &[HistoricalHit], total_audited: usize) {
         return;
     }
     let (crit, high, medium) = count_by_severity(hits);
-    println!("**{}** state(s) had findings (CRIT: {crit}, HIGH: {high}, MED: {medium}).\n", hits.len());
+    println!(
+        "**{}** state(s) had findings (CRIT: {crit}, HIGH: {high}, MED: {medium}).\n",
+        hits.len()
+    );
     let grouped = group_by_file(hits);
     for (file, file_hits) in grouped {
         println!("### `{}`\n", file.display());
@@ -334,6 +336,13 @@ fn git_show_changed_workflow_files(
             "--no-commit-id",
             "--name-only",
             "-r",
+            // --root: the initial commit has no parent, so without this it
+            //   reports zero changed files and a workflow introduced in the
+            //   repo's first commit would never be replayed.
+            // -m: expand merge commits (which otherwise show no changes), so a
+            //   workflow introduced via a merge is audited too.
+            "--root",
+            "-m",
             sha,
             "--",
             relative_dir.to_string_lossy().as_ref(),
@@ -347,8 +356,7 @@ fn git_show_changed_workflow_files(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let text =
-        String::from_utf8(out.stdout).context("git diff-tree output was not UTF-8")?;
+    let text = String::from_utf8(out.stdout).context("git diff-tree output was not UTF-8")?;
     let mut files = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -357,7 +365,8 @@ fn git_show_changed_workflow_files(
         }
         let p = PathBuf::from(line);
         let ext = p.extension().and_then(|e| e.to_str());
-        if matches!(ext, Some("yml" | "yaml")) {
+        // -m can list the same file once per parent on a merge; dedup.
+        if matches!(ext, Some("yml" | "yaml")) && !files.contains(&p) {
             files.push(p);
         }
     }
@@ -375,8 +384,10 @@ fn git_show_file(repo_root: &Path, sha: &str, rel_path: &Path) -> Result<Option<
         // File didn't exist at this commit.
         return Ok(None);
     }
-    let text = String::from_utf8(out.stdout)
-        .context(format!("file content was not UTF-8: {}", rel_path.display()))?;
+    let text = String::from_utf8(out.stdout).context(format!(
+        "file content was not UTF-8: {}",
+        rel_path.display()
+    ))?;
     Ok(Some(text))
 }
 
@@ -405,7 +416,10 @@ mod tests {
     #[test]
     fn parse_format_accepts_known_values() {
         assert_eq!(ReplayFormat::parse("terse").unwrap(), ReplayFormat::Terse);
-        assert_eq!(ReplayFormat::parse("markdown").unwrap(), ReplayFormat::Markdown);
+        assert_eq!(
+            ReplayFormat::parse("markdown").unwrap(),
+            ReplayFormat::Markdown
+        );
         assert_eq!(ReplayFormat::parse("json").unwrap(), ReplayFormat::Json);
         ReplayFormat::parse("yaml").expect_err("should reject unknown format");
     }
@@ -435,8 +449,7 @@ jobs:
       - run: echo ${{ github.event.pull_request.title }}
 ";
         let policy = Policy::default();
-        let findings =
-            audit_historical_content(yaml, &PathBuf::from("ci.yml"), &policy);
+        let findings = audit_historical_content(yaml, &PathBuf::from("ci.yml"), &policy);
         assert!(
             findings.iter().any(|f| f.title.contains("injection")),
             "expected injection finding, got: {findings:?}"
@@ -457,12 +470,13 @@ jobs:
       - run: echo hi
 ";
         let policy = Policy::default();
-        let findings =
-            audit_historical_content(yaml, &PathBuf::from("ci.yml"), &policy);
+        let findings = audit_historical_content(yaml, &PathBuf::from("ci.yml"), &policy);
         // `ci.yml` as a synthetic path has no pinned uses:, so typosquat/etc
         // shouldn't fire; check that no CRIT/HIGH findings are produced.
         assert!(
-            !findings.iter().any(|f| matches!(f.severity, Severity::Critical | Severity::High)),
+            !findings
+                .iter()
+                .any(|f| matches!(f.severity, Severity::Critical | Severity::High)),
             "clean YAML should not produce critical/high findings: {findings:?}"
         );
     }
@@ -508,5 +522,4 @@ jobs:
         let (c, h, m) = count_by_severity(&hits);
         assert_eq!((c, h, m), (1, 1, 1));
     }
-
 }

@@ -98,7 +98,10 @@ pub(crate) enum AttestationVerdict {
 /// Parse the JSON response body from GitHub's attestations endpoint and verify
 /// against an expected SHA.  Returns `Missing` if the envelope has no
 /// attestations, `Verified`/`*Mismatch`/`*Builder` on a bundle.
-pub(crate) fn verify_attestation_response(body: &str, expected_sha: &str) -> Result<AttestationVerdict> {
+pub(crate) fn verify_attestation_response(
+    body: &str,
+    expected_sha: &str,
+) -> Result<AttestationVerdict> {
     let doc = YamlLoader::load_from_str(body).context("Invalid attestation JSON envelope")?;
     let doc = doc.into_iter().next().unwrap_or(Yaml::Null);
     let map = doc
@@ -198,10 +201,7 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
         && !identity.looks_like_fulcio()
     {
         return Ok(AttestationVerdict::UntrustedIssuer {
-            issuer_cn: identity
-                .issuer_cn
-                .clone()
-                .unwrap_or_default(),
+            issuer_cn: identity.issuer_cn.clone().unwrap_or_default(),
             subject_uri: identity.subject_uri.clone(),
         });
     }
@@ -326,15 +326,13 @@ fn verify_dsse_signature(bundle: Option<&yaml_rust2::yaml::Hash>) -> DsseResult 
     pae.push(b' ');
     pae.extend_from_slice(&payload_bytes);
 
-    let verifier = ring::signature::UnparsedPublicKey::new(
-        &ring::signature::ECDSA_P256_SHA256_ASN1,
-        pubkey,
-    );
+    let verifier =
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, pubkey);
     match verifier.verify(&pae, &sig_bytes) {
         Ok(()) => DsseResult::Verified,
-        Err(_) => DsseResult::Invalid(
-            "ECDSA_P256_SHA256 verification failed for DSSE envelope".into(),
-        ),
+        Err(_) => {
+            DsseResult::Invalid("ECDSA_P256_SHA256 verification failed for DSSE envelope".into())
+        }
     }
 }
 
@@ -376,8 +374,7 @@ fn extract_in_toto_statement(
         .get(&Yaml::String("payload".to_string()))
         .and_then(Yaml::as_str)
         .context("dsseEnvelope missing `payload`")?;
-    let decoded =
-        base64_decode(payload_b64).context("dsseEnvelope.payload is not valid base64")?;
+    let decoded = base64_decode(payload_b64).context("dsseEnvelope.payload is not valid base64")?;
     let statement_text = std::str::from_utf8(&decoded)
         .context("dsseEnvelope.payload did not decode to valid UTF-8")?;
     let statement_docs = YamlLoader::load_from_str(statement_text)
@@ -435,8 +432,7 @@ fn check_subject_binding(
                 // via sha256. Other lengths never match.
                 let key_compatible = matches!(
                     (expected_kind, key),
-                    (ExpectedHash::Sha1, "sha1" | "gitCommit")
-                        | (ExpectedHash::Sha256, "sha256")
+                    (ExpectedHash::Sha1, "sha1" | "gitCommit") | (ExpectedHash::Sha256, "sha256")
                 );
                 if key_compatible && value.eq_ignore_ascii_case(expected_sha) {
                     bound = true;
@@ -513,7 +509,6 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
         .map_err(|e| crate::error::Error::new(format!("base64 decode failed: {e}")))
 }
 
-
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -560,7 +555,8 @@ mod tests {
           }
         }"#;
         let body = envelope_around(stmt);
-        let verdict = verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
+        let verdict =
+            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
         if let AttestationVerdict::Verified {
             workflow_ref,
             builder_id,
@@ -586,12 +582,12 @@ mod tests {
           "predicate": {"runDetails": {"builder": {"id": "https://github.com/actions/runner/x"}}}
         }"#;
         let body = envelope_around(stmt);
-        let verdict = verify_attestation_response(
-            &body,
-            "1111111111111111111111111111111111111111",
-        )
-        .unwrap();
-        assert!(matches!(verdict, AttestationVerdict::SubjectMismatch { .. }));
+        let verdict =
+            verify_attestation_response(&body, "1111111111111111111111111111111111111111").unwrap();
+        assert!(matches!(
+            verdict,
+            AttestationVerdict::SubjectMismatch { .. }
+        ));
     }
 
     #[test]
@@ -603,21 +599,27 @@ mod tests {
           "predicate": {"runDetails": {"builder": {"id": "https://evil.example.com/builder"}}}
         }"#;
         let body = envelope_around(stmt);
-        let verdict = verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
-        assert!(matches!(verdict, AttestationVerdict::UntrustedBuilder { .. }));
+        let verdict =
+            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
+        assert!(matches!(
+            verdict,
+            AttestationVerdict::UntrustedBuilder { .. }
+        ));
     }
 
     #[test]
     fn reports_missing_when_envelope_empty() {
         let body = "{\"attestations\": []}";
-        let verdict = verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
+        let verdict =
+            verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
         assert!(matches!(verdict, AttestationVerdict::Missing));
     }
 
     #[test]
     fn reports_missing_when_no_attestations_key() {
         let body = "{}";
-        let verdict = verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
+        let verdict =
+            verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
         assert!(matches!(verdict, AttestationVerdict::Missing));
     }
 
@@ -635,16 +637,16 @@ mod tests {
         use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 
         let rng = SystemRandom::new();
-        let pkcs8 =
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let keypair = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_ASN1_SIGNING,
-            pkcs8.as_ref(),
-            &rng,
-        )
-        .unwrap();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let keypair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
         let pubkey_sec1 = keypair.public_key().as_ref().to_vec();
-        assert_eq!(pubkey_sec1.len(), 65, "SEC1 uncompressed P-256 point is 65 bytes");
+        assert_eq!(
+            pubkey_sec1.len(),
+            65,
+            "SEC1 uncompressed P-256 point is 65 bytes"
+        );
         assert_eq!(pubkey_sec1[0], 0x04);
 
         let statement = r#"{
@@ -706,7 +708,10 @@ mod tests {
             .as_hash()
             .unwrap();
         assert!(
-            matches!(verify_dsse_signature(Some(bundle_hash)), DsseResult::Verified),
+            matches!(
+                verify_dsse_signature(Some(bundle_hash)),
+                DsseResult::Verified
+            ),
             "DSSE verification should succeed on matching keypair"
         );
 
@@ -714,11 +719,9 @@ mod tests {
         // chain to the bundled Fulcio intermediate. Chain validation is the
         // v2.2b layer; it correctly rejects self-signed / non-Fulcio certs
         // even when the DSSE signature is valid.
-        let verdict = verify_attestation_response(
-            &bundle_text,
-            "abcdef0000000000000000000000000000000000",
-        )
-        .unwrap();
+        let verdict =
+            verify_attestation_response(&bundle_text, "abcdef0000000000000000000000000000000000")
+                .unwrap();
         assert!(
             matches!(verdict, AttestationVerdict::ChainInvalid { .. }),
             "expected ChainInvalid for synthetic cert, got {verdict:?}"
@@ -734,14 +737,10 @@ mod tests {
         use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 
         let rng = SystemRandom::new();
-        let pkcs8 =
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let keypair = EcdsaKeyPair::from_pkcs8(
-            &ECDSA_P256_SHA256_ASN1_SIGNING,
-            pkcs8.as_ref(),
-            &rng,
-        )
-        .unwrap();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let keypair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
         let pubkey_sec1 = keypair.public_key().as_ref().to_vec();
 
         let original = br#"{"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"x","digest":{"sha1":"abcdef0000000000000000000000000000000000"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"runDetails":{"builder":{"id":"https://github.com/actions/runner/x"}}}}"#;
@@ -784,11 +783,9 @@ mod tests {
             }}"#
         );
 
-        let verdict = verify_attestation_response(
-            &bundle,
-            "abcdef0000000000000000000000000000000000",
-        )
-        .unwrap();
+        let verdict =
+            verify_attestation_response(&bundle, "abcdef0000000000000000000000000000000000")
+                .unwrap();
         assert!(
             matches!(verdict, AttestationVerdict::SignatureInvalid { .. }),
             "expected SignatureInvalid, got {verdict:?}"
@@ -856,7 +853,14 @@ mod tests {
         let serial = tlv(0x02, &[0x01]);
         let sig_alg = seq(&[&alg_oid, &alg_params]);
         let tbs = seq(&[
-            &version, &serial, &sig_alg, &issuer, &validity, &subject, &spki, &exts_wrapper,
+            &version,
+            &serial,
+            &sig_alg,
+            &issuer,
+            &validity,
+            &subject,
+            &spki,
+            &exts_wrapper,
         ]);
         let outer_sig_alg = seq(&[&alg_oid, &alg_params]);
         let outer_sig_value = tlv(0x03, &[0x00, 0xAA]);
@@ -872,7 +876,11 @@ mod tests {
           "predicate": {}
         }"#;
         let body = envelope_around(stmt);
-        let verdict = verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
-        assert!(matches!(verdict, AttestationVerdict::UnknownPredicate { .. }));
+        let verdict =
+            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
+        assert!(matches!(
+            verdict,
+            AttestationVerdict::UnknownPredicate { .. }
+        ));
     }
 }

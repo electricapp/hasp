@@ -70,8 +70,7 @@ use yaml_rust2::Yaml;
 // Rotation: both certs are valid through 2031-10-05. Rotate by replacing
 // the PEM files and shipping a new hasp release.
 const FULCIO_ROOT_V1_PEM: &str = include_str!("../../data/fulcio/root_v1.pem");
-const FULCIO_INTERMEDIATE_V1_PEM: &str =
-    include_str!("../../data/fulcio/intermediate_v1.pem");
+const FULCIO_INTERMEDIATE_V1_PEM: &str = include_str!("../../data/fulcio/intermediate_v1.pem");
 
 fn fulcio_root_der() -> &'static [u8] {
     static DER: OnceLock<Vec<u8>> = OnceLock::new();
@@ -196,7 +195,9 @@ impl SignerIdentity {
 /// parsing fails (malformed DER, unsupported encoding, etc.). Parse errors
 /// are swallowed on purpose so the caller can continue to treat presence as
 /// a separate signal from verification.
-pub(crate) fn extract_identity_from_bundle(bundle: &yaml_rust2::yaml::Hash) -> Option<SignerIdentity> {
+pub(crate) fn extract_identity_from_bundle(
+    bundle: &yaml_rust2::yaml::Hash,
+) -> Option<SignerIdentity> {
     let material = bundle
         .get(&Yaml::String("verificationMaterial".to_string()))?
         .as_hash()?;
@@ -245,9 +246,7 @@ pub(crate) enum ChainVerdict {
 /// public-good Fulcio intermediate. This doesn't walk to the root -- it
 /// trusts the pinned intermediate directly. An attacker would need
 /// Sigstore's intermediate private key to forge a cert that passes.
-pub(crate) fn verify_chain_to_fulcio(
-    bundle: &yaml_rust2::yaml::Hash,
-) -> ChainVerdict {
+pub(crate) fn verify_chain_to_fulcio(bundle: &yaml_rust2::yaml::Hash) -> ChainVerdict {
     let Some(material) = bundle
         .get(&Yaml::String("verificationMaterial".to_string()))
         .and_then(Yaml::as_hash)
@@ -261,9 +260,7 @@ pub(crate) fn verify_chain_to_fulcio(
         return ChainVerdict::Malformed("leaf cert base64 decode failed".into());
     };
     let Some(intermediate_spki) = fulcio_intermediate_spki() else {
-        return ChainVerdict::Malformed(
-            "bundled Fulcio intermediate could not be parsed".into(),
-        );
+        return ChainVerdict::Malformed("bundled Fulcio intermediate could not be parsed".into());
     };
 
     let Some((tbs_bytes, sig_bytes, leaf_issuer)) = extract_signed_parts(&leaf_der) else {
@@ -385,9 +382,7 @@ fn algorithm_is_ecdsa_p256(alg: &Tlv<'_>) -> bool {
     }
     if let Some(params) = parts.get(1) {
         // prime256v1 = 1.2.840.10045.3.1.7 -> 2A 86 48 CE 3D 03 01 07
-        if params.tag != 0x06
-            || params.value != [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]
-        {
+        if params.tag != 0x06 || params.value != [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07] {
             return false;
         }
     }
@@ -599,9 +594,7 @@ fn extract_subject_alt_name_uri(extensions_value: &[u8]) -> Option<String> {
                 for name in walk_sequence(inner.value) {
                     // uniformResourceIdentifier = [6] IA5String (implicit) -> tag 0x86.
                     if name.tag == 0x86 {
-                        return std::str::from_utf8(name.value)
-                            .ok()
-                            .map(str::to_string);
+                        return std::str::from_utf8(name.value).ok().map(str::to_string);
                     }
                 }
                 return None;
@@ -634,7 +627,9 @@ mod tests {
     #[test]
     fn identity_looks_like_fulcio_matches_sigstore_cn() {
         let id = SignerIdentity {
-            subject_uri: Some("https://github.com/a/b/.github/workflows/build.yml@refs/tags/v1".into()),
+            subject_uri: Some(
+                "https://github.com/a/b/.github/workflows/build.yml@refs/tags/v1".into(),
+            ),
             issuer_cn: Some("sigstore-intermediate".into()),
         };
         assert!(id.looks_like_fulcio());
@@ -711,7 +706,9 @@ mod tests {
           },
           "certificate": {"rawBytes": "CCCC"}
         }"#;
-        let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
+        let doc = yaml_rust2::YamlLoader::load_from_str(yaml)
+            .unwrap()
+            .remove(0);
         let material = doc.as_hash().unwrap();
         assert_eq!(first_cert_raw_bytes(material), Some("AAAA"));
     }
@@ -719,7 +716,9 @@ mod tests {
     #[test]
     fn first_cert_raw_bytes_falls_back_to_single_certificate() {
         let yaml = r#"{"certificate": {"rawBytes": "SINGLE"}}"#;
-        let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
+        let doc = yaml_rust2::YamlLoader::load_from_str(yaml)
+            .unwrap()
+            .remove(0);
         let material = doc.as_hash().unwrap();
         assert_eq!(first_cert_raw_bytes(material), Some("SINGLE"));
     }
@@ -727,7 +726,9 @@ mod tests {
     #[test]
     fn first_cert_raw_bytes_returns_none_for_empty_chain() {
         let yaml = r#"{"x509CertificateChain": {"certificates": []}}"#;
-        let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
+        let doc = yaml_rust2::YamlLoader::load_from_str(yaml)
+            .unwrap()
+            .remove(0);
         let material = doc.as_hash().unwrap();
         assert!(first_cert_raw_bytes(material).is_none());
     }
@@ -735,7 +736,9 @@ mod tests {
     #[test]
     fn extract_identity_from_bundle_returns_none_without_cert() {
         let yaml = r#"{"verificationMaterial": {}}"#;
-        let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
+        let doc = yaml_rust2::YamlLoader::load_from_str(yaml)
+            .unwrap()
+            .remove(0);
         let map = doc.as_hash().unwrap();
         assert!(extract_identity_from_bundle(map).is_none());
     }
@@ -785,7 +788,9 @@ mod tests {
     #[test]
     fn chain_verify_returns_no_material_for_empty_bundle() {
         let yaml = "{}";
-        let doc = yaml_rust2::YamlLoader::load_from_str(yaml).unwrap().remove(0);
+        let doc = yaml_rust2::YamlLoader::load_from_str(yaml)
+            .unwrap()
+            .remove(0);
         let map = doc.as_hash().unwrap();
         assert_eq!(verify_chain_to_fulcio(map), ChainVerdict::NoMaterial);
     }
@@ -839,16 +844,19 @@ mod tests {
         let version = tlv(0xA0, &tlv(0x02, &[0x02]));
         let serial = tlv(0x02, &[0x01]);
         let sig_alg = seq(&[&alg_oid, &alg_params]);
-        let tbs = seq(&[&version, &serial, &sig_alg, &issuer, &validity, &subject, &spki]);
+        let tbs = seq(&[
+            &version, &serial, &sig_alg, &issuer, &validity, &subject, &spki,
+        ]);
         let sig_alg_outer = seq(&[&alg_oid, &alg_params]);
         let sig_value = tlv(0x03, &[0x00, 0xAA]);
         let cert = seq(&[&tbs, &sig_alg_outer, &sig_value]);
         let cert_b64 = STANDARD.encode(&cert);
 
-        let yaml = format!(
-            r#"{{"verificationMaterial":{{"certificate":{{"rawBytes":"{cert_b64}"}}}}}}"#
-        );
-        let doc = yaml_rust2::YamlLoader::load_from_str(&yaml).unwrap().remove(0);
+        let yaml =
+            format!(r#"{{"verificationMaterial":{{"certificate":{{"rawBytes":"{cert_b64}"}}}}}}"#);
+        let doc = yaml_rust2::YamlLoader::load_from_str(&yaml)
+            .unwrap()
+            .remove(0);
         let map = doc.as_hash().unwrap();
 
         // The synthetic cert's issuer DN is "sigstore-intermediate" but the
@@ -933,7 +941,14 @@ mod tests {
         let sig_alg = seq(&[&alg_oid, &alg_params]);
 
         let tbs = seq(&[
-            &version, &serial, &sig_alg, &issuer, &validity, &subject, &spki, &exts_wrapper,
+            &version,
+            &serial,
+            &sig_alg,
+            &issuer,
+            &validity,
+            &subject,
+            &spki,
+            &exts_wrapper,
         ]);
         // Outer: SEQ{ TBS, sigAlg, sigValue }
         let outer_sig_alg = seq(&[&alg_oid, &alg_params]);

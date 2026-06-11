@@ -209,9 +209,7 @@ fn artifact_op_from_uses(uses: &str) -> Option<bool> {
         | "aochmann/actions-download-artifact"
         | "bettermarks/action-artifact-download" => Some(false),
         _ => {
-            if head.ends_with("/download-artifact")
-                || head.ends_with("/action-download-artifact")
-            {
+            if head.ends_with("/download-artifact") || head.ends_with("/action-download-artifact") {
                 Some(false)
             } else {
                 None
@@ -265,8 +263,7 @@ fn run_step_implies_artifact_download(run: &str) -> bool {
     if run.contains("gh api") {
         return true;
     }
-    if run.contains("curl") && (run.contains("api.github.com") || run.contains("GITHUB_API_URL"))
-    {
+    if run.contains("curl") && (run.contains("api.github.com") || run.contains("GITHUB_API_URL")) {
         return true;
     }
     false
@@ -364,7 +361,10 @@ fn extract_workflow_info(file: &Path, doc: &Yaml) -> Option<WorkflowInfo> {
                     let Some(step_map) = step.as_hash() else {
                         continue;
                     };
-                    let uses = step_map.get(key_uses()).and_then(Yaml::as_str).unwrap_or("");
+                    let uses = step_map
+                        .get(key_uses())
+                        .and_then(Yaml::as_str)
+                        .unwrap_or("");
                     if let Some(is_upload) = artifact_op_from_uses(uses) {
                         let with = step_map.get(key_with());
                         artifact_ops.push(ArtifactOp {
@@ -840,9 +840,7 @@ fn check_artifact_flow(graph: &Graph, findings: &mut Vec<AuditFinding>, is_warni
     let index = build_upload_index(graph);
 
     for (sink_idx, sink) in graph.workflows.iter().enumerate() {
-        if !sink.triggers.contains(&TriggerKind::WorkflowRun)
-            || !sink.permissions.is_privileged()
-        {
+        if !sink.triggers.contains(&TriggerKind::WorkflowRun) || !sink.permissions.is_privileged() {
             continue;
         }
 
@@ -879,8 +877,7 @@ fn check_artifact_flow(graph: &Graph, findings: &mut Vec<AuditFinding>, is_warni
         };
 
         for download in sink.artifact_ops.iter().filter(|op| !op.is_upload) {
-            let download_is_wildcard =
-                download.name == "*" || download.name.contains("${{");
+            let download_is_wildcard = download.name == "*" || download.name.contains("${{");
 
             // Candidate uploads: wildcard downloads see all uploads; exact
             // downloads see same-name uploads plus any wildcard uploads.
@@ -979,15 +976,9 @@ fn check_artifact_flow(graph: &Graph, findings: &mut Vec<AuditFinding>, is_warni
 /// root cause. The conclusion guard must be a real `if:` expression;
 /// `types: [completed]` is NOT a guard (it's the event-timing filter and
 /// fires on every terminal conclusion).
-fn check_unguarded_workflow_run(
-    graph: &Graph,
-    findings: &mut Vec<AuditFinding>,
-    is_warning: bool,
-) {
+fn check_unguarded_workflow_run(graph: &Graph, findings: &mut Vec<AuditFinding>, is_warning: bool) {
     for wf in &graph.workflows {
-        if !wf.triggers.contains(&TriggerKind::WorkflowRun)
-            || !wf.permissions.is_privileged()
-        {
+        if !wf.triggers.contains(&TriggerKind::WorkflowRun) || !wf.permissions.is_privileged() {
             continue;
         }
         let no_allowlist = wf.workflow_run_parents.is_empty();
@@ -997,11 +988,9 @@ fn check_unguarded_workflow_run(
             findings.push(AuditFinding {
                 file: wf.file.clone(),
                 severity: Severity::High,
-                title:
-                    "workflow_run trigger without explicit source workflows or conclusion guard"
-                        .to_string(),
-                detail:
-                    "This privileged `workflow_run` workflow has neither a \
+                title: "workflow_run trigger without explicit source workflows or conclusion guard"
+                    .to_string(),
+                detail: "This privileged `workflow_run` workflow has neither a \
                      `workflows:` allowlist nor an `if: github.event.workflow_run.\
                      conclusion == 'success'` gate on any job. Any upstream \
                      run in the repo — including one triggered by a fork PR — \
@@ -1012,7 +1001,7 @@ fn check_unguarded_workflow_run(
                      propagate. Note: `types: [completed]` is NOT a success \
                      guard — it is the event-timing filter, and fires on \
                      every terminal conclusion."
-                        .to_string(),
+                    .to_string(),
                 is_warning,
             });
         } else if no_allowlist {
@@ -1020,14 +1009,13 @@ fn check_unguarded_workflow_run(
                 file: wf.file.clone(),
                 severity: Severity::High,
                 title: "workflow_run trigger without explicit source workflows".to_string(),
-                detail:
-                    "This workflow is triggered by `workflow_run` but does not restrict \
+                detail: "This workflow is triggered by `workflow_run` but does not restrict \
                      the set of upstream workflows that can trigger it (no `workflows:` \
                      filter). Combined with privileged permissions, any workflow run in \
                      this repo — including PR-triggered ones — can cause this workflow \
                      to fire. List the specific trusted workflows under \
                      `on.workflow_run.workflows:`."
-                        .to_string(),
+                    .to_string(),
                 is_warning,
             });
         } else if no_gate {
@@ -1035,8 +1023,7 @@ fn check_unguarded_workflow_run(
                 file: wf.file.clone(),
                 severity: Severity::High,
                 title: "workflow_run trigger without conclusion guard".to_string(),
-                detail:
-                    "This workflow is triggered by `workflow_run` and does not gate \
+                detail: "This workflow is triggered by `workflow_run` and does not gate \
                      its jobs on `github.event.workflow_run.conclusion == 'success'`. \
                      Failed, cancelled, or skipped upstream runs can still fire this \
                      privileged workflow. Note: `types: [completed]` is NOT a success \
@@ -1045,7 +1032,7 @@ fn check_unguarded_workflow_run(
                      because `cancelled`, `skipped`, `timed_out`, and `neutral` all \
                      satisfy it. Add a top-level or per-job `if:` that checks \
                      `.conclusion == 'success'` explicitly."
-                        .to_string(),
+                    .to_string(),
                 is_warning,
             });
         }
@@ -1095,8 +1082,7 @@ fn check_workflow_run_event_taint(
                 severity: Severity::High,
                 title: "Workflow reads attacker-controlled github.event.workflow_run fields"
                     .to_string(),
-                detail:
-                    "This workflow references one of the attacker-controlled subfields of \
+                detail: "This workflow references one of the attacker-controlled subfields of \
                      `github.event.workflow_run.*` (head_branch, head_sha, head_repository, \
                      head_commit, event, pull_requests, display_title, triggering_actor, \
                      actor, referenced_workflows) when the upstream workflow was triggered \
@@ -1106,7 +1092,7 @@ fn check_workflow_run_event_taint(
                      `.workflow_id`, `.created_at`, and other GitHub-set subfields are safe \
                      to read and are NOT flagged — they are exactly how you implement the \
                      conclusion-success guard the artifact-flow finding recommends."
-                        .to_string(),
+                    .to_string(),
                 is_warning,
             });
         }
@@ -1155,8 +1141,7 @@ fn check_workflow_run_checkout_taint(
             severity: Severity::Critical,
             title: "Cross-workflow checkout of attacker-controlled ref in privileged sink"
                 .to_string(),
-            detail:
-                "This privileged `workflow_run`-triggered workflow checks out a git ref \
+            detail: "This privileged `workflow_run`-triggered workflow checks out a git ref \
                  derived from `github.event.workflow_run.<head_branch|head_sha|head_repository\
                  |head_commit|...>` — fields populated by the upstream PR fork. The fork's \
                  code is fetched into the workspace and executed under the sink's privileged \
@@ -1165,7 +1150,7 @@ fn check_workflow_run_checkout_taint(
                  restructure so the privileged work runs only against trusted source. \
                  Variants of this pattern (gitea/forgejo `checkout`, third-party \
                  `*-action`) are also flagged."
-                    .to_string(),
+                .to_string(),
             is_warning,
         });
     }
@@ -1452,11 +1437,10 @@ jobs:
         );
         // `uses: Actions/Checkout@... with: { ref: ${{ workflow_run.head_branch }} }`
         // must still register as a tainted checkout.
-        let with_doc = YamlLoader::load_from_str(
-            "ref: ${{ github.event.workflow_run.head_branch }}\n",
-        )
-        .unwrap()
-        .remove(0);
+        let with_doc =
+            YamlLoader::load_from_str("ref: ${{ github.event.workflow_run.head_branch }}\n")
+                .unwrap()
+                .remove(0);
         assert!(step_uses_tainted_checkout(
             "Actions/Checkout@v4",
             Some(&with_doc)
@@ -1775,8 +1759,7 @@ jobs:
         entries
             .into_iter()
             .map(|p| {
-                let src = std::fs::read_to_string(&p)
-                    .unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+                let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
                 let doc = YamlLoader::load_from_str(&src)
                     .unwrap_or_else(|e| panic!("parse {p:?}: {e}"))
                     .remove(0);
@@ -2069,7 +2052,9 @@ jobs:
             ParentsList::UppercasePathSource => {
                 "    workflows: ['.GITHUB/WORKFLOWS/SOURCE.YML']\n".to_string()
             }
-            ParentsList::NamesBogus => "    workflows: ['.github/workflows/nope.yml']\n".to_string(),
+            ParentsList::NamesBogus => {
+                "    workflows: ['.github/workflows/nope.yml']\n".to_string()
+            }
         };
         let types = match s.types {
             Types::Absent => String::new(),
@@ -2096,9 +2081,15 @@ jobs:
         };
         let reads = match s.reads {
             EventReads::None => String::new(),
-            EventReads::Conclusion => "      - run: echo ${{ github.event.workflow_run.conclusion }}\n".to_string(),
-            EventReads::HeadBranch => "      - run: echo ${{ github.event.workflow_run.head_branch }}\n".to_string(),
-            EventReads::HeadSha => "      - run: echo ${{ github.event.workflow_run.head_sha }}\n".to_string(),
+            EventReads::Conclusion => {
+                "      - run: echo ${{ github.event.workflow_run.conclusion }}\n".to_string()
+            }
+            EventReads::HeadBranch => {
+                "      - run: echo ${{ github.event.workflow_run.head_branch }}\n".to_string()
+            }
+            EventReads::HeadSha => {
+                "      - run: echo ${{ github.event.workflow_run.head_sha }}\n".to_string()
+            }
         };
         format!(
             "name: Sink\n{on}{perms}jobs:\n  d:\n{job_if}    runs-on: ubuntu-latest\n    steps:\n      - run: echo start\n{art}{reads}",
@@ -2335,9 +2326,7 @@ jobs:
             // be none, but keep the assertion narrow.
             let b_filtered: Vec<_> = b
                 .into_iter()
-                .filter(|f| {
-                    f.file.file_name().and_then(|n| n.to_str()) != Some("unrelated.yml")
-                })
+                .filter(|f| f.file.file_name().and_then(|n| n.to_str()) != Some("unrelated.yml"))
                 .collect();
             assert_eq!(
                 a, b_filtered,

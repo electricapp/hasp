@@ -19,6 +19,42 @@ pub(crate) struct SecureToken {
 /// Maximum secret size when reading from a pipe (64 KiB).
 const MAX_PIPE_SECRET_BYTES: u64 = 64 * 1024;
 
+/// Read a token file with a size cap, returning the whitespace-trimmed secret.
+///
+/// The cap mirrors `from_stdin` so `--token-file /dev/zero` (or a stray
+/// multi-gigabyte file) can't hang or exhaust memory. The full file buffer is
+/// scrubbed before returning, so only the returned trimmed copy holds the
+/// secret — the caller is responsible for scrubbing that after use (or handing
+/// it to [`SecureToken::from_string`], which scrubs it).
+pub(crate) fn read_trimmed_token_file(path: &std::path::Path) -> Result<String> {
+    let mut raw = {
+        let file = std::fs::File::open(path)
+            .context(format!("Cannot read token file {}", path.display()))?;
+        let mut s = String::new();
+        file.take(MAX_PIPE_SECRET_BYTES + 1)
+            .read_to_string(&mut s)
+            .context(format!("Cannot read token file {}", path.display()))?;
+        s
+    };
+    if raw.len() as u64 > MAX_PIPE_SECRET_BYTES {
+        scrub_string(&mut raw);
+        crate::error::bail!(
+            "Token file {} exceeds {MAX_PIPE_SECRET_BYTES} bytes",
+            path.display()
+        );
+    }
+    // Copy out the trimmed secret, then scrub the *entire* original buffer.
+    // (String::drain/truncate would shift/shrink the length but leave the
+    // trailing secret bytes in spare capacity, beyond what scrub_string zeroes.)
+    let mut trimmed = raw.trim().to_string();
+    scrub_string(&mut raw);
+    if trimmed.is_empty() {
+        scrub_string(&mut trimmed);
+        crate::error::bail!("Token file {} is empty", path.display());
+    }
+    Ok(trimmed)
+}
+
 impl SecureToken {
     pub(crate) fn from_env(var: &str) -> Result<Self> {
         let value = std::env::var(var).context(format!(
@@ -33,21 +69,10 @@ impl SecureToken {
         Self::from_string(value)
     }
 
-    /// Read a token from a file (e.g. `--token-file`). Surrounding whitespace
-    /// (including a trailing newline from `echo`) is trimmed in place so no
-    /// un-scrubbed copy of the secret is left behind.
+    /// Read a token from a file (e.g. `--token-file`). The full file buffer is
+    /// scrubbed before returning so no un-trimmed copy of the secret survives.
     pub(crate) fn from_file(path: &std::path::Path) -> Result<Self> {
-        let mut value = std::fs::read_to_string(path)
-            .context(format!("Cannot read token file {}", path.display()))?;
-        let start = value.len() - value.trim_start().len();
-        value.drain(..start);
-        let end = value.trim_end().len();
-        value.truncate(end);
-        if value.is_empty() {
-            scrub_string(&mut value);
-            crate::error::bail!("Token file {} is empty", path.display());
-        }
-        Self::from_string(value)
+        Self::from_string(read_trimmed_token_file(path)?)
     }
 
     /// Read a secret from stdin (pipe from parent process).

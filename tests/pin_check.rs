@@ -10,7 +10,13 @@ fn no_verify_reports_skip_for_sha_refs() {
     let dir = fixture("pin_check");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
     assert!(
@@ -24,7 +30,13 @@ fn mutable_ref_fails_and_exits_one() {
     let dir = fixture("pin_check");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
     assert!(
@@ -39,7 +51,13 @@ fn strict_without_token_exits_two() {
     let dir = fixture("pin_check");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--strict", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--strict",
+            "--no-policy",
+        ],
     );
     assert_eq!(
         o.status.code(),
@@ -55,7 +73,13 @@ fn strict_with_token_produces_multiple_fails() {
     let dir = fixture("pin_check");
     let o = run_with_token(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--strict", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--strict",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
     let fail_count = out.matches("FAIL").count();
@@ -70,10 +94,7 @@ fn strict_with_token_produces_multiple_fails() {
 #[ignore = "requires GITHUB_TOKEN for SHA verification"]
 fn comment_version_mismatch_is_flagged() {
     let dir = fixture("comment_mismatch");
-    let o = run_with_token(
-        &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-policy"],
-    );
+    let o = run_with_token(&dir, &["--dir", ".", "--allow-unsandboxed", "--no-policy"]);
     let out = combined(&o);
     assert!(out.to_lowercase().contains("comment"), "{out}");
     assert_eq!(o.status.code(), Some(1));

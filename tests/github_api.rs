@@ -86,7 +86,12 @@ fn exceeding_api_budget_exits_two() {
 
     let o = run_with_token(
         &repo,
-        &["--dir", ".github/workflows", "--allow-unsandboxed", "--no-policy"],
+        &[
+            "--dir",
+            ".github/workflows",
+            "--allow-unsandboxed",
+            "--no-policy",
+        ],
     );
     let out = combined(&o).to_lowercase();
     assert_eq!(
@@ -118,7 +123,12 @@ fn invalid_token_exits_two() {
 
     let o = Command::new(hasp_bin())
         .current_dir(&repo)
-        .args(["--dir", ".github/workflows", "--allow-unsandboxed", "--no-policy"])
+        .args([
+            "--dir",
+            ".github/workflows",
+            "--allow-unsandboxed",
+            "--no-policy",
+        ])
         .env("GITHUB_TOKEN", "ghp_obviously_invalid_0000000000000000000")
         .output()
         .expect("spawn hasp");

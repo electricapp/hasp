@@ -119,17 +119,33 @@ fn parse_secrets(doc: &Yaml) -> Result<Vec<SecretGrant>> {
             validate_domain(domain)?;
         }
 
-        let inject = match value["inject"].as_str() {
-            Some("header") | None => InjectMode::Header,
-            Some("basic") => InjectMode::Basic,
-            Some("none") => InjectMode::None,
-            Some(other) => bail!("unknown inject mode `{other}` for secret `{env_var}`"),
+        // Distinguish an *absent* `inject:` key (default to Header) from one
+        // that is present but not a string (`inject: ~`, `inject: true`,
+        // `inject: [none]`, …). The latter is a mistake — defaulting it to
+        // Header would silently inject the secret as a Bearer header when the
+        // author may well have meant `none`, so reject it.
+        // Yaml has many scalar/collection variants; we only accept an absent
+        // key (default) or a string, and reject everything else explicitly.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let inject = match &value["inject"] {
+            Yaml::BadValue => InjectMode::Header, // key absent
+            Yaml::String(s) => match s.as_str() {
+                "header" => InjectMode::Header,
+                "basic" => InjectMode::Basic,
+                "none" => InjectMode::None,
+                other => bail!("unknown inject mode `{other}` for secret `{env_var}`"),
+            },
+            _ => bail!("`inject` for secret `{env_var}` must be one of: header, basic, none"),
         };
 
-        let header_prefix = value["header_prefix"]
-            .as_str()
-            .unwrap_or("Bearer ")
-            .to_string();
+        // header_prefix has the same hazard: a non-string value silently
+        // becoming "Bearer " could inject an unintended header.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let header_prefix = match &value["header_prefix"] {
+            Yaml::BadValue => "Bearer ".to_string(),
+            Yaml::String(s) => s.clone(),
+            _ => bail!("`header_prefix` for secret `{env_var}` must be a string"),
+        };
         // Reject control characters in header_prefix — YAML double-quoted
         // strings interpret \r\n as literal CR+LF, which would inject
         // arbitrary HTTP headers into upstream requests.

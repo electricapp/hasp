@@ -10,7 +10,13 @@ fn mutable_container_tags_warn() {
     let dir = fixture("containers");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
     assert!(out.contains("node:20") && out.contains("WARN"), "{out}");
@@ -22,10 +28,19 @@ fn digest_pinned_container_passes() {
     let dir = fixture("containers");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
-    assert!(out.contains("postgres@sha256") && out.contains("PASS"), "{out}");
+    assert!(
+        out.contains("postgres@sha256") && out.contains("PASS"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -34,7 +49,12 @@ fn strict_turns_mutable_container_into_fail() {
     let o = run(
         &dir,
         &[
-            "--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy", "--strict",
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+            "--strict",
         ],
     );
     let out = stdout(&o);
@@ -47,7 +67,13 @@ fn docker_prefix_detects_both_mutable_and_digest() {
     let dir = fixture("docker_images");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
     assert!(out.contains("alpine:3.20") && out.contains("WARN"), "{out}");

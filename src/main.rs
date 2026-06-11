@@ -174,7 +174,7 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
     }
 
     // ── Load policy ──────────────────────────────────────────────────────
-    let policy = load_policy(args, &canonical_dir)?;
+    let policy = load_policy(args, &canonical_dir, true)?;
     let has_policy_checks = policy.has_any_enabled_check();
 
     // ── Policy drift detection (--diff-base) ─────────────────────────────
@@ -185,13 +185,25 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
     // Defense-in-depth: verify workflow files haven't been tampered with after
     // git checkout (e.g. by a prior CI step). Skipped with --allow-unsandboxed
     // since dev workflows may have uncommitted changes.
-    if args.allow_unsandboxed {
+    let integrity_hashes = if args.allow_unsandboxed {
         if !args.quiet {
             eprintln!("hasp: note: workflow integrity check skipped (--allow-unsandboxed)");
         }
+        None
     } else {
-        integrity::check_workflow_integrity(&canonical_dir)?;
-    }
+        match integrity::expected_workflow_hashes(&canonical_dir)? {
+            Some(entries) => {
+                // Launcher-side pre-check, then hand the expected hashes to the
+                // scan subprocess so it re-verifies the exact bytes it scans —
+                // closing the TOCTOU window between this read and the scan's
+                // read. The subprocess can't run git itself (execve is denied
+                // by its seccomp policy), so the launcher supplies the hashes.
+                integrity::verify_entries(&canonical_dir, &entries)?;
+                Some(integrity::encode_expected_hashes(&entries))
+            }
+            None => None,
+        }
+    };
 
     // Status/progress lines go to stderr so stdout carries only the report
     // (or, with --json, only the JSON document). Suppressed by --quiet.
@@ -205,7 +217,7 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
         );
     }
     let exe = std::env::current_exe().context("Cannot resolve current executable path")?;
-    let scan = run_scan_subprocess(&exe, args)?;
+    let scan = run_scan_subprocess(&exe, args, integrity_hashes.as_deref())?;
 
     if scan.action_refs.is_empty()
         && scan.container_refs.is_empty()
@@ -222,6 +234,7 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
                 args.strict,
                 &policy,
                 0,
+                &[],
             );
             print!("{json}");
         } else if !args.quiet {
@@ -250,7 +263,7 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
 
     // ── Compute diff-base changes (before any env scrubbing) ──────────
     let diff_changes = if let Some(ref base) = args.diff_base {
-        let changes = compute_diff_base_changes(base, &scan.action_refs);
+        let changes = compute_diff_base_changes(base, &scan.action_refs, &canonical_dir);
         if changes.is_empty() {
             eprintln!("hasp: no SHA changes found since {base}");
         } else {
@@ -329,6 +342,7 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
             args.strict,
             &policy,
             suppressed_count,
+            &compare_results,
         );
         print!("{json}");
         if failed {
@@ -372,43 +386,42 @@ fn apply_token_file(args: &cli::Args) -> Result<()> {
     let Some(path) = &args.token_file else {
         return Ok(());
     };
-    let mut raw = std::fs::read_to_string(path)
-        .context(format!("Cannot read token file {}", path.display()))?;
-    // Trim surrounding whitespace in place so no un-scrubbed copy is left.
-    let start = raw.len() - raw.trim_start().len();
-    raw.drain(..start);
-    raw.truncate(raw.trim_end().len());
-    if raw.is_empty() {
-        token::scrub_string(&mut raw);
-        error::bail!("Token file {} is empty", path.display());
-    }
+    // Reads with a size cap and scrubs the full file buffer, leaving only the
+    // trimmed secret (which we scrub below after copying it into the env).
+    let mut secret = token::read_trimmed_token_file(path)?;
     // SAFETY: the launcher is single-threaded here (before any thread or child
     // process is spawned), so set_var has no data races.
     #[allow(unsafe_code)]
     unsafe {
-        std::env::set_var("GITHUB_TOKEN", &raw);
+        std::env::set_var("GITHUB_TOKEN", &secret);
     }
-    token::scrub_string(&mut raw);
+    token::scrub_string(&mut secret);
     Ok(())
 }
 
-fn load_policy(args: &cli::Args, canonical_dir: &Path) -> Result<policy::Policy> {
+/// Load policy. `announce` controls the user-facing status/warning lines: the
+/// launcher passes `true`; the `--internal-scan`/`--internal-verify`
+/// subprocesses (which inherit the launcher's stderr) pass `false` so the same
+/// messages aren't printed up to three times per run.
+fn load_policy(args: &cli::Args, canonical_dir: &Path, announce: bool) -> Result<policy::Policy> {
     let (pol, loaded_from) = policy::Policy::resolve(args, canonical_dir)?;
-    if let Some(path) = loaded_from
-        && !args.quiet
-    {
-        eprintln!("hasp: loaded policy from {}", path.display());
-    }
+    if announce {
+        if let Some(path) = loaded_from
+            && !args.quiet
+        {
+            eprintln!("hasp: loaded policy from {}", path.display());
+        }
 
-    if !pol.has_any_enabled_check() {
-        eprintln!("hasp: warning: policy disables all security checks");
-    }
+        if !pol.has_any_enabled_check() {
+            eprintln!("hasp: warning: policy disables all security checks");
+        }
 
-    if pol.has_broad_suppressions() {
-        eprintln!(
-            "hasp: warning: policy contains broad suppression patterns (*/*, *) \
-             — some findings will be silently hidden"
-        );
+        if pol.has_broad_suppressions() {
+            eprintln!(
+                "hasp: warning: policy contains broad suppression patterns (*/*, *) \
+                 — some findings will be silently hidden"
+            );
+        }
     }
 
     Ok(pol)
@@ -493,6 +506,7 @@ fn apply_suppressions(policy: &policy::Policy, findings: &mut Vec<audit::AuditFi
 fn compute_diff_base_changes(
     diff_base: &str,
     head_refs: &[scanner::ActionRef],
+    workflow_dir: &Path,
 ) -> Vec<scanner::ActionRefChange> {
     // Validate the ref to prevent git option injection and path traversal.
     // Command::args() prevents shell injection, but git itself interprets
@@ -518,8 +532,12 @@ fn compute_diff_base_changes(
             .collect()
     };
 
-    // Get repo root for relative path calculation
+    // Get repo root for relative path calculation. Anchor on the workflow dir
+    // (not the process CWD) so `hasp --dir /other/repo/... --diff-base main`
+    // run from an unrelated directory resolves the *workflow's* repo, instead
+    // of silently reporting "no SHA changes".
     let repo_root = git_util::git_cmd()
+        .current_dir(workflow_dir)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()
@@ -562,7 +580,10 @@ fn compute_diff_base_changes(
         let relative = file.strip_prefix(&repo_root).unwrap_or(file);
         let git_path = format!("{diff_base}:{}", relative.display());
 
-        let output = git_util::git_cmd().args(["show", &git_path]).output();
+        let output = git_util::git_cmd()
+            .current_dir(&repo_root)
+            .args(["show", &git_path])
+            .output();
 
         let Ok(output) = output else {
             continue; // git show failed, skip
@@ -669,9 +690,14 @@ fn run_internal_scan(args: &cli::Args) -> Result<()> {
     }
 
     // Load policy before scanning (needs filesystem access)
-    let policy = load_policy(args, &canonical_dir)?;
+    let policy = load_policy(args, &canonical_dir, false)?;
 
-    let scan = scanner::scan_directory(&canonical_dir)?;
+    // Committed workflow hashes handed down by the launcher (which can run git);
+    // the scanner verifies the bytes it actually reads against them.
+    let expected_hashes = std::env::var(integrity::INTEGRITY_HASHES_ENV)
+        .ok()
+        .map(|s| integrity::decode_expected_hashes(&s));
+    let scan = scanner::scan_directory_with_integrity(&canonical_dir, expected_hashes)?;
     let run_audit = args.paranoid || policy.has_any_enabled_check();
     let audit_findings = if run_audit {
         let effective_owners = policy::Policy::effective_list(
@@ -744,7 +770,7 @@ fn run_internal_verify(args: &cli::Args) -> Result<()> {
         .dir
         .canonicalize()
         .context("Cannot resolve workflow dir")?;
-    let policy = load_policy(args, &canonical_dir)?;
+    let policy = load_policy(args, &canonical_dir, false)?;
 
     sandbox::phase2_deny_reads()?;
     let client = proxy::Client::from_env()?;
@@ -793,13 +819,20 @@ fn run_internal_proxy(args: &cli::Args) -> Result<()> {
     )
 }
 
-fn run_scan_subprocess(exe: &Path, args: &cli::Args) -> Result<ipc::ScanPayload> {
+fn run_scan_subprocess(
+    exe: &Path,
+    args: &cli::Args,
+    integrity_hashes: Option<&str>,
+) -> Result<ipc::ScanPayload> {
     let mut cmd = build_child_command(exe, args);
     cmd.arg("--internal-scan")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    apply_env_allowlist(&mut cmd, &[]);
+    let env: Vec<(&str, Option<OsString>)> = integrity_hashes.map_or_else(Vec::new, |h| {
+        vec![(integrity::INTEGRITY_HASHES_ENV, Some(OsString::from(h)))]
+    });
+    apply_env_allowlist(&mut cmd, &env);
 
     let output = cmd
         .output()
@@ -881,11 +914,20 @@ fn run_verify_subprocess(
     };
 
     let verifier_allowlist = [proxy_addr];
-    let verifier_sandbox = netguard::maybe_prepare(
+    let verifier_sandbox = match netguard::maybe_prepare(
         netguard::SandboxMode::Verifier,
         &verifier_allowlist,
         args.allow_unsandboxed,
-    )?;
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            // The token-holding proxy is already running — tear it down and
+            // scrub its auth secret before bailing.
+            token::scrub_string(&mut proxy_auth);
+            terminate_child(&mut proxy_child);
+            return Err(err);
+        }
+    };
     let mut verifier_cmd = build_child_command(exe, args);
     verifier_cmd
         .arg("--internal-verify")
@@ -920,7 +962,9 @@ fn run_verify_subprocess(
         }
     };
 
-    {
+    // Send the payload; on any failure tear down BOTH children so neither the
+    // token-holding proxy nor the verifier is left running for its idle window.
+    if let Err(err) = (|| -> Result<()> {
         let mut stdin = child
             .stdin
             .take()
@@ -929,11 +973,22 @@ fn run_verify_subprocess(
         stdin
             .flush()
             .context("Failed to flush verifier input payload")?;
+        Ok(())
+    })() {
+        terminate_child(&mut child);
+        terminate_child(&mut proxy_child);
+        return Err(err);
     }
 
-    let output = child
-        .wait_with_output()
-        .context("Failed to read verifier subprocess output")?;
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(err) => {
+            // `child` is consumed by wait_with_output; only the proxy remains.
+            terminate_child(&mut proxy_child);
+            return Err(error::Error::from(err))
+                .context("Failed to read verifier subprocess output");
+        }
+    };
     terminate_child(&mut proxy_child);
     ensure_child_success("verifier", output.status)?;
     ipc::read_verification_results(output.stdout.as_slice())

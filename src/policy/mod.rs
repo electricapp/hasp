@@ -1080,10 +1080,18 @@ fn apply_provenance_partial(full: &mut ProvenanceCheckConfig, prov: &PartialProv
     apply_level(&mut full.signatures, prov.signatures, "signatures");
     apply_level(&mut full.fresh_commit, prov.fresh_commit, "fresh-commit");
     apply_level(&mut full.tag_age_gap, prov.tag_age_gap, "tag-age-gap");
-    apply_level(&mut full.repo_reputation, prov.repo_reputation, "repo-reputation");
+    apply_level(
+        &mut full.repo_reputation,
+        prov.repo_reputation,
+        "repo-reputation",
+    );
     apply_level(&mut full.recent_repo, prov.recent_repo, "recent-repo");
     apply_level(&mut full.transitive, prov.transitive, "transitive");
-    apply_level(&mut full.hidden_execution, prov.hidden_execution, "hidden-execution");
+    apply_level(
+        &mut full.hidden_execution,
+        prov.hidden_execution,
+        "hidden-execution",
+    );
     apply_level(
         &mut full.slsa_attestation,
         prov.slsa_attestation,

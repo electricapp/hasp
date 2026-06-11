@@ -13,15 +13,18 @@ fn help_and_version_exit_zero() {
 
 #[test]
 fn unknown_flag_exits_two() {
-    assert_eq!(
-        run(Path::new("/"), &["--bogus"]).status.code(),
-        Some(2)
-    );
+    assert_eq!(run(Path::new("/"), &["--bogus"]).status.code(), Some(2));
 }
 
 #[test]
 fn missing_flag_values_exit_two() {
-    for flag in &["--dir", "--min-sha-age", "--diff-base", "--policy", "--max-transitive-depth"] {
+    for flag in &[
+        "--dir",
+        "--min-sha-age",
+        "--diff-base",
+        "--policy",
+        "--max-transitive-depth",
+    ] {
         assert_eq!(
             run(Path::new("/"), &[flag]).status.code(),
             Some(2),
@@ -45,7 +48,9 @@ fn bad_duration_exits_two() {
 fn bad_transitive_depth_exits_two() {
     for bad in &["0", "11", "abc"] {
         assert_eq!(
-            run(Path::new("/"), &["--max-transitive-depth", bad]).status.code(),
+            run(Path::new("/"), &["--max-transitive-depth", bad])
+                .status
+                .code(),
             Some(2),
         );
     }
@@ -54,9 +59,16 @@ fn bad_transitive_depth_exits_two() {
 #[test]
 fn nonexistent_dir_exits_two() {
     assert_eq!(
-        run(Path::new("/"), &["--dir", "/nonexistent/path/to/workflows", "--allow-unsandboxed"])
-            .status
-            .code(),
+        run(
+            Path::new("/"),
+            &[
+                "--dir",
+                "/nonexistent/path/to/workflows",
+                "--allow-unsandboxed"
+            ]
+        )
+        .status
+        .code(),
         Some(2)
     );
 }

@@ -83,8 +83,7 @@ pub(crate) fn doctor_status() -> SandboxReport {
     {
         SandboxReport {
             available: false,
-            detail: "OS sandbox is Linux-only; use --allow-unsandboxed for development"
-                .to_string(),
+            detail: "OS sandbox is Linux-only; use --allow-unsandboxed for development".to_string(),
         }
     }
 }
@@ -219,28 +218,42 @@ fn apply_landlock_deny_reads() -> Result<()> {
 /// explicitly listed directories, and denies `ptrace`/`process_vm`. Network
 /// is handled by BPF cgroup, not seccomp, so we allow network syscalls.
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+/// Apply the exec-child filesystem/syscall sandbox to the current process so
+/// the about-to-be-spawned child inherits it.
+///
+/// `writable_dirs` get full write rights (create/write/remove beneath them).
+/// `remove_only_dirs` get *only* `RemoveDir`/`RemoveFile` — used to grant the
+/// orchestrator the ability to `rmdir` the per-sandbox cgroup directories (which
+/// live directly under these parents) during teardown, without otherwise
+/// widening write access. Landlock checks `RemoveDir` against the *parent* of
+/// the removed entry, so the parent, not the cgroup dir itself, carries the right.
 pub(crate) fn phase_exec_child(
     writable_dirs: &[std::path::PathBuf],
+    remove_only_dirs: &[std::path::PathBuf],
     allow_unsandboxed: bool,
 ) -> Result<()> {
     platform_preflight(allow_unsandboxed, true)?;
 
     #[cfg(target_os = "linux")]
     {
-        apply_landlock_exec_child(writable_dirs)?;
+        apply_landlock_exec_child(writable_dirs, remove_only_dirs)?;
         apply_seccomp_exec_child()?;
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = writable_dirs;
+        let _ = remove_only_dirs;
     }
 
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn apply_landlock_exec_child(writable_dirs: &[std::path::PathBuf]) -> Result<()> {
+fn apply_landlock_exec_child(
+    writable_dirs: &[std::path::PathBuf],
+    remove_only_dirs: &[std::path::PathBuf],
+) -> Result<()> {
     use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
 
     let write_rights = AccessFs::WriteFile
@@ -280,6 +293,24 @@ fn apply_landlock_exec_child(writable_dirs: &[std::path::PathBuf]) -> Result<()>
             .map_err(|e| format!("Landlock PathFd error for {}: {e}", path.display()))?;
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, write_rights))
+            .map_err(|e| format!("Landlock add_rule error for {}: {e}", path.display()))?;
+    }
+
+    // Remove-only parents: grant just the rights needed to delete an empty
+    // subdirectory (the per-sandbox cgroup dirs), not to create or write under
+    // them. Skips paths that don't resolve rather than failing the whole run.
+    let remove_rights = AccessFs::RemoveDir | AccessFs::RemoveFile;
+    for dir in remove_only_dirs {
+        let Ok(path) = dir.canonicalize() else {
+            continue;
+        };
+        if !path.is_dir() {
+            continue;
+        }
+        let fd = PathFd::new(&path)
+            .map_err(|e| format!("Landlock PathFd error for {}: {e}", path.display()))?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, remove_rights))
             .map_err(|e| format!("Landlock add_rule error for {}: {e}", path.display()))?;
     }
 
@@ -387,8 +418,19 @@ fn install_seccomp_filter(denied: &[u32], label: &str) -> Result<()> {
     const RET_ALLOW: u32 = 0x7FFF_0000;
     const RET_KILL: u32 = 0x8000_0000; // SECCOMP_RET_KILL_PROCESS
 
+    // On x86_64, syscalls issued through the x32 ABI report AUDIT_ARCH_X86_64
+    // but carry __X32_SYSCALL_BIT (0x4000_0000) in the syscall number. Without
+    // an explicit guard, a denied syscall (socket, connect, execve, ptrace, …)
+    // invoked as `nr | 0x4000_0000` matches no JEQ entry and falls through to
+    // RET_ALLOW, defeating the filter. We insert one extra instruction that
+    // kills any syscall with that bit set. aarch64 has no x32 ABI.
+    #[cfg(target_arch = "x86_64")]
+    const X32_GUARD: usize = 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    const X32_GUARD: usize = 0;
+
     let n = denied.len();
-    let kill_idx = 3 + n + 1;
+    let kill_idx = 3 + X32_GUARD + n + 1;
 
     if n > 250 {
         bail!("Too many denied syscalls for BPF filter: {} (max 250)", n);
@@ -405,11 +447,24 @@ fn install_seccomp_filter(denied: &[u32], label: &str) -> Result<()> {
     )); // wrong arch → kill
     filter.push(stmt(LD_ABS_W, 0)); // load syscall nr
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        const JGE_K: u16 = 0x35; // BPF_JMP | BPF_JGE | BPF_K (unsigned >=)
+        const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+        filter.push(jump(
+            JGE_K,
+            X32_SYSCALL_BIT,
+            u8::try_from(kill_idx - 4).expect("offset bounded by n ≤ 250 check"),
+            0,
+        )); // x32 syscall (high bit set) → kill
+    }
+
     for (i, &sc) in denied.iter().enumerate() {
         filter.push(jump(
             JEQ_K,
             sc,
-            u8::try_from(kill_idx - 3 - i - 1).expect("offset bounded by n ≤ 250 check"),
+            u8::try_from(kill_idx - 3 - X32_GUARD - i - 1)
+                .expect("offset bounded by n ≤ 250 check"),
             0,
         ));
     }

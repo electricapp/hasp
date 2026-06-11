@@ -9,10 +9,19 @@ fn policy_suppresses_configured_checks() {
     let dir = fixture("policy_suppress");
     let o = run(
         &dir,
-        &["--dir", "workflows", "--allow-unsandboxed", "--no-verify", "--paranoid"],
+        &[
+            "--dir",
+            "workflows",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--paranoid",
+        ],
     );
     let out = combined(&o);
-    assert!(out.contains("loaded policy"), "expected policy load log: {out}");
+    assert!(
+        out.contains("loaded policy"),
+        "expected policy load log: {out}"
+    );
     assert!(
         !out.to_lowercase().contains("expression-injection"),
         "expression-injection should be suppressed by policy: {out}"

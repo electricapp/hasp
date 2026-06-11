@@ -10,7 +10,13 @@ fn remote_reusable_workflow_is_unauditable() {
     let dir = fixture("unauditable");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = combined(&o).to_lowercase();
     assert!(
@@ -44,7 +50,13 @@ fn subpath_action_reports_path() {
     let dir = fixture("subpath");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     let out = stdout(&o);
     assert!(
@@ -79,7 +91,13 @@ fn scan_outside_git_repo_succeeds() {
     let dir = copy_fixture_outside_repo("outside_git");
     let o = run(
         &dir,
-        &["--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy"],
+        &[
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+        ],
     );
     assert_eq!(
         o.status.code(),

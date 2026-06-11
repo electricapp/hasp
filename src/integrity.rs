@@ -3,6 +3,10 @@ use sha1::{Digest, Sha1};
 use std::fmt::Write;
 use std::path::Path;
 
+/// Env var carrying the committed workflow hashes from the launcher to the scan
+/// subprocess (which cannot run git itself — execve is denied by its sandbox).
+pub(crate) const INTEGRITY_HASHES_ENV: &str = "HASP_INTEGRITY_HASHES";
+
 /// Check that every `.yml`/`.yaml` file in `dir` matches the content recorded
 /// by git.  If any file's on-disk content has been modified after `git checkout`
 /// (e.g. by a prior CI step injecting malicious workflow content), this returns
@@ -14,24 +18,38 @@ use std::path::Path;
 /// However, if a `.git` directory exists (indicating this *is* a repo) but
 /// `git ls-tree` fails, that is suspicious and we fail closed rather than
 /// silently passing.
+/// Convenience wrapper: compute and verify in one call. Production code splits
+/// these (see `expected_workflow_hashes` + `verify_entries`) so the same hashes
+/// can also be handed to the scan subprocess; kept here for tests.
+#[cfg(test)]
 pub(crate) fn check_workflow_integrity(dir: &Path) -> Result<()> {
-    let entries = match git_ls_files_stage(dir) {
-        Ok(entries) if entries.is_empty() => return Ok(()),
-        Ok(entries) => entries,
-        Err(e) => {
-            // If .git doesn't exist anywhere in the directory ancestry,
-            // this genuinely isn't a git repo — skip silently.
-            if !has_git_dir(dir) {
-                return Ok(());
-            }
-            // .git exists but git ls-files failed — fail closed.
-            return Err(e);
-        }
-    };
+    expected_workflow_hashes(dir)?.map_or(Ok(()), |entries| verify_entries(dir, &entries))
+}
 
+/// Return the committed (`HEAD`) blob hashes for every `.yml`/`.yaml` file under
+/// `dir`, or `None` when `dir` is not inside a git repository (in which case the
+/// integrity check is skipped as defense-in-depth, not a hard requirement).
+///
+/// Fails closed when a `.git` directory exists but `git ls-tree` errors.
+pub(crate) fn expected_workflow_hashes(dir: &Path) -> Result<Option<Vec<GitStageEntry>>> {
+    match git_ls_files_stage(dir) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(e) => {
+            // If .git doesn't exist anywhere in the directory ancestry, this
+            // genuinely isn't a git repo — skip silently.
+            if has_git_dir(dir) { Err(e) } else { Ok(None) }
+        }
+    }
+}
+
+/// Verify that each committed entry's on-disk content still matches `HEAD`.
+/// This is the *launcher-side* pre-check; the scanner subprocess additionally
+/// verifies the exact bytes it scans (see `scanner`) to close the TOCTOU window
+/// between this read and the scan's read.
+pub(crate) fn verify_entries(dir: &Path, entries: &[GitStageEntry]) -> Result<()> {
     let mut mismatches: Vec<String> = Vec::new();
 
-    for entry in &entries {
+    for entry in entries {
         let file_path = dir.join(&entry.path);
 
         let content = match std::fs::read(&file_path) {
@@ -43,12 +61,12 @@ pub(crate) fn check_workflow_integrity(dir: &Path) -> Result<()> {
             }
         };
 
-        let disk_hash = git_blob_hash(&content);
-
-        if disk_hash != entry.blob_hash {
+        if git_blob_hash(&content) != entry.blob_hash {
             mismatches.push(format!(
                 "  {} (git: {}, disk: {})",
-                entry.path, entry.blob_hash, disk_hash
+                entry.path,
+                entry.blob_hash,
+                git_blob_hash(&content)
             ));
         }
     }
@@ -65,6 +83,48 @@ pub(crate) fn check_workflow_integrity(dir: &Path) -> Result<()> {
          This may indicate a prior CI step tampered with workflow files after checkout.\n\
          Pass --allow-unsandboxed to skip this check (development only)."
     );
+}
+
+/// Serialize expected hashes for transport to the scan subprocess (env var).
+/// Each entry is `<blob_hash>:<hex(path)>`, joined by `;`. Hex-encoding the path
+/// keeps the format unambiguous regardless of bytes in the filename.
+pub(crate) fn encode_expected_hashes(entries: &[GitStageEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        if !out.is_empty() {
+            out.push(';');
+        }
+        out.push_str(&entry.blob_hash);
+        out.push(':');
+        for b in entry.path.as_bytes() {
+            let _ = write!(out, "{b:02x}");
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_expected_hashes`]. Lenient: malformed entries are skipped
+/// (the launcher-side check already ran, so this only *adds* verification).
+pub(crate) fn decode_expected_hashes(s: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for entry in s.split(';').filter(|e| !e.is_empty()) {
+        let Some((hash, hex_path)) = entry.split_once(':') else {
+            continue;
+        };
+        if hex_path.len() % 2 != 0 {
+            continue;
+        }
+        let bytes: Option<Vec<u8>> = (0..hex_path.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex_path[i..i + 2], 16).ok())
+            .collect();
+        if let Some(bytes) = bytes
+            && let Ok(path) = String::from_utf8(bytes)
+        {
+            map.insert(path, hash.to_string());
+        }
+    }
+    map
 }
 
 /// Walk up from `dir` to check whether a `.git` directory (or file, for
@@ -92,7 +152,7 @@ fn has_git_dir(dir: &Path) -> bool {
 }
 
 /// A single blob entry from the committed `HEAD` tree.
-struct GitStageEntry {
+pub(crate) struct GitStageEntry {
     blob_hash: String,
     path: String,
 }
@@ -116,6 +176,12 @@ fn git_ls_files_stage(dir: &Path) -> Result<Vec<GitStageEntry>> {
         .arg(dir)
         .arg("ls-tree")
         .arg("-r")
+        // -z: NUL-terminated records with *unquoted* paths. Without it, git
+        // C-quotes any path containing non-ASCII/`"`/`\` bytes (e.g.
+        // `"d\303\251ploy.yml"`), which would defeat the `.yml` extension check
+        // and break `dir.join(path)` — silently skipping integrity checks for
+        // workflows with such names (a fail-open hole).
+        .arg("-z")
         .arg("HEAD")
         .arg("--")
         .arg(".")
@@ -133,9 +199,9 @@ fn git_ls_files_stage(dir: &Path) -> Result<Vec<GitStageEntry>> {
 
     let mut entries = Vec::new();
 
-    for line in stdout.lines() {
-        // Format: "<mode> <type> <hash>\t<path>"
-        let Some((meta, path)) = line.split_once('\t') else {
+    for record in stdout.split('\0').filter(|r| !r.is_empty()) {
+        // Format: "<mode> <type> <hash>\t<path>" (path unquoted thanks to -z).
+        let Some((meta, path)) = record.split_once('\t') else {
             continue;
         };
 
@@ -167,7 +233,7 @@ fn git_ls_files_stage(dir: &Path) -> Result<Vec<GitStageEntry>> {
 
 /// Compute the SHA-1 hash of content using git's blob format:
 /// `blob <size>\0<content>`
-fn git_blob_hash(content: &[u8]) -> String {
+pub(crate) fn git_blob_hash(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha1::new();
     hasher.update(header.as_bytes());
@@ -204,8 +270,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("hasp-integrity-{tag}-{}-{nanos}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "hasp-integrity-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(path.join(".github/workflows")).expect("mkdir temp repo");
         git(&path, &["init", "-q"]);
         path
@@ -272,5 +340,39 @@ mod tests {
             hash, "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
             "git blob hash of empty content should match git's empty blob"
         );
+    }
+
+    #[test]
+    fn expected_hashes_encode_decode_round_trips() {
+        let entries = vec![
+            GitStageEntry {
+                blob_hash: "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0".into(),
+                path: "ci.yml".into(),
+            },
+            GitStageEntry {
+                // Non-ASCII filename: the hex path encoding must survive it.
+                blob_hash: "95d09f2b10159347eece71399a7e2e907ea3df4f".into(),
+                path: "déploy.yaml".into(),
+            },
+        ];
+        let encoded = encode_expected_hashes(&entries);
+        let decoded = decode_expected_hashes(&encoded);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            decoded.get("ci.yml").map(String::as_str),
+            Some("b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0")
+        );
+        assert_eq!(
+            decoded.get("déploy.yaml").map(String::as_str),
+            Some("95d09f2b10159347eece71399a7e2e907ea3df4f")
+        );
+    }
+
+    #[test]
+    fn decode_expected_hashes_skips_malformed_entries() {
+        // No panic, and well-formed entries still decode.
+        let decoded = decode_expected_hashes("nocolon;deadbeef:zz;abc:6369");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.get("ci").map(String::as_str), Some("abc"));
     }
 }

@@ -30,21 +30,25 @@ jobs:
 
     let o = run(
         &repo,
-        &[
-            "tree",
-            "--dir",
-            ".github/workflows",
-            "--allow-unsandboxed",
-        ],
+        &["tree", "--dir", ".github/workflows", "--allow-unsandboxed"],
     );
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
-    assert!(out.contains("ci.yml"), "ASCII tree should name the workflow: {out}");
+    assert!(
+        out.contains("ci.yml"),
+        "ASCII tree should name the workflow: {out}"
+    );
     assert!(
         out.contains("actions/checkout"),
         "ASCII tree should list the pinned action: {out}"
     );
-    assert!(out.contains("score:"), "ASCII tree should emit scores: {out}");
-    assert!(out.contains("[pinned]"), "ASCII tree should tag pinned refs: {out}");
+    assert!(
+        out.contains("score:"),
+        "ASCII tree should emit scores: {out}"
+    );
+    assert!(
+        out.contains("[pinned]"),
+        "ASCII tree should tag pinned refs: {out}"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }
 

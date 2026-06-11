@@ -123,8 +123,7 @@ fn check_provenance_with_api_at(
                     eprintln!(
                         "hasp: warning: SLSA attestation lookup failed for {}@{}: {e}",
                         result.action_ref.target(),
-                        &result.action_ref.ref_str
-                            [..result.action_ref.ref_str.len().min(12)]
+                        &result.action_ref.ref_str[..result.action_ref.ref_str.len().min(12)]
                     );
                     SlsaCheckOutcome::FetchFailed
                 }
@@ -403,9 +402,7 @@ fn check_provenance_with_api_at(
                     findings.push(AuditFinding {
                         file: result.action_ref.file.clone(),
                         severity: Severity::Medium,
-                        title: format!(
-                            "SLSA attestation for {target} could not be parsed"
-                        ),
+                        title: format!("SLSA attestation for {target} could not be parsed"),
                         detail: format!(
                             "GitHub returned an attestation bundle for \
                              {short_sha} in {target} but we couldn't parse it: \
@@ -420,9 +417,7 @@ fn check_provenance_with_api_at(
                     findings.push(AuditFinding {
                         file: result.action_ref.file.clone(),
                         severity: Severity::Medium,
-                        title: format!(
-                            "No SLSA attestation published for {target}"
-                        ),
+                        title: format!("No SLSA attestation published for {target}"),
                         detail: format!(
                             "GitHub has no build attestation for commit {short_sha} in \
                              {target}. SLSA attestations provide positive evidence that \
@@ -459,15 +454,19 @@ fn emit_slsa_finding(
             issuer_cn,
             subject_uri,
         } => findings.push(slsa_untrusted_issuer_finding(
-            &file, target, issuer_cn, subject_uri.as_deref(), is_warning,
+            &file,
+            target,
+            issuer_cn,
+            subject_uri.as_deref(),
+            is_warning,
         )),
         AttestationVerdict::SignatureInvalid { reason } => findings.push(
             // Invalid signature is tampering evidence; force deny.
             slsa_signature_invalid_finding(&file, target, short_sha, reason, false),
         ),
-        AttestationVerdict::ChainInvalid { reason } => findings.push(
-            slsa_chain_invalid_finding(&file, target, short_sha, reason, is_warning),
-        ),
+        AttestationVerdict::ChainInvalid { reason } => findings.push(slsa_chain_invalid_finding(
+            &file, target, short_sha, reason, is_warning,
+        )),
         AttestationVerdict::SubjectMismatch { observed, .. } => findings.push(
             // Tampered binding always denies, regardless of policy level.
             slsa_subject_mismatch_finding(&file, target, short_sha, observed, false),
@@ -478,9 +477,9 @@ fn emit_slsa_finding(
         AttestationVerdict::UnknownPredicate { predicate_type } => findings.push(
             slsa_unknown_predicate_finding(&file, target, short_sha, predicate_type, is_warning),
         ),
-        AttestationVerdict::MalformedAttestation(msg) => findings.push(
-            slsa_malformed_finding(&file, target, short_sha, msg, is_warning),
-        ),
+        AttestationVerdict::MalformedAttestation(msg) => findings.push(slsa_malformed_finding(
+            &file, target, short_sha, msg, is_warning,
+        )),
     }
 }
 
@@ -622,9 +621,7 @@ fn slsa_malformed_finding(
         file: file.to_path_buf(),
         severity: Severity::Medium,
         title: format!("SLSA attestation for {target} is malformed"),
-        detail: format!(
-            "Attestation bundle for {short_sha} could not be validated: {msg}."
-        ),
+        detail: format!("Attestation bundle for {short_sha} could not be validated: {msg}."),
         is_warning,
     }
 }

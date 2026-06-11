@@ -142,10 +142,9 @@ impl SubPattern {
         // Find the first colon after the repo portion. But the repo itself may
         // be `org/repo` with no colon; just split on the first ':' after the
         // initial `repo:` prefix.
-        let (repo_str, rest) = rest.find(':').map_or(
-            (rest, None),
-            |idx| (&rest[..idx], Some(&rest[idx + 1..])),
-        );
+        let (repo_str, rest) = rest
+            .find(':')
+            .map_or((rest, None), |idx| (&rest[..idx], Some(&rest[idx + 1..])));
 
         let repo = GlobToken::new(repo_str);
 
@@ -169,10 +168,9 @@ impl SubPattern {
         }
 
         // Split kind/value on first colon.
-        let (kind_str, value_str) = rest.find(':').map_or(
-            (rest, None),
-            |idx| (&rest[..idx], Some(&rest[idx + 1..])),
-        );
+        let (kind_str, value_str) = rest
+            .find(':')
+            .map_or((rest, None), |idx| (&rest[..idx], Some(&rest[idx + 1..])));
         let kind = match kind_str {
             "ref" => SubKind::Ref,
             "environment" => SubKind::Environment,
@@ -195,8 +193,8 @@ pub(crate) fn load_trust_policy(
     provider: OidcProvider,
     path: &Path,
 ) -> Result<Vec<OidcAcceptance>> {
-    let meta = std::fs::metadata(path)
-        .context(format!("Cannot stat OIDC policy {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).context(format!("Cannot stat OIDC policy {}", path.display()))?;
     if meta.len() > MAX_POLICY_BYTES {
         bail!(
             "OIDC policy file {} is too large ({} bytes, max {} bytes)",
@@ -211,10 +209,10 @@ pub(crate) fn load_trust_policy(
     // yaml-rust2 parses JSON as a degenerate YAML 1.2 flow document.
     let docs = YamlLoader::load_from_str(&text)
         .context(format!("Invalid JSON/YAML in {}", path.display()))?;
-    let doc = docs.into_iter().next().context(format!(
-        "Empty policy document in {}",
-        path.display()
-    ))?;
+    let doc = docs
+        .into_iter()
+        .next()
+        .context(format!("Empty policy document in {}", path.display()))?;
 
     match provider {
         OidcProvider::Aws => aws::parse(&doc, path),
@@ -315,7 +313,10 @@ mod tests {
         let s = SubPattern::parse("repo:my-org/my-repo:ref:refs/heads/main").unwrap();
         assert_eq!(s.repo.raw, "my-org/my-repo");
         assert_eq!(s.kind, SubKind::Ref);
-        assert_eq!(s.value.as_ref().map(|g| g.raw.as_str()), Some("refs/heads/main"));
+        assert_eq!(
+            s.value.as_ref().map(|g| g.raw.as_str()),
+            Some("refs/heads/main")
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use crate::audit::{AuditFinding, Severity};
 use crate::error::{Context, Result, bail};
 use crate::git_util;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -95,8 +95,11 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
 
     // Short-circuit when base resolves to the same SHA as HEAD: nothing to
     // diff, and re-running an identical scan against itself is pointless.
+    // BUT only when the working tree is clean for the workflow dir — the "head"
+    // scan scans the *working tree*, not the HEAD commit, so with uncommitted
+    // edits the two scans differ and skipping would hide new findings.
     let head_sha = git_util::resolve_ref_sha(&repo_root, "HEAD").ok();
-    if head_sha.as_deref() == Some(base_sha.as_str()) {
+    if head_sha.as_deref() == Some(base_sha.as_str()) && worktree_is_clean(&canonical_dir) {
         let empty = DeltaReport {
             base,
             new: Vec::new(),
@@ -107,8 +110,7 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
         return Ok(());
     }
 
-    let exe =
-        std::env::current_exe().context("Cannot resolve current executable path")?;
+    let exe = std::env::current_exe().context("Cannot resolve current executable path")?;
 
     // HEAD scan in a sandboxed --internal-scan subprocess.
     let mut head_findings = run_internal_scan(&exe, &canonical_dir, args)?.audit_findings;
@@ -180,29 +182,62 @@ fn strip_scan_root(findings: &mut [AuditFinding], scan_root: &Path) {
     }
 }
 
+/// True if the working tree has no uncommitted changes (staged or unstaged) for
+/// `dir`. Conservative: any git error returns `false`, so the caller falls back
+/// to a full scan rather than risk skipping uncommitted edits.
+fn worktree_is_clean(dir: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--")
+        .arg(".")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && output.stdout.is_empty()
+}
 
 fn compute_delta(
     base_ref: &str,
     base_findings: &[AuditFinding],
     head_findings: &[AuditFinding],
 ) -> DeltaReport {
-    let base_keys: HashSet<FindingKey<'_>> = base_findings.iter().map(FindingKey::from).collect();
-    let head_keys: HashSet<FindingKey<'_>> = head_findings.iter().map(FindingKey::from).collect();
+    // Multiset diff: identical findings can legitimately recur (e.g. two
+    // unnamed steps with the same injectable expression produce byte-identical
+    // findings). Set semantics would fold a newly-added duplicate into
+    // "unchanged" and never flag it — a fail-open in PR-gating. Count instead.
+    let mut base_remaining: HashMap<FindingKey<'_>, usize> = HashMap::new();
+    for f in base_findings {
+        *base_remaining.entry(FindingKey::from(f)).or_default() += 1;
+    }
 
     let mut new = Vec::new();
     let mut unchanged_count = 0_usize;
     for f in head_findings {
-        if base_keys.contains(&FindingKey::from(f)) {
-            unchanged_count += 1;
-        } else {
-            new.push(f.clone());
+        match base_remaining.get_mut(&FindingKey::from(f)) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                unchanged_count += 1;
+            }
+            _ => new.push(f.clone()),
         }
+    }
+
+    let mut head_remaining: HashMap<FindingKey<'_>, usize> = HashMap::new();
+    for f in head_findings {
+        *head_remaining.entry(FindingKey::from(f)).or_default() += 1;
     }
 
     let mut fixed = Vec::new();
     for f in base_findings {
-        if !head_keys.contains(&FindingKey::from(f)) {
-            fixed.push(f.clone());
+        match head_remaining.get_mut(&FindingKey::from(f)) {
+            Some(remaining) if *remaining > 0 => *remaining -= 1,
+            _ => fixed.push(f.clone()),
         }
     }
 
@@ -680,20 +715,61 @@ fn clear_cleanup_path() {
     }
 }
 
+// Self-pipe trick: the signal handler must be async-signal-safe, but worktree
+// cleanup spawns `git` and allocates (neither is safe in signal context). So
+// the handler only does an async-signal-safe `write(2)` of the signal number to
+// this pipe; a dedicated thread reads it and runs the real cleanup outside
+// signal context, then exits the process.
+#[cfg(unix)]
+static SIGNAL_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static SIGNAL_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(unix)]
 fn install_signal_cleanup_once() {
     use std::sync::Once;
+    use std::sync::atomic::Ordering;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        // SAFETY: pipe() fills a 2-element array we own.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if rc != 0 {
+            // Couldn't create the pipe — fall back to Drop-on-unwind cleanup
+            // only (don't install a handler that can't signal its worker).
+            return;
+        }
+        let [read_fd, write_fd] = fds;
+        SIGNAL_PIPE_WRITE.store(write_fd, Ordering::SeqCst);
+
+        // Worker thread: blocks until the handler writes, then does the
+        // allocating/process-spawning cleanup safely and exits the process.
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 1];
+            // SAFETY: read up to one byte into a buffer we own from our pipe.
+            #[allow(unsafe_code)]
+            let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+            let sig = if n == 1 {
+                libc::c_int::from(buf[0])
+            } else {
+                libc::SIGINT
+            };
+            if CLEANUP_ACTIVE.load(Ordering::SeqCst)
+                && let Ok(guard) = CLEANUP_TARGET.lock()
+                && let Some((path, parent, repo_root)) = guard.as_ref()
+            {
+                cleanup_worktree(path, repo_root);
+                let _ = std::fs::remove_dir(parent);
+            }
+            std::process::exit(128 + sig);
+        });
+
         // The fn-pointer-to-usize cast is the only way to pass an
-        // `extern "C" fn` to libc's untyped `sighandler_t`. clippy's
-        // fn_to_numeric_cast_any lint targets accidental casts in
-        // arithmetic; this is a documented FFI shim.
+        // `extern "C" fn` to libc's untyped `sighandler_t`.
         #[allow(clippy::fn_to_numeric_cast_any)]
         let handler: libc::sighandler_t = signal_handler as *const () as usize;
         // SAFETY: `signal(2)` only mutates per-process disposition flags.
-        // The handler itself is async-signal-safe: it only uses try_lock
-        // (never blocks) and `_exit` (async-signal-safe).
         #[allow(unsafe_code)]
         unsafe {
             libc::signal(libc::SIGINT, handler);
@@ -709,18 +785,37 @@ const fn install_signal_cleanup_once() {
 
 #[cfg(unix)]
 extern "C" fn signal_handler(sig: libc::c_int) {
-    if CLEANUP_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-        && let Ok(guard) = CLEANUP_TARGET.try_lock()
-        && let Some((path, parent, repo_root)) = guard.as_ref()
-    {
-        cleanup_worktree(path, repo_root);
-        let _ = std::fs::remove_dir(parent);
+    use std::sync::atomic::Ordering;
+    // A second signal means the worker may be wedged (e.g. `git` hung) — bail
+    // hard with the async-signal-safe `_exit`, accepting a possible leftover
+    // worktree over an unkillable process.
+    if SIGNAL_FIRED.swap(true, Ordering::SeqCst) {
+        // SAFETY: `_exit` is async-signal-safe.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::_exit(128 + sig);
+        }
     }
-    // SAFETY: `_exit` is async-signal-safe and immediately terminates the
-    // process. 128 + signo follows the POSIX shell convention.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::_exit(128 + sig);
+    // First signal: hand off to the worker thread via the self-pipe. write(2)
+    // is async-signal-safe; everything unsafe in cleanup happens in the worker.
+    let fd = SIGNAL_PIPE_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = [u8::try_from(sig & 0xff).unwrap_or(0)];
+        // SAFETY: write one byte to a pipe fd we own; async-signal-safe.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = libc::write(fd, byte.as_ptr().cast(), 1);
+        }
+    }
+    // Don't let the interrupted code resume; the worker will exit the process.
+    // pause() is async-signal-safe. A second signal re-enters and `_exit`s.
+    #[allow(clippy::infinite_loop)]
+    loop {
+        // SAFETY: pause() merely waits for a signal.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::pause();
+        }
     }
 }
 

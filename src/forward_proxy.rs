@@ -18,10 +18,16 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 const MAX_CONNECTIONS: u32 = 10_000;
 const MAX_AUTH_FAILURES: u32 = 5;
-/// Proxy exits if no connection arrives within this window. Prevents
-/// orphaned proxies (e.g. orchestrator OOM-killed) from holding the
-/// secret in memory indefinitely.
-const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
+/// How long to wait per `poll` tick before re-checking liveness deadlines.
+const ACCEPT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+/// Backstop idle timeout. Orphan cleanup is primarily driven by parent-process
+/// liveness (see `run_internal`): when the orchestrator exits, this process is
+/// reparented and `getppid()` changes, so we shut down promptly *without*
+/// false-positiving on a legitimate build step that simply makes no network
+/// call for a while. This idle timer only catches the pathological case where
+/// reparenting is not observable; it is deliberately long so a slow-but-alive
+/// step is never killed out from under itself.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Run as `hasp --internal-forward-proxy`. Reads configuration from env vars,
 /// binds to an ephemeral localhost port, and announces readiness on stdout.
@@ -87,43 +93,67 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
             .context("Failed to flush forward proxy ready line")?;
     }
 
-    // Set accept timeout so the proxy exits if the orchestrator dies and
-    // no more requests arrive. Without this, an orphaned proxy holds the
-    // secret in memory and accepts loopback connections indefinitely.
+    // Non-blocking listener so we can wait via poll(2) and re-check liveness
+    // between connections (TcpListener has no native accept timeout).
     listener
         .set_nonblocking(true)
         .context("Failed to set listener non-blocking mode")?;
+
+    // Orphan detection: the orchestrator holds the secret's lifecycle and kills
+    // this proxy when the step finishes. If the orchestrator instead dies (e.g.
+    // OOM-killed), this process is reparented and getppid() changes — that, not
+    // an idle timer, is our primary "the parent is gone, stop holding the
+    // secret" signal, so a long-but-alive step is never killed mid-flight.
+    // SAFETY: getppid() takes no arguments and always succeeds.
+    #[allow(unsafe_code)]
+    let orig_ppid = unsafe { libc::getppid() };
 
     let mut total_connections = 0_u32;
     let mut auth_failures = 0_u32;
     let mut last_activity = std::time::Instant::now();
     loop {
-        // Use a short accept timeout and check idle deadline between accepts.
-        // TcpListener doesn't have set_timeout, so we poll with non-blocking
-        // accepts and sleep briefly between checks.
-        let stream = match listener.accept() {
+        // Wait for a pending connection. poll(2) wakes immediately when one
+        // arrives (no per-request latency) and lets us re-check liveness on a
+        // timeout tick without busy-waiting.
+        if !wait_for_connection(&listener, ACCEPT_TICK)? {
+            // SAFETY: getppid() takes no arguments and always succeeds.
+            #[allow(unsafe_code)]
+            let ppid = unsafe { libc::getppid() };
+            if ppid != orig_ppid {
+                eprintln!("hasp forward-proxy: orchestrator exited, shutting down");
+                return Ok(());
+            }
+            if last_activity.elapsed() > IDLE_TIMEOUT {
+                eprintln!("hasp forward-proxy: idle backstop reached, shutting down");
+                return Ok(());
+            }
+            continue;
+        }
+
+        let mut stream = match listener.accept() {
             Ok((s, _)) => {
                 last_activity = std::time::Instant::now();
                 s
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if last_activity.elapsed() > IDLE_TIMEOUT {
-                    eprintln!("hasp forward-proxy: idle timeout, shutting down");
-                    return Ok(());
+            // A client that connected then reset surfaces as a spurious wakeup
+            // (WouldBlock) or a transient accept error (ECONNABORTED/EINTR).
+            // None of these are fatal — skip the connection and keep serving.
+            // The idle/parent-liveness checks above backstop a wedged listener.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => {
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+                ) {
+                    eprintln!("hasp forward-proxy: accept error (continuing): {e}");
                 }
-                // Brief sleep to avoid busy-wait. The proxy is I/O bound anyway.
-                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            Err(e) => {
-                return Err(crate::error::Error::from(e)).context("Accept failed");
-            }
         };
-        // Switch accepted stream back to blocking for request handling
+        // Switch accepted stream back to blocking for request handling.
         stream
             .set_nonblocking(false)
             .context("Failed to set stream blocking mode")?;
-        let mut stream = stream;
         total_connections += 1;
         if total_connections > MAX_CONNECTIONS {
             let _ = write_http_error(&mut stream, 503, "Connection limit exceeded");
@@ -140,8 +170,11 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
             .set_write_timeout(Some(std::time::Duration::from_mins(1)))
             .context("Failed to set write timeout")?;
 
-        // Only accept loopback clients
-        let peer = stream.peer_addr().context("Failed to get peer addr")?;
+        // Only accept loopback clients. A reset between accept and peer_addr
+        // surfaces as an error here — skip the connection rather than abort.
+        let Ok(peer) = stream.peer_addr() else {
+            continue;
+        };
         if !peer.ip().is_loopback() {
             let _ = write_http_error(&mut stream, 403, "Only loopback clients allowed");
             continue;
@@ -158,18 +191,48 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
             &tls_config,
         ) {
             Ok(()) => {}
-            Err(ref err) if err.msg().contains("authentication failed") => {
+            // Match only the proxy's *own* auth-failure marker, not arbitrary
+            // upstream errors that happen to mention authentication.
+            Err(ref err) if err.msg().contains("Forward proxy authentication failed") => {
                 auth_failures += 1;
                 // Truncate error to avoid leaking internals to client
                 let _ = write_http_error(&mut stream, 403, "Authentication failed");
             }
             Err(ref err) => {
                 eprintln!("hasp forward-proxy: request error: {err}");
-                // Send generic error to client — never leak internal error chains
+                // handle_request only returns Err *before* any response byte is
+                // written to the client, so a clean 502 cannot corrupt a
+                // partially-forwarded response.
                 let _ = write_http_error(&mut stream, 502, "Proxy error");
             }
         }
     }
+}
+
+/// Wait up to `timeout` for `listener` to have a pending connection. Returns
+/// `true` if a connection may be ready to accept, `false` on timeout. Uses
+/// poll(2) so there is neither the latency nor the CPU cost of sleep-polling.
+fn wait_for_connection(listener: &TcpListener, timeout: std::time::Duration) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: poll() reads/writes exactly the one pollfd we own for this call.
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        // EINTR: treat as a timeout; the caller re-checks deadlines and retries.
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(crate::error::Error::from(err))
+            .context("poll on forward proxy listener failed");
+    }
+    Ok(ret > 0)
 }
 
 /// Parse readiness line from a forward proxy subprocess.
@@ -255,16 +318,16 @@ fn handle_request(
         Vec::new()
     };
 
-    // Use a pre-resolved upstream address for the *requested* host — never
+    // Use the pre-resolved upstream addresses for the *requested* host — never
     // re-resolve DNS. Eliminates DNS rebinding between pre-resolution and
     // request time, and ensures a multi-domain grant dials the IP that belongs
     // to this request's host rather than whichever domain sorted first. The
     // BPF cgroup on this proxy already only allows these IPs.
-    let upstream_addr = upstream_map
+    let upstream_addrs = upstream_map
         .iter()
         .find(|(domain, _)| domain.eq_ignore_ascii_case(host_domain))
-        .and_then(|(_, addrs)| addrs.first())
-        .copied()
+        .map(|(_, addrs)| addrs.as_slice())
+        .filter(|addrs| !addrs.is_empty())
         .context("No pre-resolved upstream addresses for the requested host")?;
 
     let server_name = rustls::pki_types::ServerName::try_from(host_domain.to_string())
@@ -272,8 +335,24 @@ fn handle_request(
     let mut tls_conn = rustls::ClientConnection::new(Arc::clone(tls_config), server_name)
         .map_err(|e| format!("TLS connection setup failed: {e}"))?;
 
-    let mut tcp = TcpStream::connect(upstream_addr)
-        .context(format!("Failed to connect to upstream {upstream_addr}"))?;
+    // Try each pre-resolved address in turn so a single dead anycast/rotation
+    // member doesn't fail an otherwise-serviceable request. All candidates are
+    // already in the BPF allowlist.
+    let mut tcp = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in upstream_addrs {
+        match TcpStream::connect(addr) {
+            Ok(s) => {
+                tcp = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let Some(mut tcp) = tcp else {
+        let err = last_err.map_or_else(|| "no upstream addresses".to_string(), |e| e.to_string());
+        bail!("Failed to connect to any upstream for {host_domain}: {err}");
+    };
     tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .context("Failed to set upstream read timeout")?;
     tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))
@@ -335,7 +414,10 @@ fn handle_request(
         write!(tls_stream, "{name}: {value}\r\n").context("Failed to write upstream header")?;
     }
 
-    if !body.is_empty() {
+    // Emit Content-Length whenever there is a body, or when the client sent one
+    // explicitly (including `Content-Length: 0` on a body-less POST/PUT, which
+    // some upstreams require — dropping it yields a spurious 411 Length Required).
+    if !body.is_empty() || req.has_content_length {
         write!(tls_stream, "Content-Length: {}\r\n", body.len())
             .context("Failed to write Content-Length")?;
     }
@@ -351,24 +433,52 @@ fn handle_request(
 
     // Stream response back to client through a fixed-size copy buffer.
     // Cap total bytes to prevent OOM from a malicious/broken upstream.
+    //
+    // Once the first response byte has been forwarded we are committed to this
+    // byte stream: splicing an HTTP error onto it (or appending a second
+    // response) would corrupt it. So after `response_started`, any further
+    // problem is logged and we simply stop — the client sees a (possibly
+    // truncated) but uncorrupted response, never a 502 glued onto the body.
     let mut total_forwarded = 0_u64;
+    let mut response_started = false;
     let mut copy_buf = [0_u8; 16 * 1024]; // 16 KiB streaming buffer
     loop {
-        let n = tls_stream
-            .read(&mut copy_buf)
-            .context("Failed to read upstream response")?;
+        let n = match tls_stream.read(&mut copy_buf) {
+            Ok(n) => n,
+            // rustls returns UnexpectedEof when the server closes the TCP
+            // connection without a TLS close_notify (common for load balancers
+            // and many origins). The response is complete; treat it as EOF
+            // rather than an error so we don't append a bogus 502.
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                if response_started {
+                    eprintln!(
+                        "hasp forward-proxy: upstream read error after {total_forwarded} bytes: {e}"
+                    );
+                    break;
+                }
+                return Err(crate::error::Error::from(e))
+                    .context("Failed to read upstream response");
+            }
+        };
         if n == 0 {
             break;
         }
         total_forwarded += n as u64;
         if total_forwarded > MAX_RESPONSE_BYTES {
-            bail!("Upstream response exceeded {} bytes", MAX_RESPONSE_BYTES);
+            // Already streaming — can't cleanly signal an error, so truncate.
+            eprintln!(
+                "hasp forward-proxy: upstream response exceeded {MAX_RESPONSE_BYTES} bytes, truncating"
+            );
+            break;
         }
-        client
-            .write_all(&copy_buf[..n])
-            .context("Failed to forward response to client")?;
+        if client.write_all(&copy_buf[..n]).is_err() {
+            // Client hung up mid-response; nothing left to salvage.
+            return Ok(());
+        }
+        response_started = true;
     }
-    client.flush().context("Failed to flush client response")?;
+    client.flush().ok();
 
     Ok(())
 }
@@ -380,6 +490,7 @@ struct HttpRequest {
     host: String,
     headers: Vec<(String, String)>,
     content_length: usize,
+    has_content_length: bool,
 }
 
 /// Parse HTTP/1.1 request line + headers.
@@ -403,6 +514,7 @@ fn parse_http_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest> 
         host: parsed.host,
         headers: parsed.headers,
         content_length: parsed.content_length,
+        has_content_length: parsed.has_content_length,
     })
 }
 
@@ -471,6 +583,7 @@ struct ParsedHeaders {
     headers: Vec<(String, String)>,
     host: String,
     content_length: usize,
+    has_content_length: bool,
 }
 
 /// Read HTTP headers up to the blank line that ends them.
@@ -481,6 +594,7 @@ fn parse_headers(
     let mut headers = Vec::with_capacity(32);
     let mut host = String::new();
     let mut content_length = 0_usize;
+    let mut has_content_length = false;
 
     loop {
         if headers.len() >= MAX_REQUEST_HEADERS {
@@ -516,6 +630,7 @@ fn parse_headers(
                 content_length = value.parse().map_err(|_| {
                     crate::error::Error::new(format!("Invalid Content-Length header: `{value}`"))
                 })?;
+                has_content_length = true;
             }
             if name.eq_ignore_ascii_case("transfer-encoding") {
                 // We only support Content-Length framing. A chunked body would
@@ -530,6 +645,7 @@ fn parse_headers(
         headers,
         host,
         content_length,
+        has_content_length,
     })
 }
 
@@ -762,7 +878,8 @@ mod tests {
 
     #[test]
     fn upstream_map_round_trips_multiple_domains() {
-        let raw = "api.github.com=140.82.121.6:443;140.82.121.5:443|uploads.github.com=140.82.121.9:443";
+        let raw =
+            "api.github.com=140.82.121.6:443;140.82.121.5:443|uploads.github.com=140.82.121.9:443";
         let map = parse_upstream_map_str(raw).unwrap();
         assert_eq!(map.len(), 2);
         assert_eq!(map[0].0, "api.github.com");
@@ -778,10 +895,8 @@ mod tests {
     fn upstream_map_selects_addr_for_requested_host() {
         // Regression: a request to the second domain must dial that domain's
         // IP, not whichever domain happened to be listed first.
-        let map = parse_upstream_map_str(
-            "a.example.com=10.0.0.1:443|b.example.com=10.0.0.2:443",
-        )
-        .unwrap();
+        let map = parse_upstream_map_str("a.example.com=10.0.0.1:443|b.example.com=10.0.0.2:443")
+            .unwrap();
         let pick = |host: &str| {
             map.iter()
                 .find(|(d, _)| d.eq_ignore_ascii_case(host))

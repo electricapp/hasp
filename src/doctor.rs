@@ -155,7 +155,10 @@ fn load_token(args: &Args) -> Result<Option<(&'static str, SecureToken)>> {
         return Ok(Some(("--token-file", SecureToken::from_file(path)?)));
     }
     if std::env::var_os("GITHUB_TOKEN").is_some() {
-        return Ok(Some(("GITHUB_TOKEN", SecureToken::from_env("GITHUB_TOKEN")?)));
+        return Ok(Some((
+            "GITHUB_TOKEN",
+            SecureToken::from_env("GITHUB_TOKEN")?,
+        )));
     }
     Ok(None)
 }

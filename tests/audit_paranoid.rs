@@ -11,7 +11,12 @@ fn paranoid_finds_multiple_audit_categories() {
     let o = run(
         &dir,
         &[
-            "--dir", ".", "--allow-unsandboxed", "--no-verify", "--no-policy", "--paranoid",
+            "--dir",
+            ".",
+            "--allow-unsandboxed",
+            "--no-verify",
+            "--no-policy",
+            "--paranoid",
         ],
     );
     let out = combined(&o).to_lowercase();
@@ -26,7 +31,10 @@ fn paranoid_finds_multiple_audit_categories() {
         .iter()
         .filter(|s| out.contains(&s.to_lowercase()))
         .count();
-    assert!(hits >= 3, "expected ≥3 audit categories to fire, got {hits}: {out}");
+    assert!(
+        hits >= 3,
+        "expected ≥3 audit categories to fire, got {hits}: {out}"
+    );
 }
 
 #[test]

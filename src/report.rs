@@ -355,6 +355,7 @@ fn tag_to_status(tag: &str) -> &'static str {
 /// flag is computed from the SAME pure classifiers (`format_result`,
 /// `format_container_ref`) the human report uses, so the two output modes can
 /// never disagree on exit code.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn scan_json(
     results: &[VerificationResult],
     container_refs: &[ContainerRef],
@@ -363,6 +364,7 @@ pub(crate) fn scan_json(
     strict: bool,
     policy: &Policy,
     suppressed_count: usize,
+    upstream_changes: &[CompareResult],
 ) -> (String, bool) {
     use crate::jsonout::quote;
     use std::fmt::Write as _;
@@ -387,7 +389,11 @@ pub(crate) fn scan_json(
         if is_failure && !policy_skip {
             failed = true;
         }
-        let status = if policy_skip { "skip" } else { tag_to_status(tag) };
+        let status = if policy_skip {
+            "skip"
+        } else {
+            tag_to_status(tag)
+        };
         let comma = if i + 1 < results.len() { "," } else { "" };
         let _ = writeln!(
             out,
@@ -408,7 +414,11 @@ pub(crate) fn scan_json(
         if is_failure {
             failed = true;
         }
-        let comma = if i + 1 < container_refs.len() { "," } else { "" };
+        let comma = if i + 1 < container_refs.len() {
+            ","
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
             "    {{\"image\": {}, \"file\": {}, \"status\": {}, \"detail\": {}}}{comma}",
@@ -453,6 +463,34 @@ pub(crate) fn scan_json(
             quote(&f.title),
             quote(&f.file.display().to_string()),
             quote(&f.detail),
+        );
+    }
+    let _ = writeln!(out, "  ],");
+
+    // ── upstream changes (informational; from --diff-base, never affects ok) ──
+    let _ = writeln!(out, "  \"upstream_changes\": [");
+    for (i, c) in upstream_changes.iter().enumerate() {
+        let comma = if i + 1 < upstream_changes.len() {
+            ","
+        } else {
+            ""
+        };
+        let summaries = c
+            .commit_summaries
+            .iter()
+            .map(|s| quote(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "    {{\"action\": {}, \"old_sha\": {}, \"new_sha\": {}, \"ahead_by\": {}, \
+             \"files_changed\": {}, \"html_url\": {}, \"commits\": [{summaries}]}}{comma}",
+            quote(&format!("{}/{}", c.owner, c.repo)),
+            quote(&c.old_sha),
+            quote(&c.new_sha),
+            c.ahead_by,
+            c.files_changed,
+            quote(&c.html_url),
         );
     }
     let _ = writeln!(out, "  ],");

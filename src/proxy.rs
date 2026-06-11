@@ -16,19 +16,24 @@ pub(crate) const GITHUB_ADDRS_ENV: &str = "HASP_GITHUB_ADDRS";
 pub(crate) const READY_MAGIC: &str = "HASP_PROXY_READY_V1";
 
 const MAX_MESSAGE_BYTES: usize = 4096;
-/// Cap for multi-KB responses (SLSA attestation bundles). Applied only on the
-/// client side for commands that explicitly opt into the large-response path.
-/// Sized to accommodate repos with several Sigstore-bundle attestations on a
-/// single SHA; bump if real-world GitHub responses approach this.
-const MAX_LARGE_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Client-side cap for multi-KB responses (action.yml and SLSA attestation
+/// bundles). This must exceed the *encoded* size the server can produce: the
+/// server reads up to 2 MiB of action.yml (`github/client.rs`) and
+/// percent-encodes it (up to ~3× for `%`/CR/LF/TAB/NUL bytes) plus framing, so
+/// a 1 MiB client cap would reject valid large responses that the server
+/// happily produced. 8 MiB covers worst-case encoding expansion with headroom.
+const MAX_LARGE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_API_CALLS_PER_RUN: u32 = 300;
 const MAX_AUTH_FAILURES: u32 = 5;
 const MAX_CONNECTIONS: u32 = 1000;
-/// Proxy exits if no connection arrives within this window. Prevents an
-/// orphaned proxy (e.g. launcher OOM-killed before `terminate_child`) from
-/// holding the decrypted `GITHUB_TOKEN` in memory and accepting loopback
-/// connections indefinitely. Mirrors the forward proxy's idle guard.
-const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+/// How long to wait per `poll` tick before re-checking liveness deadlines.
+const ACCEPT_TICK: Duration = Duration::from_secs(1);
+/// Backstop idle timeout. Orphan cleanup is primarily driven by parent-process
+/// liveness: when the launcher exits (e.g. OOM-killed before `terminate_child`)
+/// this process is reparented and `getppid()` changes, so we stop holding the
+/// decrypted `GITHUB_TOKEN` promptly. This idle timer is only a safety net for
+/// the case where reparenting is not observable.
+const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 
 pub(crate) struct Client {
     proxy_addr: SocketAddr,
@@ -252,8 +257,14 @@ impl Api for Client {
         if fields.len() < 4 || fields[0] != "COMPARE_RESULT" {
             bail!("Malformed COMPARE response from proxy");
         }
-        let ahead_by: u32 = fields[1].parse().unwrap_or(0);
-        let files_changed: u32 = fields[2].parse().unwrap_or(0);
+        // Don't silently coerce malformed numbers to 0 — that would report a
+        // corrupted proxy response as "0 commits ahead / 0 files changed".
+        let ahead_by: u32 = fields[1]
+            .parse()
+            .context("Malformed ahead_by in COMPARE response from proxy")?;
+        let files_changed: u32 = fields[2]
+            .parse()
+            .context("Malformed files_changed in COMPARE response from proxy")?;
         let html_url = fields[3].clone();
         // Cap to 10 summaries to match the server-side limit, even if a
         // misbehaving proxy returns more fields.
@@ -288,14 +299,32 @@ impl Api for Client {
     }
 }
 
-/// Block until a client connects, returning `Ok(None)` if no connection
-/// arrives within `IDLE_TIMEOUT`. The listener must be in non-blocking mode;
-/// the returned stream is switched back to blocking for request handling.
+/// Block until a client connects, returning `Ok(None)` when the proxy should
+/// shut down (launcher gone or idle backstop reached). The listener must be in
+/// non-blocking mode; the returned stream is switched back to blocking for
+/// request handling.
 fn accept_with_idle(
     listener: &TcpListener,
     last_activity: &mut std::time::Instant,
+    orig_ppid: i32,
 ) -> Result<Option<TcpStream>> {
     loop {
+        // poll(2) wakes immediately on a pending connection (no per-request
+        // latency) and lets us re-check liveness on a timeout tick.
+        if !poll_listener_readable(listener, ACCEPT_TICK)? {
+            // SAFETY: getppid() takes no arguments and always succeeds.
+            #[allow(unsafe_code)]
+            let ppid = unsafe { libc::getppid() };
+            if ppid != orig_ppid {
+                eprintln!("hasp proxy: launcher exited, shutting down");
+                return Ok(None);
+            }
+            if last_activity.elapsed() > IDLE_TIMEOUT {
+                eprintln!("hasp proxy: idle timeout, shutting down");
+                return Ok(None);
+            }
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 *last_activity = std::time::Instant::now();
@@ -304,16 +333,43 @@ fn accept_with_idle(
                     .context("Failed to set proxy stream blocking mode")?;
                 return Ok(Some(stream));
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if last_activity.elapsed() > IDLE_TIMEOUT {
-                    eprintln!("hasp proxy: idle timeout, shutting down");
-                    return Ok(None);
+            // A client that reset before we accepted it is transient, not fatal.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+                ) {
+                    eprintln!("hasp proxy: accept error (continuing): {e}");
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(crate::error::Error::from(e)).context("Proxy accept failed"),
         }
     }
+}
+
+/// Wait up to `timeout` for `listener` to have a pending connection. Returns
+/// `true` if it may be ready to accept, `false` on timeout. Uses poll(2) so
+/// there is neither the latency nor the CPU cost of sleep-polling.
+fn poll_listener_readable(listener: &TcpListener, timeout: Duration) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: poll() reads/writes exactly the one pollfd we own for this call.
+    #[allow(unsafe_code)]
+    let ret = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        // EINTR: treat as a timeout; the caller re-checks deadlines and retries.
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(crate::error::Error::from(err)).context("poll on proxy listener failed");
+    }
+    Ok(ret > 0)
 }
 
 pub(crate) fn run_server(timeout_secs: u64) -> Result<()> {
@@ -363,8 +419,11 @@ pub(crate) fn run_server(timeout_secs: u64) -> Result<()> {
     let mut auth_failures = 0_u32;
     let mut total_connections = 0_u32;
     let mut last_activity = std::time::Instant::now();
+    // SAFETY: getppid() takes no arguments and always succeeds.
+    #[allow(unsafe_code)]
+    let orig_ppid = unsafe { libc::getppid() };
     loop {
-        let Some(mut stream) = accept_with_idle(&listener, &mut last_activity)? else {
+        let Some(mut stream) = accept_with_idle(&listener, &mut last_activity, orig_ppid)? else {
             return Ok(());
         };
         total_connections += 1;
@@ -396,9 +455,11 @@ pub(crate) fn run_server(timeout_secs: u64) -> Result<()> {
             .set_write_timeout(Some(Duration::from_secs(30)))
             .context("Failed to set proxy write timeout")?;
 
-        let peer = stream
-            .peer_addr()
-            .context("Failed to determine proxy client address")?;
+        // A reset between accept and peer_addr surfaces as an error here — skip
+        // the connection rather than abort the whole proxy.
+        let Ok(peer) = stream.peer_addr() else {
+            continue;
+        };
         if peer.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
             write_error(&mut stream, "proxy only accepts loopback clients")?;
             continue;
@@ -406,7 +467,11 @@ pub(crate) fn run_server(timeout_secs: u64) -> Result<()> {
 
         match handle_connection(&mut stream, &client, &auth) {
             Ok(()) => {}
-            Err(ref err) if err.msg().contains("authentication failed") => {
+            // Match only the proxy's *own* auth-failure marker. Upstream GitHub
+            // 401/403 responses also say "authentication failed" but must not
+            // count against the loopback-attacker budget or self-terminate the
+            // proxy — they indicate a bad GITHUB_TOKEN, surfaced elsewhere.
+            Err(ref err) if err.msg().contains("Proxy authentication failed") => {
                 auth_failures += 1;
                 // Keep the detail on stderr; send the client a generic message
                 // so internal error chains / upstream URLs never leak.

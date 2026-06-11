@@ -101,13 +101,24 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
 
     // 5. Prepare BPF sandbox for child (only proxy localhost ports)
     let child_allowlist: Vec<SocketAddr> = proxy_infos.iter().map(|p| p.addr).collect();
-    let child_sandbox = netguard::maybe_prepare(
+    let child_sandbox = match netguard::maybe_prepare(
         netguard::SandboxMode::StepRunner,
         &child_allowlist,
         args.allow_unsandboxed,
-    )?;
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            // The secret-holding forward proxies are already running. Kill them
+            // (and scrub their auth tokens) before bailing; kill first so the
+            // cgroup dirs can be removed when the sandboxes drop.
+            scrub_proxy_auths(&mut proxy_infos);
+            cleanup_children(&mut proxy_children);
+            drop(proxy_sandboxes);
+            return Err(err);
+        }
+    };
 
-    // 6. Collect writable dirs: user-specified + manifest + cgroup path
+    // 6. Collect writable dirs: user-specified + manifest + child cgroup path.
     let mut all_writable: Vec<PathBuf> = exec_args.writable_dirs.clone();
     for dir in &manifest.writable_dirs {
         all_writable.push(PathBuf::from(dir));
@@ -117,11 +128,39 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
         all_writable.push(sandbox.path().to_path_buf());
     }
 
+    // Cgroup *parent* directories that teardown (step 11) must be able to rmdir.
+    // Landlock checks RemoveDir against the parent of the removed entry, so
+    // without granting these the orchestrator's own (inherited) Landlock domain
+    // would deny cleanup and leak one empty cgroup dir per proxy/child per run.
+    // RemoveDir-only; every hasp cgroup under these parents is occupied for the
+    // child's whole lifetime, so the inherited right can't remove a live one.
+    let mut cgroup_parents: Vec<PathBuf> = Vec::new();
+    for sandbox in proxy_sandboxes.iter().flatten() {
+        if let Some(parent) = sandbox.path().parent() {
+            cgroup_parents.push(parent.to_path_buf());
+        }
+    }
+    if let Some(parent) = child_sandbox.as_ref().and_then(|s| s.path().parent()) {
+        cgroup_parents.push(parent.to_path_buf());
+    }
+    cgroup_parents.sort();
+    cgroup_parents.dedup();
+
     // 7. Apply Landlock + seccomp BEFORE spawning child so child inherits.
     // Landlock is inherited across fork — the child gets the same fs restrictions.
     // seccomp is inherited across fork — the child gets ptrace/process_vm denied.
     // After this point, the orchestrator (and child) can only write to declared dirs.
-    crate::sandbox::phase_exec_child(&all_writable, args.allow_unsandboxed)?;
+    if let Err(err) =
+        crate::sandbox::phase_exec_child(&all_writable, &cgroup_parents, args.allow_unsandboxed)
+    {
+        // Kill the secret-holding proxies first, then drop the sandbox handles
+        // so their (now-empty) cgroup dirs can be removed.
+        scrub_proxy_auths(&mut proxy_infos);
+        cleanup_children(&mut proxy_children);
+        drop(child_sandbox);
+        drop(proxy_sandboxes);
+        return Err(err);
+    }
 
     // 8. Build child command with scrubbed env + proxy vars
     let mut child_cmd = Command::new(&exec_args.command[0]);
@@ -178,7 +217,15 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
     // so explicitly drop the child cgroup handle first — otherwise a nonzero
     // exit (the common failing-build case) would leak the StepRunner cgroup
     // directory. The child has already been waited on above.
-    let code = status.code().unwrap_or(1);
+    //
+    // A child killed by a signal (OOM → SIGKILL, SIGSEGV, …) has no exit code;
+    // map it to the shell convention 128+signum so callers can tell a crash
+    // apart from an ordinary nonzero exit (the help text promises the child's
+    // status is propagated).
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(1, |sig| 128 + sig)
+    });
     drop(child_sandbox);
     if code != 0 {
         std::process::exit(code);

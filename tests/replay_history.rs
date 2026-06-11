@@ -53,13 +53,7 @@ jobs:
 
     let o = run(
         &repo,
-        &[
-            "replay",
-            "--since",
-            "1year",
-            "--dir",
-            ".github/workflows",
-        ],
+        &["replay", "--since", "1year", "--dir", ".github/workflows"],
     );
     let out = combined(&o).to_lowercase();
     assert!(
@@ -97,13 +91,7 @@ jobs:
 
     let o = run(
         &repo,
-        &[
-            "replay",
-            "--since",
-            "1year",
-            "--dir",
-            ".github/workflows",
-        ],
+        &["replay", "--since", "1year", "--dir", ".github/workflows"],
     );
     assert_eq!(
         o.status.code(),

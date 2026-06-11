@@ -382,12 +382,15 @@ fn wait_for_stop(pid: u32) -> Result<()> {
         }
         break r;
     };
-    let stopped = libc::WIFSTOPPED(status);
-    if ret == 0 || !stopped {
-        // Child terminated before reaching the self-SIGSTOP at top of
-        // main(). Common cause: the binary crashed during runtime init,
-        // or the wrong binary was invoked.
-        bail!("Sandboxed child exited before self-SIGSTOP could land");
+    // waitpid without WNOHANG never returns 0 for a valid pid, so a non-stopped
+    // result means the child terminated before we could stop it for cgroup
+    // migration. For an arbitrary ParentStop binary that's usually a
+    // fast-exiting/crashing command; for SelfStop the child died during runtime
+    // init before reaching its self-SIGSTOP. Either way it never ran user code
+    // inside the cgroup, so report a protocol-neutral error.
+    let _ = ret;
+    if !libc::WIFSTOPPED(status) {
+        bail!("Sandboxed child terminated before it could be migrated into the egress cgroup");
     }
     Ok(())
 }
@@ -518,10 +521,46 @@ fn set_pids_max(cgroup_path: &Path, max: u32) -> Result<()> {
     ))
 }
 
+/// Closes an owned file descriptor on drop, so an early `?` return doesn't leak
+/// it (and its CLOEXEC-or-not status to any later child).
+#[cfg(target_os = "linux")]
+struct FdGuard(libc::c_int);
+
+#[cfg(target_os = "linux")]
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            // SAFETY: closing a file descriptor we opened and exclusively own.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn prepare_linux(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result<SandboxHandle> {
     let cgroup_path = create_cgroup(mode)?;
-    let cgroup_fd = open_dir_fd(&cgroup_path)?;
+    // If BPF setup fails after the cgroup was created (e.g. unprivileged
+    // BPF_MAP_CREATE returns EPERM because kernel.unprivileged_bpf_disabled=1),
+    // remove the directory so failed runs don't accumulate stale cgroups. The
+    // fds opened inside are closed by their FdGuards regardless.
+    match attach_bpf_to_cgroup(&cgroup_path, allowlist) {
+        Ok(()) => Ok(SandboxHandle {
+            path: cgroup_path,
+            helper: None,
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_dir(&cgroup_path);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_bpf_to_cgroup(cgroup_path: &Path, allowlist: &[SocketAddr]) -> Result<()> {
+    let cgroup_fd = FdGuard(open_dir_fd(cgroup_path)?);
 
     let v4_targets: Vec<SocketAddrV4> = allowlist
         .iter()
@@ -542,37 +581,37 @@ fn prepare_linux(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result<SandboxH
         .context("too many v4 allowlist entries")?;
     let v6_entries = u32::try_from(std::cmp::max(v6_targets.len(), 1))
         .context("too many v6 allowlist entries")?;
-    let v4_map = create_hash_map(8, v4_entries)?;
-    let v6_map = create_hash_map(20, v6_entries)?;
+    let v4_map = FdGuard(create_hash_map(8, v4_entries)?);
+    let v6_map = FdGuard(create_hash_map(20, v6_entries)?);
 
     for target in &v4_targets {
-        update_v4_allowlist(v4_map, *target)?;
+        update_v4_allowlist(v4_map.0, *target)?;
     }
     for target in &v6_targets {
-        update_v6_allowlist(v6_map, *target)?;
+        update_v6_allowlist(v6_map.0, *target)?;
     }
 
     attach_sock_addr_prog(
-        cgroup_fd,
-        v4_map,
+        cgroup_fd.0,
+        v4_map.0,
         bpf::BPF_CGROUP_INET4_CONNECT,
         IpVersion::V4,
     )?;
     attach_sock_addr_prog(
-        cgroup_fd,
-        v6_map,
+        cgroup_fd.0,
+        v6_map.0,
         bpf::BPF_CGROUP_INET6_CONNECT,
         IpVersion::V6,
     )?;
     attach_sock_addr_prog(
-        cgroup_fd,
-        v4_map,
+        cgroup_fd.0,
+        v4_map.0,
         bpf::BPF_CGROUP_UDP4_SENDMSG,
         IpVersion::V4,
     )?;
     attach_sock_addr_prog(
-        cgroup_fd,
-        v6_map,
+        cgroup_fd.0,
+        v6_map.0,
         bpf::BPF_CGROUP_UDP6_SENDMSG,
         IpVersion::V6,
     )?;
@@ -580,27 +619,16 @@ fn prepare_linux(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result<SandboxH
     // Best-effort: deny AF_UNIX connections to prevent Docker socket, D-Bus,
     // and SSH agent access. Requires kernel 6.7+ (BPF_CGROUP_UNIX_CONNECT).
     // Silently skipped on older kernels — INET confinement still active.
-    if let Err(e) = attach_unix_deny_prog(cgroup_fd) {
+    if let Err(e) = attach_unix_deny_prog(cgroup_fd.0) {
         eprintln!("hasp: note: AF_UNIX deny unavailable ({e}), INET-only confinement");
     }
 
     // Best-effort: cap child process count to prevent fork bombs.
     // Succeeds as root (sudo helper path); silently ignored if unprivileged.
-    let _ = set_pids_max(&cgroup_path, 4096);
+    let _ = set_pids_max(cgroup_path, 4096);
 
-    // SAFETY: closing file descriptors we opened earlier in this function.
-    // These are plain ints returned by kernel syscalls (BPF map create, dup).
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::close(v4_map);
-        libc::close(v6_map);
-        libc::close(cgroup_fd);
-    }
-
-    Ok(SandboxHandle {
-        path: cgroup_path,
-        helper: None,
-    })
+    // cgroup_fd / v4_map / v6_map are closed here by their FdGuards.
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1111,6 +1139,26 @@ pub(crate) fn run_bpf_helper() -> Result<()> {
     crate::error::bail!("BPF helper is only available on Linux")
 }
 
+/// Parse and validate the BPF helper's `MAGIC\t<cgroup_path>` ready line.
+#[cfg(target_os = "linux")]
+fn parse_helper_ready_line(ready_line: &str) -> Result<PathBuf> {
+    let trimmed = ready_line.trim_end_matches(['\n', '\r']);
+    let Some((magic, path_str)) = trimmed.split_once('\t') else {
+        bail!("Malformed BPF helper ready line: {trimmed}");
+    };
+    if magic != BPF_READY_MAGIC {
+        bail!("Malformed BPF helper ready line: {trimmed}");
+    }
+    let path = PathBuf::from(path_str);
+    if !path.is_dir() {
+        bail!(
+            "BPF helper returned non-existent cgroup path: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
 /// Spawn `sudo hasp --internal-bpf-helper` and parse the cgroup path it creates.
 #[cfg(target_os = "linux")]
 fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result<SandboxHandle> {
@@ -1168,21 +1216,17 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
         let code = status.code().unwrap_or(-1);
         bail!("sudo BPF helper exited with code {code} before announcing ready");
     }
-    let trimmed = ready_line.trim_end_matches(['\n', '\r']);
-    let Some((magic, path_str)) = trimmed.split_once('\t') else {
-        bail!("Malformed BPF helper ready line: {trimmed}");
+    // Parse the ready line. On any failure we never construct a SandboxHandle
+    // to own `child`, so reap it here — otherwise the sudo helper lingers as a
+    // zombie until the orchestrator exits.
+    let path = match parse_helper_ready_line(&ready_line) {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
     };
-    if magic != BPF_READY_MAGIC {
-        bail!("Malformed BPF helper ready line: {trimmed}");
-    }
-
-    let path = PathBuf::from(path_str);
-    if !path.is_dir() {
-        bail!(
-            "BPF helper returned non-existent cgroup path: {}",
-            path.display()
-        );
-    }
 
     Ok(SandboxHandle {
         path,

@@ -197,7 +197,10 @@ fn workflow_has_pr_trigger(on_val: Option<&Yaml>) -> bool {
     };
     #[allow(clippy::wildcard_enum_match_arm)]
     match on {
-        Yaml::String(s) => matches!(s.as_str(), "pull_request" | "pull_request_target" | "issue_comment"),
+        Yaml::String(s) => matches!(
+            s.as_str(),
+            "pull_request" | "pull_request_target" | "issue_comment"
+        ),
         Yaml::Array(arr) => arr.iter().any(|v| {
             v.as_str().is_some_and(|s| {
                 matches!(s, "pull_request" | "pull_request_target" | "issue_comment")
@@ -312,9 +315,7 @@ jobs:
         );
         let findings = run_check(&doc);
         assert!(
-            findings
-                .iter()
-                .any(|f| f.title.contains("curl")),
+            findings.iter().any(|f| f.title.contains("curl")),
             "expected curl-pipe-bash finding, got: {findings:?}"
         );
     }
@@ -334,9 +335,7 @@ jobs:
         );
         let findings = run_check(&doc);
         assert!(
-            findings
-                .iter()
-                .any(|f| f.title.contains("go install")),
+            findings.iter().any(|f| f.title.contains("go install")),
             "expected go-install finding, got: {findings:?}"
         );
     }
