@@ -16,9 +16,7 @@ use crate::error::Result;
 use std::path::Path;
 use yaml_rust2::Yaml;
 
-use super::{GlobToken, OidcAcceptance, OidcProvider, SubKind, SubPattern};
-
-const GH_ISSUER_HOST: &str = "token.actions.githubusercontent.com";
+use super::{GlobToken, OidcAcceptance, OidcProvider, SubKind, SubPattern, is_github_issuer};
 
 /// Attribute lvalues that we accept as a "ref" pin. GitHub's OIDC token has
 /// many `*_ref` claims (`head_ref`, `base_ref`, `workflow_ref`,
@@ -43,7 +41,7 @@ pub(crate) fn parse(doc: &Yaml, path: &Path) -> Result<Vec<OidcAcceptance>> {
     // warning, but if the field is present and points at a non-GitHub issuer,
     // refuse to emit acceptances (those tokens aren't from GitHub Actions).
     if let Some(issuer) = extract_issuer_uri(map) {
-        if !issuer_is_github(&issuer) {
+        if !is_github_issuer(&issuer) {
             return Ok(Vec::new());
         }
     } else {
@@ -179,31 +177,6 @@ fn extract_issuer_uri(map: &yaml_rust2::yaml::Hash) -> Option<String> {
     map.get(&Yaml::String("issuerUri".to_string()))
         .and_then(Yaml::as_str)
         .map(str::to_string)
-}
-
-/// True iff `uri`'s authority (host[:port]) equals GitHub's OIDC issuer
-/// host. Tight parse: rejects look-alikes like
-/// `https://token.actions.githubusercontent.com.attacker.com/foo`.
-fn issuer_is_github(uri: &str) -> bool {
-    // Strip scheme.
-    let after_scheme = uri
-        .strip_prefix("https://")
-        .or_else(|| uri.strip_prefix("http://"))
-        .unwrap_or(uri);
-    // Authority ends at the first `/`, `?`, `#`, or end of string.
-    let authority_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..authority_end];
-    // Drop port (anything after the last ':' if present and ASCII digits).
-    let host = authority.rsplit_once(':').map_or(authority, |(h, p)| {
-        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
-            h
-        } else {
-            authority
-        }
-    });
-    host.eq_ignore_ascii_case(GH_ISSUER_HOST)
 }
 
 fn strip_quotes(s: &str) -> String {

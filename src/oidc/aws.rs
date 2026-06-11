@@ -22,9 +22,8 @@ use crate::error::Result;
 use std::path::Path;
 use yaml_rust2::Yaml;
 
-use super::{OidcAcceptance, OidcProvider, SubPattern};
+use super::{GH_ISSUER_HOST, OidcAcceptance, OidcProvider, SubPattern};
 
-const GH_ISSUER_HOST: &str = "token.actions.githubusercontent.com";
 /// Marker that separates the OIDC-provider component of the ARN from the
 /// issuer host. AWS ARNs are formatted
 /// `arn:aws:iam::<account>:oidc-provider/<host>`.

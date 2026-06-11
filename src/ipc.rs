@@ -284,7 +284,8 @@ pub(crate) fn read_verifier_input(mut reader: impl Read) -> Result<VerifierInput
     })
 }
 
-#[cfg(test)]
+// Used by tests and by the fuzz harness (via `fuzz_api`).
+#[cfg(any(test, feature = "fuzz-exports"))]
 pub(crate) fn read_action_refs(mut reader: impl Read) -> Result<Vec<ActionRef>> {
     let text = read_protocol_text_limited(
         &mut reader,

@@ -51,8 +51,10 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
         bail!("Forward proxy has no allowed domains");
     }
 
-    // Parse pre-resolved upstream addresses (avoids DNS re-resolution per request)
-    let upstream_addrs = parse_upstream_addrs()?;
+    // Parse pre-resolved per-domain upstream addresses (avoids DNS
+    // re-resolution per request, and lets us dial the IP that belongs to the
+    // requested host rather than whichever domain sorted first).
+    let upstream_map = parse_upstream_map()?;
 
     let inject_mode = match std::env::var(FORWARD_PROXY_INJECT_ENV)
         .unwrap_or_else(|_| "header".to_string())
@@ -150,7 +152,7 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
             &secret,
             &auth,
             &allowed_domains,
-            &upstream_addrs,
+            &upstream_map,
             inject_mode,
             &header_prefix,
             &tls_config,
@@ -193,7 +195,7 @@ fn handle_request(
     secret: &SecureToken,
     auth: &SecureToken,
     allowed_domains: &[String],
-    upstream_addrs: &[SocketAddr],
+    upstream_map: &[(String, Vec<SocketAddr>)],
     inject_mode: InjectMode,
     header_prefix: &str,
     tls_config: &Arc<rustls::ClientConfig>,
@@ -253,12 +255,17 @@ fn handle_request(
         Vec::new()
     };
 
-    // Use pre-resolved upstream address — never re-resolve DNS.
-    // Eliminates DNS rebinding attacks between pre-resolution and request time.
-    // The BPF cgroup on this proxy already only allows these IPs.
-    let upstream_addr = *upstream_addrs
-        .first()
-        .context("No pre-resolved upstream addresses available")?;
+    // Use a pre-resolved upstream address for the *requested* host — never
+    // re-resolve DNS. Eliminates DNS rebinding between pre-resolution and
+    // request time, and ensures a multi-domain grant dials the IP that belongs
+    // to this request's host rather than whichever domain sorted first. The
+    // BPF cgroup on this proxy already only allows these IPs.
+    let upstream_addr = upstream_map
+        .iter()
+        .find(|(domain, _)| domain.eq_ignore_ascii_case(host_domain))
+        .and_then(|(_, addrs)| addrs.first())
+        .copied()
+        .context("No pre-resolved upstream addresses for the requested host")?;
 
     let server_name = rustls::pki_types::ServerName::try_from(host_domain.to_string())
         .map_err(|e| format!("Invalid server name: {e}"))?;
@@ -378,22 +385,52 @@ struct HttpRequest {
 /// Parse HTTP/1.1 request line + headers.
 fn parse_http_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest> {
     let mut total_read = 0_usize;
+    let (method, path) = parse_request_line(reader, &mut total_read)?;
+    let parsed = parse_headers(reader, &mut total_read)?;
+
+    if parsed.host.is_empty() {
+        bail!("HTTP request missing Host header");
+    }
+    // Reject control characters in Host — prevents header injection
+    // when the Host value is written to the upstream request.
+    if parsed.host.bytes().any(|b| b.is_ascii_control()) {
+        bail!("Host header contains control characters");
+    }
+
+    Ok(HttpRequest {
+        method,
+        path,
+        host: parsed.host,
+        headers: parsed.headers,
+        content_length: parsed.content_length,
+    })
+}
+
+/// Read and validate the HTTP request line, returning `(method, path)`.
+fn parse_request_line(
+    reader: &mut BufReader<TcpStream>,
+    total_read: &mut usize,
+) -> Result<(String, String)> {
     let mut request_line = String::new();
+    // Bound the single-line read so a peer that sends a huge line with no
+    // newline can't grow the String past the header budget before the check.
     let n = reader
+        .by_ref()
+        .take(MAX_REQUEST_HEADER_BYTES as u64 + 1)
         .read_line(&mut request_line)
         .context("Failed to read HTTP request line")?;
-    total_read += n;
-    if total_read > MAX_REQUEST_HEADER_BYTES {
+    *total_read += n;
+    if *total_read > MAX_REQUEST_HEADER_BYTES {
         bail!("HTTP request headers too large");
     }
 
     let request_line = request_line.trim_end();
     let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
     if parts.len() != 3 {
-        bail!(
-            "Malformed HTTP request line (truncated: {:?})",
-            &request_line[..request_line.len().min(64)]
-        );
+        // Truncate on a char boundary — the request line is attacker-controlled
+        // and a byte slice could split a multibyte UTF-8 sequence and panic.
+        let preview: String = request_line.chars().take(64).collect();
+        bail!("Malformed HTTP request line (truncated: {preview:?})");
     }
     let method = parts[0].to_string();
     let path = parts[1].to_string();
@@ -427,6 +464,20 @@ fn parse_http_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest> 
         bail!("Request path must start with /");
     }
 
+    Ok((method, path))
+}
+
+struct ParsedHeaders {
+    headers: Vec<(String, String)>,
+    host: String,
+    content_length: usize,
+}
+
+/// Read HTTP headers up to the blank line that ends them.
+fn parse_headers(
+    reader: &mut BufReader<TcpStream>,
+    total_read: &mut usize,
+) -> Result<ParsedHeaders> {
     let mut headers = Vec::with_capacity(32);
     let mut host = String::new();
     let mut content_length = 0_usize;
@@ -436,11 +487,17 @@ fn parse_http_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest> 
             bail!("Too many HTTP headers (max {MAX_REQUEST_HEADERS})");
         }
         let mut line = String::new();
+        // Bound each header line to the remaining header budget so a single
+        // newline-less line can't OOM the proxy (the cumulative check below
+        // only fires after the line is fully read).
+        let remaining = (MAX_REQUEST_HEADER_BYTES - *total_read) as u64 + 1;
         let n = reader
+            .by_ref()
+            .take(remaining)
             .read_line(&mut line)
             .context("Failed to read HTTP header")?;
-        total_read += n;
-        if total_read > MAX_REQUEST_HEADER_BYTES {
+        *total_read += n;
+        if *total_read > MAX_REQUEST_HEADER_BYTES {
             bail!("HTTP request headers too large");
         }
         let trimmed = line.trim_end();
@@ -454,44 +511,61 @@ fn parse_http_request(reader: &mut BufReader<TcpStream>) -> Result<HttpRequest> 
                 host.clone_from(&value);
             }
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
+                // Don't silently coerce a bad Content-Length to 0 — that would
+                // forward a body-less request and hide the malformed input.
+                content_length = value.parse().map_err(|_| {
+                    crate::error::Error::new(format!("Invalid Content-Length header: `{value}`"))
+                })?;
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                // We only support Content-Length framing. A chunked body would
+                // otherwise be left unread and silently dropped, so reject it.
+                bail!("Transfer-Encoding is not supported by this proxy");
             }
             headers.push((name, value));
         }
     }
 
-    if host.is_empty() {
-        bail!("HTTP request missing Host header");
-    }
-    // Reject control characters in Host — prevents header injection
-    // when the Host value is written to the upstream request.
-    if host.bytes().any(|b| b.is_ascii_control()) {
-        bail!("Host header contains control characters");
-    }
-
-    Ok(HttpRequest {
-        method,
-        path,
-        host,
+    Ok(ParsedHeaders {
         headers,
+        host,
         content_length,
     })
 }
 
-fn parse_upstream_addrs() -> Result<Vec<SocketAddr>> {
+/// Parse the per-domain upstream map from the environment. Format is
+/// `domain=addr1;addr2|domain2=addr3` — one group per domain, addresses
+/// separated by `;`, groups by `|`. None of these separators can appear in a
+/// validated domain (`[a-z0-9.-]`) or a `SocketAddr` rendering, so the split
+/// is unambiguous.
+fn parse_upstream_map() -> Result<Vec<(String, Vec<SocketAddr>)>> {
     let raw = std::env::var(FORWARD_PROXY_UPSTREAM_ADDRS_ENV)
         .context(format!("{FORWARD_PROXY_UPSTREAM_ADDRS_ENV} not set"))?;
-    let mut addrs = Vec::new();
-    for part in raw.split(',').filter(|p| !p.is_empty()) {
-        addrs.push(
-            part.parse::<SocketAddr>()
-                .context(format!("Invalid upstream address: `{part}`"))?,
-        );
+    parse_upstream_map_str(&raw)
+}
+
+fn parse_upstream_map_str(raw: &str) -> Result<Vec<(String, Vec<SocketAddr>)>> {
+    let mut map = Vec::new();
+    for group in raw.split('|').filter(|g| !g.is_empty()) {
+        let (domain, addrs_raw) = group
+            .split_once('=')
+            .context(format!("Malformed upstream map entry: `{group}`"))?;
+        let mut addrs = Vec::new();
+        for part in addrs_raw.split(';').filter(|p| !p.is_empty()) {
+            addrs.push(
+                part.parse::<SocketAddr>()
+                    .context(format!("Invalid upstream address: `{part}`"))?,
+            );
+        }
+        if addrs.is_empty() {
+            bail!("Forward proxy domain `{domain}` has no upstream addresses");
+        }
+        map.push((domain.to_string(), addrs));
     }
-    if addrs.is_empty() {
+    if map.is_empty() {
         bail!("Forward proxy received empty upstream address set");
     }
-    Ok(addrs)
+    Ok(map)
 }
 
 fn build_tls_config() -> Arc<rustls::ClientConfig> {
@@ -657,5 +731,70 @@ mod tests {
         );
         let parsed = req.unwrap();
         assert_eq!(parsed.content_length, 42);
+    }
+
+    #[test]
+    fn rejects_chunked_transfer_encoding() {
+        // A chunked body would otherwise be left unread and silently dropped.
+        let req = parse_raw_request(
+            b"POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        let err = req.unwrap_err();
+        assert!(
+            err.msg().contains("Transfer-Encoding"),
+            "expected transfer-encoding rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unparseable_content_length() {
+        // A bad Content-Length must error, not silently coerce to 0 (which
+        // would forward a body-less request and hide the malformed input).
+        let req = parse_raw_request(
+            b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: notanumber\r\n\r\n",
+        );
+        let err = req.unwrap_err();
+        assert!(
+            err.msg().contains("Content-Length"),
+            "expected content-length rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upstream_map_round_trips_multiple_domains() {
+        let raw = "api.github.com=140.82.121.6:443;140.82.121.5:443|uploads.github.com=140.82.121.9:443";
+        let map = parse_upstream_map_str(raw).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[0].0, "api.github.com");
+        assert_eq!(map[0].1.len(), 2);
+        assert_eq!(map[1].0, "uploads.github.com");
+        assert_eq!(
+            map[1].1[0],
+            "140.82.121.9:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn upstream_map_selects_addr_for_requested_host() {
+        // Regression: a request to the second domain must dial that domain's
+        // IP, not whichever domain happened to be listed first.
+        let map = parse_upstream_map_str(
+            "a.example.com=10.0.0.1:443|b.example.com=10.0.0.2:443",
+        )
+        .unwrap();
+        let pick = |host: &str| {
+            map.iter()
+                .find(|(d, _)| d.eq_ignore_ascii_case(host))
+                .and_then(|(_, addrs)| addrs.first())
+                .copied()
+        };
+        assert_eq!(pick("b.example.com"), Some("10.0.0.2:443".parse().unwrap()));
+        assert_eq!(pick("A.EXAMPLE.COM"), Some("10.0.0.1:443".parse().unwrap()));
+        assert_eq!(pick("c.example.com"), None);
+    }
+
+    #[test]
+    fn upstream_map_rejects_empty() {
+        parse_upstream_map_str("").unwrap_err();
     }
 }

@@ -7,12 +7,12 @@
 
 use crate::audit::{self, AuditFinding, Severity};
 use crate::error::{Context, Result, bail};
+use crate::git_util;
 use crate::policy::Policy;
 use crate::scanner;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayFormat {
@@ -56,7 +56,7 @@ pub(crate) fn run(args: &crate::cli::Args) -> Result<()> {
         .dir
         .canonicalize()
         .context("Cannot resolve workflow dir")?;
-    let repo_root = git_repo_root(&canonical_dir)?;
+    let repo_root = git_util::repo_toplevel(&canonical_dir)?;
     let relative_dir = canonical_dir
         .strip_prefix(&repo_root)
         .context("workflow directory is outside the git repo")?
@@ -290,7 +290,7 @@ fn git_log_commits(
     since: &str,
     relative_dir: &Path,
 ) -> Result<Vec<CommitRecord>> {
-    let out = Command::new("git")
+    let out = git_util::git_cmd()
         .args([
             "log",
             &format!("--since={since}"),
@@ -328,7 +328,7 @@ fn git_show_changed_workflow_files(
     sha: &str,
     relative_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let out = Command::new("git")
+    let out = git_util::git_cmd()
         .args([
             "diff-tree",
             "--no-commit-id",
@@ -366,7 +366,7 @@ fn git_show_changed_workflow_files(
 
 fn git_show_file(repo_root: &Path, sha: &str, rel_path: &Path) -> Result<Option<String>> {
     let git_path = format!("{sha}:{}", rel_path.display());
-    let out = Command::new("git")
+    let out = git_util::git_cmd()
         .args(["show", &git_path])
         .current_dir(repo_root)
         .output()
@@ -378,22 +378,6 @@ fn git_show_file(repo_root: &Path, sha: &str, rel_path: &Path) -> Result<Option<
     let text = String::from_utf8(out.stdout)
         .context(format!("file content was not UTF-8: {}", rel_path.display()))?;
     Ok(Some(text))
-}
-
-fn git_repo_root(start: &Path) -> Result<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(start)
-        .output()
-        .context("Failed to run `git rev-parse --show-toplevel`")?;
-    if !out.status.success() {
-        bail!(
-            "`git rev-parse` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let text = String::from_utf8(out.stdout).context("git rev-parse output was not UTF-8")?;
-    Ok(PathBuf::from(text.trim()))
 }
 
 fn is_sane_since(s: &str) -> bool {

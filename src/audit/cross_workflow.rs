@@ -289,10 +289,6 @@ struct WorkflowInfo {
     /// matching the chosen form.
     workflow_run_parents: Vec<String>,
     permissions: PermissionSummary,
-    /// Reserved for Feature 2 (OIDC trust-policy linting) — set when any job
-    /// or top-level permissions block grants `id-token: write`.
-    #[allow(dead_code)]
-    uses_oidc: bool,
     artifact_ops: Vec<ArtifactOp>,
     /// True iff any `${{ ... }}` expression references one of the
     /// attacker-controlled subfields of `github.event.workflow_run.*`
@@ -402,15 +398,12 @@ fn extract_workflow_info(file: &Path, doc: &Yaml) -> Option<WorkflowInfo> {
         }
     }
 
-    let uses_oidc = permissions.has_id_token_write;
-
     Some(WorkflowInfo {
         file: file.to_path_buf(),
         name,
         triggers,
         workflow_run_parents,
         permissions,
-        uses_oidc,
         artifact_ops,
         reads_attacker_controlled_event_fields,
         has_tainted_checkout_ref,

@@ -15,6 +15,33 @@ pub(crate) mod gcp;
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 
+/// GitHub's OIDC issuer host. Shared so the per-provider parsers can't drift.
+pub(super) const GH_ISSUER_HOST: &str = "token.actions.githubusercontent.com";
+
+/// True iff `issuer`'s authority (host, ignoring scheme/port/path) is exactly
+/// GitHub's OIDC issuer host. Tight host match — rejects look-alikes like
+/// `https://token.actions.githubusercontent.com.attacker.com/foo`.
+pub(super) fn is_github_issuer(issuer: &str) -> bool {
+    let after_scheme = issuer
+        .strip_prefix("https://")
+        .or_else(|| issuer.strip_prefix("http://"))
+        .unwrap_or(issuer);
+    // Authority ends at the first `/`, `?`, `#`, or end of string.
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    // Drop a trailing `:port` (only if it's all ASCII digits).
+    let host = authority.rsplit_once(':').map_or(authority, |(h, p)| {
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            authority
+        }
+    });
+    host.eq_ignore_ascii_case(GH_ISSUER_HOST)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OidcProvider {
     Aws,
