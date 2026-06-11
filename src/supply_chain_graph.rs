@@ -511,7 +511,11 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
     let per_ref_signals = if args.no_verify {
         HashMap::new()
     } else {
-        collect_online_signals(&scan.action_refs)
+        collect_online_signals(
+            &scan.action_refs,
+            args.timeout_seconds
+                .unwrap_or(crate::github::DEFAULT_HTTP_TIMEOUT_SECS),
+        )
     };
 
     let graph = build(&workflow_files, &scan.action_refs, &findings, &per_ref_signals);
@@ -545,11 +549,11 @@ pub(crate) fn run_tree(args: &crate::cli::Args) -> crate::error::Result<()> {
 /// If `GITHUB_TOKEN` is set, query the GitHub API directly (no subprocess
 /// sandbox — `hasp tree` is already inline like `hasp diff`) and populate
 /// `TrustSignals` per unique pinned action ref.
-fn collect_online_signals(refs: &[ActionRef]) -> HashMap<RefKey, TrustSignals> {
+fn collect_online_signals(refs: &[ActionRef], timeout_secs: u64) -> HashMap<RefKey, TrustSignals> {
     if std::env::var_os("GITHUB_TOKEN").is_none() {
         return HashMap::new();
     }
-    let client = match build_tree_client() {
+    let client = match build_tree_client(timeout_secs) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("hasp tree: online signals unavailable ({e}); rendering offline graph");
@@ -682,7 +686,7 @@ const PER_REF_CALL_COST: usize = 4;
 /// refs without letting a pathological repo spin.
 const TREE_CALL_BUDGET: usize = 500;
 
-fn build_tree_client() -> crate::error::Result<crate::github::Client> {
+fn build_tree_client(timeout_secs: u64) -> crate::error::Result<crate::github::Client> {
     use crate::error::Context as _;
     use crate::token::SecureToken;
     let token = SecureToken::from_env("GITHUB_TOKEN")
@@ -693,6 +697,7 @@ fn build_tree_client() -> crate::error::Result<crate::github::Client> {
         &addrs,
         std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         u32::try_from(TREE_CALL_BUDGET).unwrap_or(u32::MAX),
+        timeout_secs,
     )
 }
 

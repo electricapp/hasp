@@ -47,6 +47,8 @@ pub(crate) mod integrity;
 #[cfg(feature = "fuzz-exports")]
 pub(crate) mod ipc;
 #[cfg(feature = "fuzz-exports")]
+pub(crate) mod jsonout;
+#[cfg(feature = "fuzz-exports")]
 pub(crate) mod manifest;
 #[cfg(feature = "fuzz-exports")]
 pub(crate) mod netguard;

@@ -7,8 +7,8 @@ mod transitive;
 mod verify;
 
 pub(crate) use client::{
-    Api, Client, CompareResult, ReachabilityStatus, RepoInfo, create_github_pinned_tls_config,
-    pre_resolve_api,
+    Api, Client, CompareResult, DEFAULT_HTTP_TIMEOUT_SECS, ReachabilityStatus, RepoInfo,
+    create_github_pinned_tls_config, pre_resolve_api,
 };
 pub(crate) use provenance::check_provenance_with_api;
 pub(crate) use transitive::scan_transitive_with_api;

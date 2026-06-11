@@ -40,6 +40,14 @@ fn main() {
 
     println!("cargo:rustc-env=RUST_VERSION={rust_version}");
 
+    // Embed the commit date (ISO 8601) for the --version line. The committer
+    // date is identical for a given commit, so this stays byte-reproducible
+    // without pulling in a date-formatting crate — consistent with hasp's
+    // reproducible-build goals (see docs/REPRODUCE.md).
+    let commit_date =
+        run_git(&["show", "-s", "--format=%cI", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=COMMIT_DATE={commit_date}");
+
     // Propagate SOURCE_DATE_EPOCH if set (reproducible builds)
     if let Ok(epoch) = std::env::var("SOURCE_DATE_EPOCH") {
         println!("cargo:rustc-env=SOURCE_DATE_EPOCH={epoch}");

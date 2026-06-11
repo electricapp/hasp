@@ -316,7 +316,7 @@ fn accept_with_idle(
     }
 }
 
-pub(crate) fn run_server() -> Result<()> {
+pub(crate) fn run_server(timeout_secs: u64) -> Result<()> {
     let upstream_addrs = parse_upstream_addrs()?;
     let token = SecureToken::from_env("GITHUB_TOKEN")?;
     let auth = SecureToken::from_env(PROXY_AUTH_ENV)?;
@@ -326,6 +326,7 @@ pub(crate) fn run_server() -> Result<()> {
         &upstream_addrs,
         Arc::clone(&call_count),
         MAX_API_CALLS_PER_RUN,
+        timeout_secs,
     )?;
 
     // Check token scopes before entering the connection loop.  The

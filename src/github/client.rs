@@ -307,15 +307,76 @@ pub(crate) struct Client {
     max_calls: u32,
 }
 
+/// Default per-request network timeout in seconds, used when the caller does
+/// not pass `--timeout`.
+pub(crate) const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Result of a lightweight connectivity probe against the GitHub API,
+/// used by `hasp doctor`.
+pub(crate) struct Probe {
+    /// HTTP status code returned by `GET /rate_limit`.
+    pub(crate) status: u16,
+    /// Value of the response `Date` header (server clock), if present.
+    pub(crate) server_date: Option<String>,
+    /// Value of the `X-RateLimit-Remaining` header, if present.
+    pub(crate) rate_remaining: Option<String>,
+}
+
 #[allow(clippy::same_name_method)]
 impl Client {
+    /// Hit the free `/rate_limit` endpoint to confirm the network path works
+    /// and the token is accepted. Returns the HTTP status plus the server
+    /// `Date` and rate-limit headers. Does not consume the call budget.
+    pub(crate) fn probe(&self) -> Result<Probe> {
+        let url = api_url("rate_limit");
+        let request = self.token.with_unmasked(|plain| {
+            let mut auth_header = format!("Bearer {plain}");
+            let req = self
+                .agent
+                .get(&url)
+                .set("Accept", "application/vnd.github+json")
+                .set("X-GitHub-Api-Version", "2022-11-28")
+                .set("User-Agent", concat!("hasp/", env!("CARGO_PKG_VERSION")))
+                .set("Authorization", &auth_header);
+            scrub_string(&mut auth_header);
+            req
+        });
+
+        match request.call() {
+            Ok(resp) => {
+                let status = resp.status();
+                let server_date = resp.header("Date").map(str::to_string);
+                let rate_remaining = resp.header("X-RateLimit-Remaining").map(str::to_string);
+                let _ = resp
+                    .into_reader()
+                    .take(1024 * 64)
+                    .read_to_string(&mut String::new());
+                Ok(Probe {
+                    status,
+                    server_date,
+                    rate_remaining,
+                })
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let server_date = resp.header("Date").map(str::to_string);
+                Ok(Probe {
+                    status: code,
+                    server_date,
+                    rate_remaining: None,
+                })
+            }
+            Err(e) => bail!("GitHub API connectivity probe failed: {e}"),
+        }
+    }
+
     pub(crate) fn new_with_call_budget(
         token: SecureToken,
         resolved_addrs: &[SocketAddr],
         call_count: Arc<AtomicU32>,
         max_calls: u32,
+        timeout_secs: u64,
     ) -> Result<Self> {
-        Self::new_inner(token, resolved_addrs, Some(call_count), max_calls)
+        Self::new_inner(token, resolved_addrs, Some(call_count), max_calls, timeout_secs)
     }
 
     fn new_inner(
@@ -323,6 +384,7 @@ impl Client {
         resolved_addrs: &[SocketAddr],
         call_count: Option<Arc<AtomicU32>>,
         max_calls: u32,
+        timeout_secs: u64,
     ) -> Result<Self> {
         if resolved_addrs.is_empty() {
             bail!("Cannot create GitHub client without pre-resolved addresses");
@@ -330,8 +392,11 @@ impl Client {
 
         let tls_config = create_github_pinned_tls_config()?;
 
+        // Clamp to a sane floor; the CLI validates 1..=3600 but internal
+        // callers pass a default, so never allow a zero (= no) timeout.
+        let timeout_secs = timeout_secs.clamp(1, 3600);
         let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .redirects(5)
             .tls_config(tls_config)
             .resolver(PinnedResolver {

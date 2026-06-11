@@ -33,6 +33,23 @@ impl SecureToken {
         Self::from_string(value)
     }
 
+    /// Read a token from a file (e.g. `--token-file`). Surrounding whitespace
+    /// (including a trailing newline from `echo`) is trimmed in place so no
+    /// un-scrubbed copy of the secret is left behind.
+    pub(crate) fn from_file(path: &std::path::Path) -> Result<Self> {
+        let mut value = std::fs::read_to_string(path)
+            .context(format!("Cannot read token file {}", path.display()))?;
+        let start = value.len() - value.trim_start().len();
+        value.drain(..start);
+        let end = value.trim_end().len();
+        value.truncate(end);
+        if value.is_empty() {
+            scrub_string(&mut value);
+            crate::error::bail!("Token file {} is empty", path.display());
+        }
+        Self::from_string(value)
+    }
+
     /// Read a secret from stdin (pipe from parent process).
     ///
     /// This avoids passing secrets via environment variables, which leak

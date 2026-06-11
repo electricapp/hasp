@@ -339,6 +339,131 @@ pub(crate) fn print_upstream_changes_no_detail(changes: &[ActionRefChange]) {
     println!();
 }
 
+/// Lowercase JSON status string for a `format_result` / `format_container_ref`
+/// tag.
+fn tag_to_status(tag: &str) -> &'static str {
+    match tag {
+        "PASS" => "pass",
+        "FAIL" => "fail",
+        "WARN" => "warn",
+        _ => "skip",
+    }
+}
+
+/// Render the full scan result as a JSON document and return it together with
+/// the overall failure flag (whether exit code 1 is warranted). The failure
+/// flag is computed from the SAME pure classifiers (`format_result`,
+/// `format_container_ref`) the human report uses, so the two output modes can
+/// never disagree on exit code.
+pub(crate) fn scan_json(
+    results: &[VerificationResult],
+    container_refs: &[ContainerRef],
+    skipped_refs: &[SkippedRef],
+    findings: &[AuditFinding],
+    strict: bool,
+    policy: &Policy,
+    suppressed_count: usize,
+) -> (String, bool) {
+    use crate::jsonout::quote;
+    use std::fmt::Write as _;
+
+    let mut failed = false;
+    let mut out = String::new();
+    let _ = writeln!(out, "{{");
+    let _ = writeln!(out, "  \"version\": {},", quote(env!("CARGO_PKG_VERSION")));
+
+    // ── action references ──
+    let _ = writeln!(out, "  \"action_refs\": [");
+    for (i, r) in results.iter().enumerate() {
+        let resolved = policy.resolve_for_action(
+            &r.action_ref.owner,
+            &r.action_ref.repo,
+            r.action_ref.path.as_deref(),
+        );
+        let policy_skip = matches!(&r.status, VerificationStatus::MutableRef { .. })
+            && matches!(resolved.pin, policy::PinPolicy::Off)
+            && !strict;
+        let (tag, detail, is_failure) = format_result(r, strict, resolved.pin);
+        if is_failure && !policy_skip {
+            failed = true;
+        }
+        let status = if policy_skip { "skip" } else { tag_to_status(tag) };
+        let comma = if i + 1 < results.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "    {{\"action\": {}, \"ref\": {}, \"file\": {}, \"status\": {}, \"detail\": {}}}{comma}",
+            quote(&r.action_ref.target()),
+            quote(r.action_ref.short_ref()),
+            quote(&r.action_ref.file.display().to_string()),
+            quote(status),
+            quote(&detail),
+        );
+    }
+    let _ = writeln!(out, "  ],");
+
+    // ── container references ──
+    let _ = writeln!(out, "  \"container_refs\": [");
+    for (i, r) in container_refs.iter().enumerate() {
+        let (tag, detail, is_failure) = format_container_ref(r, strict);
+        if is_failure {
+            failed = true;
+        }
+        let comma = if i + 1 < container_refs.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "    {{\"image\": {}, \"file\": {}, \"status\": {}, \"detail\": {}}}{comma}",
+            quote(&r.image),
+            quote(&r.file.display().to_string()),
+            quote(tag_to_status(tag)),
+            quote(&detail),
+        );
+    }
+    let _ = writeln!(out, "  ],");
+
+    // ── unauditable references (always blocking) ──
+    if !skipped_refs.is_empty() {
+        failed = true;
+    }
+    let _ = writeln!(out, "  \"unauditable_refs\": [");
+    for (i, s) in skipped_refs.iter().enumerate() {
+        let comma = if i + 1 < skipped_refs.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "    {{\"uses\": {}, \"file\": {}, \"detail\": {}}}{comma}",
+            quote(&s.uses_str),
+            quote(&s.file.display().to_string()),
+            quote(&s.detail),
+        );
+    }
+    let _ = writeln!(out, "  ],");
+
+    // ── audit findings ──
+    let _ = writeln!(out, "  \"findings\": [");
+    for (i, f) in findings.iter().enumerate() {
+        if !f.is_warning {
+            failed = true;
+        }
+        let level = if f.is_warning { "warn" } else { "deny" };
+        let comma = if i + 1 < findings.len() { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "    {{\"severity\": {}, \"level\": {}, \"title\": {}, \"file\": {}, \"detail\": {}}}{comma}",
+            quote(&format!("{}", f.severity)),
+            quote(level),
+            quote(&f.title),
+            quote(&f.file.display().to_string()),
+            quote(&f.detail),
+        );
+    }
+    let _ = writeln!(out, "  ],");
+
+    let _ = writeln!(out, "  \"suppressed\": {suppressed_count},");
+    let _ = writeln!(out, "  \"ok\": {}", !failed);
+    let _ = writeln!(out, "}}");
+
+    (out, failed)
+}
+
 fn textwrap(s: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();

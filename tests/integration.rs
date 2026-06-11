@@ -95,13 +95,15 @@ fn scan_fixtures_detects_mutable_refs() {
         fixtures_dir().to_str().unwrap(),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Should find action references
+    // Status/progress lines (the ref counts) go to stderr; the report goes to
+    // stdout. This keeps `hasp > report.txt` clean.
     assert!(
-        stdout.contains("action reference"),
-        "scan should report action references: {stdout}"
+        stderr.contains("action reference"),
+        "scan should report action reference counts on stderr: {stderr}"
     );
-    // Mutable refs should appear as WARN (not strict mode)
+    // Mutable refs should appear as WARN (not strict mode) in the stdout report
     assert!(
         stdout.contains("WARN") || stdout.contains("mutable ref"),
         "scan should warn about mutable refs: {stdout}"

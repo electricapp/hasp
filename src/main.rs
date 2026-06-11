@@ -1,6 +1,9 @@
 mod audit;
 mod cli;
+mod completion;
 mod diff;
+mod docs;
+mod doctor;
 mod error;
 mod exec;
 mod forward_proxy;
@@ -8,6 +11,7 @@ mod git_util;
 mod github;
 mod integrity;
 mod ipc;
+mod jsonout;
 mod manifest;
 mod netguard;
 mod oidc;
@@ -43,6 +47,8 @@ fn scrubbed_subprocess_vars() -> &'static [&'static str] {
 }
 
 fn main() {
+    install_panic_hook();
+
     #[cfg(target_os = "linux")]
     maybe_self_stop_for_sandbox();
 
@@ -54,6 +60,22 @@ fn main() {
         eprintln!("hasp: error: {e}");
         std::process::exit(2);
     }
+}
+
+/// Install a panic hook that, after the default message, points the user at
+/// the issue tracker. A panic is always a hasp bug (not user error), so this
+/// is the one place a "report this" URL belongs. Runs even under
+/// `panic = "abort"`: the hook fires before the process aborts.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        eprintln!(
+            "\nhasp: this is a bug. Please report it, including the message above:\n  \
+             https://github.com/{}/issues",
+            env!("GITHUB_REPO"),
+        );
+    }));
 }
 
 /// If the parent set `HASP_AWAIT_SANDBOX=1` AND the parent process really
@@ -126,6 +148,9 @@ fn run() -> Result<()> {
         Mode::Tree => supply_chain_graph::run_tree(&args),
         Mode::Replay => replay::run(&args),
         Mode::Exec => exec::run_exec(&args),
+        Mode::Doctor => doctor::run(&args),
+        Mode::Docs => docs::run(args.docs_topic.as_deref()),
+        Mode::Completion => completion::run(args.completion_shell.as_deref().unwrap_or("")),
         Mode::InternalScan => run_internal_scan(&args),
         Mode::InternalVerify => run_internal_verify(&args),
         Mode::InternalProxy => run_internal_proxy(&args),
@@ -138,6 +163,7 @@ fn run() -> Result<()> {
 fn run_launcher(args: &cli::Args) -> Result<()> {
     sandbox::platform_preflight(args.allow_unsandboxed, true)?;
     scrub_parent_environment();
+    apply_token_file(args)?;
 
     let canonical_dir = args
         .dir
@@ -160,12 +186,24 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
     // git checkout (e.g. by a prior CI step). Skipped with --allow-unsandboxed
     // since dev workflows may have uncommitted changes.
     if args.allow_unsandboxed {
-        eprintln!("hasp: note: workflow integrity check skipped (--allow-unsandboxed)");
+        if !args.quiet {
+            eprintln!("hasp: note: workflow integrity check skipped (--allow-unsandboxed)");
+        }
     } else {
         integrity::check_workflow_integrity(&canonical_dir)?;
     }
 
-    println!("hasp: scanning {}/", canonical_dir.display());
+    // Status/progress lines go to stderr so stdout carries only the report
+    // (or, with --json, only the JSON document). Suppressed by --quiet.
+    if !args.quiet {
+        eprintln!("hasp: scanning {}/", canonical_dir.display());
+    }
+    if args.verbose {
+        eprintln!(
+            "hasp: settings: strict={} paranoid={} no_verify={} max_transitive_depth={}",
+            args.strict, args.paranoid, args.no_verify, args.max_transitive_depth
+        );
+    }
     let exe = std::env::current_exe().context("Cannot resolve current executable path")?;
     let scan = run_scan_subprocess(&exe, args)?;
 
@@ -175,24 +213,39 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
         && !args.paranoid
         && !has_policy_checks
     {
-        println!("hasp: no executable dependency references found.");
+        if args.json {
+            let (json, _) = report::scan_json(
+                &[],
+                &scan.container_refs,
+                &scan.skipped_refs,
+                &[],
+                args.strict,
+                &policy,
+                0,
+            );
+            print!("{json}");
+        } else if !args.quiet {
+            eprintln!("hasp: no executable dependency references found.");
+        }
         return Ok(());
     }
 
-    if !scan.action_refs.is_empty() {
-        println!("hasp: found {} action reference(s)", scan.action_refs.len());
-    }
-    if !scan.container_refs.is_empty() {
-        println!(
-            "hasp: found {} container image reference(s)",
-            scan.container_refs.len()
-        );
-    }
-    if !scan.skipped_refs.is_empty() {
-        println!(
-            "hasp: found {} unauditable reference(s)",
-            scan.skipped_refs.len()
-        );
+    if !args.quiet {
+        if !scan.action_refs.is_empty() {
+            eprintln!("hasp: found {} action reference(s)", scan.action_refs.len());
+        }
+        if !scan.container_refs.is_empty() {
+            eprintln!(
+                "hasp: found {} container image reference(s)",
+                scan.container_refs.len()
+            );
+        }
+        if !scan.skipped_refs.is_empty() {
+            eprintln!(
+                "hasp: found {} unauditable reference(s)",
+                scan.skipped_refs.len()
+            );
+        }
     }
 
     // ── Compute diff-base changes (before any env scrubbing) ──────────
@@ -236,10 +289,12 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
                  Pass --no-verify to explicitly skip verification."
             );
         }
-        eprintln!(
-            "hasp: note: GITHUB_TOKEN not set — SHA verification skipped. \
-             Pass --no-verify to silence."
-        );
+        if !args.quiet {
+            eprintln!(
+                "hasp: note: GITHUB_TOKEN not set — SHA verification skipped. \
+                 Pass --no-verify to silence."
+            );
+        }
         (
             github::skip_verify(&scan.action_refs),
             Vec::new(),
@@ -252,19 +307,42 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
     // launcher only needs to format results to stdout/stderr and exit.
     sandbox::phase3_deny_launcher(args.allow_unsandboxed)?;
 
+    // Policy enables audit even without --paranoid. Compute the (possibly
+    // suppressed) finding set once; it feeds both the text and JSON output.
+    let run_audit = args.paranoid || args.has_age_policy() || has_policy_checks;
+    let (audit_findings, suppressed_count) = if run_audit {
+        let mut all_findings = scan.audit_findings.clone();
+        all_findings.append(&mut provenance_findings);
+        let suppressed = apply_suppressions(&policy, &mut all_findings);
+        (all_findings, suppressed)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    // ── JSON output: one machine-readable document, then exit ──────────────
+    if args.json {
+        let (json, failed) = report::scan_json(
+            &results,
+            &scan.container_refs,
+            &scan.skipped_refs,
+            &audit_findings,
+            args.strict,
+            &policy,
+            suppressed_count,
+        );
+        print!("{json}");
+        if failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // ── Human-readable report ──────────────────────────────────────────────
     let has_unsupported_refs = report::print_skipped_refs(&scan.skipped_refs);
     let has_container_failures = report::print_container_refs(&scan.container_refs, args.strict);
     let has_pin_failures = report::print_results(&results, args.strict, &policy);
-
-    // Policy enables audit even without --paranoid
-    let run_audit = args.paranoid || args.has_age_policy() || has_policy_checks;
     let has_audit_failures = if run_audit {
-        let mut all_findings = scan.audit_findings;
-        all_findings.append(&mut provenance_findings);
-
-        // Apply suppressions from policy
-        let suppressed_count = apply_suppressions(&policy, &mut all_findings);
-        report::print_audit_findings(&all_findings, suppressed_count)
+        report::print_audit_findings(&audit_findings, suppressed_count)
     } else {
         false
     };
@@ -283,9 +361,42 @@ fn run_launcher(args: &cli::Args) -> Result<()> {
     Ok(())
 }
 
+/// If `--token-file` was given, read the token and place it in `GITHUB_TOKEN`
+/// so the existing env-based verification flow (which captures and scrubs the
+/// var before spawning the proxy child) picks it up. A flag beats the ambient
+/// env var, so the file always wins. The launcher is single-threaded with no
+/// children yet at this point, so the brief in-process env write is no worse
+/// than the user having exported `GITHUB_TOKEN` themselves — and it keeps the
+/// secret out of their shell history and sibling processes.
+fn apply_token_file(args: &cli::Args) -> Result<()> {
+    let Some(path) = &args.token_file else {
+        return Ok(());
+    };
+    let mut raw = std::fs::read_to_string(path)
+        .context(format!("Cannot read token file {}", path.display()))?;
+    // Trim surrounding whitespace in place so no un-scrubbed copy is left.
+    let start = raw.len() - raw.trim_start().len();
+    raw.drain(..start);
+    raw.truncate(raw.trim_end().len());
+    if raw.is_empty() {
+        token::scrub_string(&mut raw);
+        error::bail!("Token file {} is empty", path.display());
+    }
+    // SAFETY: the launcher is single-threaded here (before any thread or child
+    // process is spawned), so set_var has no data races.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("GITHUB_TOKEN", &raw);
+    }
+    token::scrub_string(&mut raw);
+    Ok(())
+}
+
 fn load_policy(args: &cli::Args, canonical_dir: &Path) -> Result<policy::Policy> {
     let (pol, loaded_from) = policy::Policy::resolve(args, canonical_dir)?;
-    if let Some(path) = loaded_from {
+    if let Some(path) = loaded_from
+        && !args.quiet
+    {
         eprintln!("hasp: loaded policy from {}", path.display());
     }
 
@@ -676,7 +787,10 @@ fn run_internal_proxy(args: &cli::Args) -> Result<()> {
         sandbox::NetworkPolicy::Allow,
         false,
     )?;
-    proxy::run_server()
+    proxy::run_server(
+        args.timeout_seconds
+            .unwrap_or(github::DEFAULT_HTTP_TIMEOUT_SECS),
+    )
 }
 
 fn run_scan_subprocess(exe: &Path, args: &cli::Args) -> Result<ipc::ScanPayload> {
@@ -836,6 +950,12 @@ fn build_child_command(exe: &Path, args: &cli::Args) -> Command {
     if args.strict {
         cmd.arg("--strict");
     }
+    if args.quiet {
+        cmd.arg("--quiet");
+    }
+    if args.verbose {
+        cmd.arg("--verbose");
+    }
     if let Some(seconds) = args.min_sha_age_seconds {
         cmd.arg("--min-sha-age").arg(format!("{seconds}s"));
     }
@@ -850,6 +970,9 @@ fn build_child_command(exe: &Path, args: &cli::Args) -> Command {
         cmd.arg("--no-policy");
     }
     cmd.arg("--dir").arg(&args.dir);
+    if let Some(secs) = args.timeout_seconds {
+        cmd.arg("--timeout").arg(format!("{secs}"));
+    }
     if args.max_transitive_depth != 3 {
         cmd.arg("--max-transitive-depth")
             .arg(format!("{}", args.max_transitive_depth));

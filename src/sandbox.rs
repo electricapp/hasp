@@ -46,6 +46,49 @@ pub(crate) fn platform_preflight(allow_unsandboxed: bool, emit_warning: bool) ->
     Ok(())
 }
 
+/// Human-facing summary of OS sandbox availability, for `hasp doctor`.
+pub(crate) struct SandboxReport {
+    /// Whether the OS sandbox can be enforced on this platform/kernel.
+    pub(crate) available: bool,
+    /// One-line detail (platform note, kernel requirement, or error).
+    pub(crate) detail: String,
+}
+
+/// Detect — without self-restricting — whether the OS sandbox is available.
+/// Used only by `hasp doctor`; never alters the calling process. On Linux it
+/// creates (but does NOT enforce) a Landlock ruleset to confirm kernel support.
+pub(crate) fn doctor_status() -> SandboxReport {
+    #[cfg(target_os = "linux")]
+    {
+        use landlock::{AccessFs, Ruleset, RulesetAttr};
+
+        let write_rights = AccessFs::WriteFile | AccessFs::MakeReg | AccessFs::RemoveFile;
+        match Ruleset::default()
+            .handle_access(write_rights)
+            .map_err(|e| format!("{e}"))
+            .and_then(|r| r.create().map_err(|e| format!("{e}")))
+        {
+            Ok(_ruleset) => SandboxReport {
+                available: true,
+                detail: "Landlock + seccomp available (Linux)".to_string(),
+            },
+            Err(e) => SandboxReport {
+                available: false,
+                detail: format!("Landlock unavailable (kernel >= 5.13 required): {e}"),
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        SandboxReport {
+            available: false,
+            detail: "OS sandbox is Linux-only; use --allow-unsandboxed for development"
+                .to_string(),
+        }
+    }
+}
+
 pub(crate) fn phase1_deny_writes_and_syscalls(
     allow_unsandboxed: bool,
     network_policy: NetworkPolicy,

@@ -7,12 +7,53 @@ pub(crate) enum Mode {
     Tree,
     Replay,
     Exec,
+    Doctor,
+    Docs,
+    Completion,
     InternalScan,
     InternalVerify,
     InternalProxy,
     InternalForwardProxy,
     InternalBpfHelper,
 }
+
+/// Subcommands recognized as the first positional argument. Used both for
+/// dispatch and for "did you mean" suggestions on typos.
+const SUBCOMMANDS: &[&str] = &[
+    "diff",
+    "tree",
+    "replay",
+    "exec",
+    "doctor",
+    "docs",
+    "completion",
+    "help",
+];
+
+/// Top-level scan-mode flags, for "did you mean" suggestions on unknown flags.
+const SCANNER_FLAGS: &[&str] = &[
+    "--dir",
+    "--strict",
+    "--paranoid",
+    "--no-verify",
+    "--max-transitive-depth",
+    "--min-sha-age",
+    "--security-action-min-sha-age",
+    "--policy",
+    "--no-policy",
+    "--oidc-policy",
+    "--no-oidc",
+    "--diff-base",
+    "--self-check",
+    "--allow-unsandboxed",
+    "--token-file",
+    "--timeout",
+    "--json",
+    "--quiet",
+    "--verbose",
+    "--help",
+    "--version",
+];
 
 #[derive(Clone)]
 pub(crate) struct ExecArgs {
@@ -46,6 +87,22 @@ pub(crate) struct Args {
     pub(crate) tree_min_score: Option<f32>,
     pub(crate) replay_since: Option<String>,
     pub(crate) replay_format: Option<crate::replay::ReplayFormat>,
+    /// Global `--json` switch: machine-readable output for the scan mode and
+    /// `doctor`. Subcommands with richer formats keep their own `--format`.
+    pub(crate) json: bool,
+    /// `-q`/`--quiet`: suppress non-essential `note:`/status lines on stderr.
+    pub(crate) quiet: bool,
+    /// `-v`/`--verbose`: emit extra diagnostic detail.
+    pub(crate) verbose: bool,
+    /// `--timeout <secs>`: per-request network timeout (default 30s).
+    pub(crate) timeout_seconds: Option<u64>,
+    /// `--token-file <path>`: read the GitHub token from a file instead of
+    /// the `GITHUB_TOKEN` environment variable.
+    pub(crate) token_file: Option<PathBuf>,
+    /// `hasp docs [topic]` positional.
+    pub(crate) docs_topic: Option<String>,
+    /// `hasp completion <shell>` positional.
+    pub(crate) completion_shell: Option<String>,
     pub(crate) mode: Mode,
     pub(crate) exec: Option<ExecArgs>,
 }
@@ -73,6 +130,13 @@ impl Default for Args {
             tree_min_score: None,
             replay_since: None,
             replay_format: None,
+            json: false,
+            quiet: false,
+            verbose: false,
+            timeout_seconds: None,
+            token_file: None,
+            docs_topic: None,
+            completion_shell: None,
             mode: Mode::Launcher,
             exec: None,
         }
@@ -86,29 +150,88 @@ impl Args {
 }
 
 pub(crate) fn parse() -> Args {
-    let mut args = Args::default();
+    let args = Args::default();
     let mut iter = std::env::args().skip(1);
 
-    // Peek at the first argument to detect subcommands
+    // Peek at the first argument to detect subcommands. Dispatch is exact-match
+    // only: no prefix abbreviations (so adding a subcommand can never change
+    // what an existing abbreviation means) and no implicit catch-all.
     let first = iter.next();
     if let Some(ref first_arg) = first {
-        if first_arg == "exec" {
-            return parse_exec(args, iter);
-        }
-        if first_arg == "diff" {
-            return parse_diff(args, iter);
-        }
-        if first_arg == "tree" {
-            return parse_tree(args, iter);
-        }
-        if first_arg == "replay" {
-            return parse_replay(args, iter);
+        match first_arg.as_str() {
+            "exec" => return parse_exec(args, iter),
+            "diff" => return parse_diff(args, iter),
+            "tree" => return parse_tree(args, iter),
+            "replay" => return parse_replay(args, iter),
+            "doctor" => return parse_doctor(args, iter),
+            "docs" => return parse_docs(args, iter),
+            "completion" => return parse_completion(args, iter),
+            "help" => print_help_for(iter.next().as_deref()),
+            _ => {}
         }
     }
-    // If not a subcommand, re-process the first argument in the normal loop
+    // If not a subcommand, re-process the first argument in the normal loop.
+    let mut args = args;
     let replay = first.into_iter().chain(iter);
     parse_scanner_args(&mut args, replay);
     args
+}
+
+/// Levenshtein edit distance between two strings (hand-rolled, no deps).
+/// Used only for short CLI tokens, so the quadratic cost is irrelevant.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0_usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// The closest candidate to `input` within edit distance 2, if any.
+fn suggest<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .map(|c| (levenshtein(input, c), *c))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|&(d, _)| d)
+        .map(|(_, c)| c)
+}
+
+/// Print "Did you mean '<prefix><suggestion>'?" on stderr when a near match
+/// exists for `token` among `candidates`.
+fn print_suggestion(token: &str, candidates: &[&str], prefix: &str) {
+    if let Some(s) = suggest(token, candidates) {
+        eprintln!("Did you mean '{prefix}{s}'?");
+    }
+}
+
+/// Dispatch `hasp help [command]`. Diverges (prints and exits).
+fn print_help_for(name: Option<&str>) -> ! {
+    match name {
+        None => print_help(),
+        Some("diff") => print_diff_help(),
+        Some("tree") => print_tree_help(),
+        Some("replay") => print_replay_help(),
+        Some("exec") => print_exec_help(),
+        Some("doctor") => print_doctor_help(),
+        Some("docs") => print_docs_help(),
+        Some("completion") => print_completion_help(),
+        Some(other) => {
+            eprintln!("hasp help: unknown command: {other}");
+            print_suggestion(other, SUBCOMMANDS, "hasp help ");
+            eprintln!("Run 'hasp help' for the list of commands.");
+            std::process::exit(2);
+        }
+    }
+    std::process::exit(0);
 }
 
 fn parse_diff(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
@@ -149,6 +272,18 @@ fn parse_diff(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
                 // First non-flag positional is the base ref.
                 if other.starts_with('-') {
                     eprintln!("hasp diff: unknown option: {other}");
+                    print_suggestion(
+                        other,
+                        &[
+                            "--format",
+                            "--dir",
+                            "--policy",
+                            "--no-policy",
+                            "--paranoid",
+                            "--allow-unsandboxed",
+                        ],
+                        "",
+                    );
                     eprintln!("Try 'hasp diff --help' for usage.");
                     std::process::exit(2);
                 }
@@ -204,6 +339,11 @@ fn parse_exec(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
             }
             other => {
                 eprintln!("hasp exec: unknown option: {other}");
+                print_suggestion(
+                    other,
+                    &["--manifest", "--writable", "--allow-unsandboxed"],
+                    "",
+                );
                 eprintln!("Try 'hasp exec --help' for usage.");
                 std::process::exit(2);
             }
@@ -301,6 +441,22 @@ fn parse_scanner_args(args: &mut Args, mut iter: impl Iterator<Item = String>) {
             "--no-oidc" => args.no_oidc = true,
             "--self-check" => args.self_check = true,
             "--allow-unsandboxed" => args.allow_unsandboxed = true,
+            "--token-file" => {
+                args.token_file = Some(PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp: --token-file requires a file path");
+                    std::process::exit(2);
+                })));
+            }
+            "--timeout" => {
+                let value = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp: --timeout requires a value in seconds");
+                    std::process::exit(2);
+                });
+                args.timeout_seconds = Some(parse_timeout_or_exit(&value));
+            }
+            "--json" => args.json = true,
+            "-q" | "--quiet" => args.quiet = true,
+            "-v" | "--verbose" => args.verbose = true,
             "--internal-scan" => args.mode = Mode::InternalScan,
             "--internal-verify" => args.mode = Mode::InternalVerify,
             "--internal-proxy" => args.mode = Mode::InternalProxy,
@@ -312,19 +468,31 @@ fn parse_scanner_args(args: &mut Args, mut iter: impl Iterator<Item = String>) {
             }
             "-V" | "--version" => {
                 println!(
-                    "hasp {} ({}) [{}]",
+                    "hasp {} ({}, {}) [{}]",
                     env!("CARGO_PKG_VERSION"),
                     env!("GIT_HASH"),
+                    env!("COMMIT_DATE"),
                     env!("RUST_VERSION"),
                 );
                 std::process::exit(0);
             }
             other => {
-                eprintln!("hasp: unknown argument: {other}");
+                if other.starts_with('-') {
+                    eprintln!("hasp: unknown option: {other}");
+                    print_suggestion(other, SCANNER_FLAGS, "");
+                } else {
+                    eprintln!("hasp: unknown argument: {other}");
+                    print_suggestion(other, SUBCOMMANDS, "hasp ");
+                }
                 eprintln!("Try 'hasp --help' for usage.");
                 std::process::exit(2);
             }
         }
+    }
+
+    if args.quiet && args.verbose {
+        eprintln!("hasp: --quiet and --verbose are mutually exclusive");
+        std::process::exit(2);
     }
 
     if args.paranoid {
@@ -344,6 +512,17 @@ fn parse_duration_or_exit(flag: &str, raw: &str) -> i64 {
         eprintln!("hasp: {flag} expects a duration like 48h, 30d, 15m, or 3600s");
         std::process::exit(2);
     })
+}
+
+/// Parse `--timeout` as whole seconds in the range 1..=3600.
+fn parse_timeout_or_exit(raw: &str) -> u64 {
+    match raw.parse::<u64>() {
+        Ok(secs) if (1..=3600).contains(&secs) => secs,
+        _ => {
+            eprintln!("hasp: --timeout must be a whole number of seconds between 1 and 3600");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn parse_duration(raw: &str) -> Option<i64> {
@@ -412,6 +591,17 @@ fn parse_tree(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args
             }
             other => {
                 eprintln!("hasp tree: unknown option: {other}");
+                print_suggestion(
+                    other,
+                    &[
+                        "--format",
+                        "--min-score",
+                        "--dir",
+                        "--no-verify",
+                        "--allow-unsandboxed",
+                    ],
+                    "",
+                );
                 eprintln!("Try 'hasp tree --help' for usage.");
                 std::process::exit(2);
             }
@@ -454,9 +644,103 @@ fn parse_replay(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Ar
             }
             other => {
                 eprintln!("hasp replay: unknown option: {other}");
+                print_suggestion(other, &["--since", "--format", "--dir"], "");
                 eprintln!("Try 'hasp replay --help' for usage.");
                 std::process::exit(2);
             }
+        }
+    }
+    args
+}
+
+fn parse_doctor(mut args: Args, mut iter: std::iter::Skip<std::env::Args>) -> Args {
+    args.mode = Mode::Doctor;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => args.json = true,
+            "--no-verify" => args.no_verify = true,
+            "--allow-unsandboxed" => args.allow_unsandboxed = true,
+            "-q" | "--quiet" => args.quiet = true,
+            "-v" | "--verbose" => args.verbose = true,
+            "--token-file" => {
+                args.token_file = Some(PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp doctor: --token-file requires a file path");
+                    std::process::exit(2);
+                })));
+            }
+            "--timeout" => {
+                let value = iter.next().unwrap_or_else(|| {
+                    eprintln!("hasp doctor: --timeout requires a value in seconds");
+                    std::process::exit(2);
+                });
+                args.timeout_seconds = Some(parse_timeout_or_exit(&value));
+            }
+            "-h" | "--help" => {
+                print_doctor_help();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("hasp doctor: unknown option: {other}");
+                eprintln!("Try 'hasp doctor --help' for usage.");
+                std::process::exit(2);
+            }
+        }
+    }
+    args
+}
+
+fn parse_docs(mut args: Args, iter: std::iter::Skip<std::env::Args>) -> Args {
+    args.mode = Mode::Docs;
+    let mut positional: Vec<String> = Vec::new();
+    for arg in iter {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_docs_help();
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("hasp docs: unknown option: {other}");
+                eprintln!("Try 'hasp docs --help' for usage.");
+                std::process::exit(2);
+            }
+            other => positional.push(other.to_string()),
+        }
+    }
+    if positional.len() > 1 {
+        eprintln!("hasp docs: expected at most one topic, got {positional:?}");
+        std::process::exit(2);
+    }
+    args.docs_topic = positional.into_iter().next();
+    args
+}
+
+fn parse_completion(mut args: Args, iter: std::iter::Skip<std::env::Args>) -> Args {
+    args.mode = Mode::Completion;
+    let mut positional: Vec<String> = Vec::new();
+    for arg in iter {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_completion_help();
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("hasp completion: unknown option: {other}");
+                eprintln!("Try 'hasp completion --help' for usage.");
+                std::process::exit(2);
+            }
+            other => positional.push(other.to_string()),
+        }
+    }
+    match positional.len() {
+        0 => {
+            eprintln!("hasp completion: missing <shell> (bash, zsh, or fish)");
+            eprintln!("Usage: hasp completion <bash|zsh|fish>");
+            std::process::exit(2);
+        }
+        1 => args.completion_shell = Some(positional.remove(0)),
+        _ => {
+            eprintln!("hasp completion: expected one shell name, got {positional:?}");
+            std::process::exit(2);
         }
     }
     args
@@ -482,6 +766,11 @@ OPTIONS:
 EXIT CODES:
     0   No past state would have produced a deny-level finding
     1   At least one past state would have failed today's audit
+    2   Usage error
+
+EXAMPLES:
+    hasp replay --since 90d
+    hasp replay --since 6h --format markdown
 
 Uses `git log` to enumerate historical revisions of workflow files and
 re-runs the current audit rules against each past state. Answers:
@@ -508,16 +797,21 @@ OPTIONS:
                                    therefore always pass.
     --no-verify                    Skip all online (GitHub API) signals;
                                    render the graph from offline data only
+    -d, --dir <DIR>                Workflow directory [default: .github/workflows]
+        --allow-unsandboxed        Skip sandbox preflight (dev mode)
+    -h, --help                     Print this help
 
 NOTE:
     `hasp tree` always runs the static audit at the policy-configured
     levels to populate `findings_here`. `--paranoid` and `--no-oidc`
     are honored by `hasp` / `hasp diff` but do not affect tree output.
-    -d, --dir <DIR>                Workflow directory [default: .github/workflows]
-        --allow-unsandboxed        Skip sandbox preflight (dev mode)
-    -h, --help                     Print this help
 
-EXAMPLE:
+EXIT CODES:
+    0   Every node scores at or above --min-score (or no threshold set)
+    1   At least one node scored below --min-score
+    2   Usage error
+
+EXAMPLES:
     hasp tree
     hasp tree --format json | jq '.nodes[] | select(.score < 0.5)'
     hasp tree --min-score 0.6",
@@ -551,8 +845,9 @@ OPTIONS:
 EXIT CODES:
     0   No new blocking findings introduced
     1   At least one new deny-level finding in the head branch
+    2   Usage error
 
-EXAMPLE:
+EXAMPLES:
     hasp diff main --format markdown | gh pr comment --body-file -",
         env!("CARGO_PKG_VERSION")
     );
@@ -577,7 +872,12 @@ OPTIONS:
                             Development-only; weakens the threat model.
     -h, --help              Print this help
 
-EXAMPLE:
+EXIT CODES:
+    The child command's own exit status is propagated. hasp itself uses
+    exit 2 for usage errors and refuses to run (exit 2) without a sandbox
+    unless --allow-unsandboxed is passed.
+
+EXAMPLES:
     hasp exec --manifest .hasp/publish.yml -- npm publish
 
 The child process runs with:
@@ -589,20 +889,122 @@ The child process runs with:
     );
 }
 
+fn print_doctor_help() {
+    println!(
+        "\
+hasp doctor {}
+Run environment health checks and report what works and what doesn't.
+
+USAGE:
+    hasp doctor [OPTIONS]
+
+OPTIONS:
+        --no-verify         Skip checks that require the GitHub API (offline)
+        --token-file <PATH> Read the GitHub token from a file
+        --timeout <SECS>    Per-request network timeout [default: 30]
+        --allow-unsandboxed Report sandbox status without refusing to run
+        --json              Machine-readable JSON output
+    -q, --quiet             Print only failures
+    -h, --help              Print this help
+
+CHECKS:
+    * GitHub token present (env or --token-file)
+    * api.github.com reachable and token accepted
+    * Clock skew vs the GitHub server
+    * OS sandbox availability (Landlock / seccomp on this platform)
+    * Policy file (.hasp.yml) discovery and parse
+
+EXIT CODES:
+    0   All checks passed (warnings allowed)
+    1   At least one check failed
+    2   Usage error
+
+EXAMPLES:
+    hasp doctor
+    hasp doctor --json | jq '.checks[] | select(.status != \"ok\")'",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_docs_help() {
+    println!(
+        "\
+hasp docs {}
+Print in-binary documentation topics. Works fully offline; the text is
+embedded in this exact build.
+
+USAGE:
+    hasp docs [TOPIC]
+
+ARGS:
+    [TOPIC]   A topic name. With no topic, lists the available topics.
+
+EXIT CODES:
+    0   Topic printed, or topic list shown
+    2   Unknown topic
+
+EXAMPLES:
+    hasp docs                # list topics
+    hasp docs policy         # print the .hasp.yml policy reference
+    hasp docs security | less",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_completion_help() {
+    println!(
+        "\
+hasp completion {}
+Generate a shell completion script. Print it to stdout and source it.
+
+USAGE:
+    hasp completion <SHELL>
+
+ARGS:
+    <SHELL>   One of: bash, zsh, fish
+
+EXIT CODES:
+    0   Script written to stdout
+    2   Missing or unsupported shell
+
+EXAMPLES:
+    hasp completion bash > /etc/bash_completion.d/hasp
+    hasp completion zsh  > \"${{fpath[1]}}/_hasp\"
+    hasp completion fish > ~/.config/fish/completions/hasp.fish",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn print_help() {
     println!(
         "\
-hasp {}
-Scans GitHub Actions workflows for unpinned or phantom action references.
+hasp {} ({}, {})
+Paranoid security scanner and sandboxed step runner for GitHub Actions.
 
 Verifies every 'uses:' directive is pinned to an immutable 40-char commit SHA,
-then confirms that SHA actually exists via the GitHub API. Also validates that
-any # version comment matches the SHA's actual tagged release.
+confirms that SHA actually exists via the GitHub API, and validates that any
+# version comment matches the SHA's tagged release. With --paranoid it also
+audits workflows for injection, excessive permissions, hidden execution paths,
+and supply-chain risks.
 
 USAGE:
-    hasp [OPTIONS]
+    hasp [OPTIONS]             Scan .github/workflows (default command)
+    hasp <COMMAND> [ARGS]      Run a subcommand (see COMMANDS)
 
-OPTIONS:
+COMMANDS:
+    diff <base>     Show the audit-finding delta between a base ref and HEAD
+    tree            Emit a scored supply-chain dependency graph for the repo
+    replay          Re-audit historical workflow states over a time window
+    exec -- <cmd>   Run a command in a sandbox with proxy-mediated secrets
+    doctor          Run environment health checks
+    docs [topic]    Print in-binary documentation topics
+    completion      Generate shell completion scripts
+    help [command]  Print help for hasp or a specific command
+
+    The command must be the first argument. Run `hasp help <command>`
+    or `hasp <command> --help` for command-specific options.
+
+SCAN OPTIONS:
     -d, --dir <DIR>   Workflow directory [default: .github/workflows]
         --strict      Treat mutable tag/branch refs as failures (not warnings)
         --paranoid    Enable all security audits (injection, permissions, sources)
@@ -637,17 +1039,51 @@ OPTIONS:
                       Permit running without the full OS sandbox / Linux
                       egress confinement. Development-only; weakens the
                       threat model.
+        --token-file <PATH>
+                      Read the GitHub token from a file instead of the
+                      GITHUB_TOKEN environment variable.
+        --timeout <SECS>
+                      Per-request network timeout [default: 30, range: 1-3600]
+        --json        Machine-readable JSON output instead of the text report
+    -q, --quiet       Suppress non-essential status/notes on stderr
+    -v, --verbose     Show extra diagnostic detail
     -h, --help        Print this help
     -V, --version     Print version
 
 EXIT CODES:
     0   All checks pass (or only warnings in non-strict mode)
     1   One or more failures detected
-    2   Usage error
+    2   Usage error, or the run could not proceed (bad input, sandbox
+        unavailable without --allow-unsandboxed, network/setup failure)
 
 ENVIRONMENT:
-    GITHUB_TOKEN      Required for SHA verification and tag resolution",
-        env!("CARGO_PKG_VERSION")
+    GITHUB_TOKEN      GitHub API token for SHA verification and tag
+                      resolution. Read once, then scrubbed from the
+                      environment. Overridden by --token-file.
+    NO_COLOR          Honored implicitly: hasp emits no ANSI color.
+    SOURCE_DATE_EPOCH Build-time only: pins timestamps for reproducible builds.
+
+    Proxy variables (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) are deliberately
+    IGNORED and stripped: hasp pins its only outbound host (api.github.com)
+    to prevent MITM via an attacker-controlled proxy.
+
+EXAMPLES:
+    $ hasp                                # scan with default checks
+    $ hasp --paranoid                     # enable all security audits
+    $ hasp --strict                       # treat mutable refs as failures
+    $ hasp diff main --format markdown    # PR-delta as a PR comment
+    $ hasp tree --min-score 0.6           # fail on low-trust dependencies
+    $ hasp exec --manifest publish.yml -- npm publish
+
+LEARN MORE:
+    Use `hasp <command> --help` for details on any subcommand.
+    Docs:    https://github.com/{}/tree/main/docs
+    Issues:  https://github.com/{}/issues",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_HASH"),
+        env!("COMMIT_DATE"),
+        env!("GITHUB_REPO"),
+        env!("GITHUB_REPO"),
     );
 }
 
