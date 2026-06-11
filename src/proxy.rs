@@ -24,6 +24,11 @@ const MAX_LARGE_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_API_CALLS_PER_RUN: u32 = 300;
 const MAX_AUTH_FAILURES: u32 = 5;
 const MAX_CONNECTIONS: u32 = 1000;
+/// Proxy exits if no connection arrives within this window. Prevents an
+/// orphaned proxy (e.g. launcher OOM-killed before `terminate_child`) from
+/// holding the decrypted `GITHUB_TOKEN` in memory and accepting loopback
+/// connections indefinitely. Mirrors the forward proxy's idle guard.
+const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 pub(crate) struct Client {
     proxy_addr: SocketAddr,
@@ -215,7 +220,16 @@ impl Api for Client {
         path: Option<&str>,
         sha: &str,
     ) -> Result<Option<String>> {
-        let fields = self.request("GET_ACTION_YML", &[owner, repo, path.unwrap_or(""), sha])?;
+        // action.yml bodies are read server-side with a 2 MiB cap and then
+        // percent-encoded (which expands them). The default 4 KiB message cap
+        // would truncate real composite actions and make transitive scanning
+        // silently give up, so opt into the large-response path like
+        // GET_ATTESTATION does.
+        let fields = self.request_with_cap(
+            "GET_ACTION_YML",
+            &[owner, repo, path.unwrap_or(""), sha],
+            MAX_LARGE_MESSAGE_BYTES,
+        )?;
         if fields.len() != 2 || fields[0] != "OPTION" {
             bail!("Malformed GET_ACTION_YML response from proxy");
         }
@@ -274,6 +288,34 @@ impl Api for Client {
     }
 }
 
+/// Block until a client connects, returning `Ok(None)` if no connection
+/// arrives within `IDLE_TIMEOUT`. The listener must be in non-blocking mode;
+/// the returned stream is switched back to blocking for request handling.
+fn accept_with_idle(
+    listener: &TcpListener,
+    last_activity: &mut std::time::Instant,
+) -> Result<Option<TcpStream>> {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                *last_activity = std::time::Instant::now();
+                stream
+                    .set_nonblocking(false)
+                    .context("Failed to set proxy stream blocking mode")?;
+                return Ok(Some(stream));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_activity.elapsed() > IDLE_TIMEOUT {
+                    eprintln!("hasp proxy: idle timeout, shutting down");
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(crate::error::Error::from(e)).context("Proxy accept failed"),
+        }
+    }
+}
+
 pub(crate) fn run_server() -> Result<()> {
     let upstream_addrs = parse_upstream_addrs()?;
     let token = SecureToken::from_env("GITHUB_TOKEN")?;
@@ -311,10 +353,19 @@ pub(crate) fn run_server() -> Result<()> {
         lock.flush().context("Failed to flush proxy ready line")?;
     }
 
+    // Poll with non-blocking accepts so we can enforce an idle deadline; the
+    // listener has no native accept timeout.
+    listener
+        .set_nonblocking(true)
+        .context("Failed to set proxy listener non-blocking mode")?;
+
     let mut auth_failures = 0_u32;
     let mut total_connections = 0_u32;
-    for stream in listener.incoming() {
-        let mut stream = stream?;
+    let mut last_activity = std::time::Instant::now();
+    loop {
+        let Some(mut stream) = accept_with_idle(&listener, &mut last_activity)? else {
+            return Ok(());
+        };
         total_connections += 1;
         if total_connections > MAX_CONNECTIONS {
             write_error(
@@ -356,17 +407,17 @@ pub(crate) fn run_server() -> Result<()> {
             Ok(()) => {}
             Err(ref err) if err.msg().contains("authentication failed") => {
                 auth_failures += 1;
-                let msg = err.to_string();
-                write_error(&mut stream, &msg)?;
+                // Keep the detail on stderr; send the client a generic message
+                // so internal error chains / upstream URLs never leak.
+                eprintln!("hasp proxy: {err}");
+                write_error(&mut stream, "authentication failed")?;
             }
             Err(ref err) => {
-                let msg = err.to_string();
-                write_error(&mut stream, &msg)?;
+                eprintln!("hasp proxy: {err}");
+                write_error(&mut stream, "proxy error")?;
             }
         }
     }
-
-    Ok(())
 }
 
 pub(crate) fn read_ready_line(reader: impl Read) -> Result<SocketAddr> {
@@ -579,11 +630,9 @@ fn handle_connection(
             write_response(stream, "OPTION", &[body.as_deref().unwrap_or("")])?;
         }
         other => {
-            let truncated = if other.len() > 32 {
-                &other[..32]
-            } else {
-                other
-            };
+            // Truncate on a char boundary — `other` is attacker-controlled and
+            // may contain multibyte UTF-8 that a byte slice would split.
+            let truncated: String = other.chars().take(32).collect();
             bail!("Unknown proxy request `{truncated}`")
         }
     }

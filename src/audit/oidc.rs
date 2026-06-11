@@ -33,8 +33,6 @@ struct OidcWorkflowFacts {
     /// default. Tracked separately so we can fire an independent finding
     /// regardless of trust-policy contents.
     pr_target_triggered: bool,
-    #[allow(dead_code)]
-    workflow_dispatch: bool,
     /// Branches/tags the workflow can run on (from `on.push.branches`,
     /// `on.pull_request.branches`, etc.). Empty = no branch filter (any branch).
     branches: HashSet<String>,
@@ -158,7 +156,6 @@ fn classify_trigger(name: &str, facts: &mut OidcWorkflowFacts) {
             facts.pr_triggered = true;
             facts.pr_target_triggered = true;
         }
-        "workflow_dispatch" => facts.workflow_dispatch = true,
         _ => {}
     }
 }

@@ -59,7 +59,16 @@ impl SecureToken {
 
     fn from_string(mut value: String) -> Result<Self> {
         let len = value.len();
-        let pad = generate_random_pad(len)?;
+        // Scrub the plaintext even if pad generation fails — otherwise the
+        // secret would be dropped via the normal String destructor without the
+        // volatile zeroing that scrub_string performs.
+        let pad = match generate_random_pad(len) {
+            Ok(pad) => pad,
+            Err(e) => {
+                scrub_string(&mut value);
+                return Err(e);
+            }
+        };
         let masked = xor_bytes(value.as_bytes(), &pad);
         scrub_string(&mut value);
         Ok(Self {

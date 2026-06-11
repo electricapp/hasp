@@ -77,13 +77,17 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
     let exe = std::env::current_exe().context("Cannot resolve current executable path")?;
     let mut proxy_children: Vec<Child> = Vec::new();
     let mut proxy_infos: Vec<ProxyInfo> = Vec::new();
+    // Held alive until after the proxies are killed; their Drop removes the
+    // per-proxy cgroup directories, which only succeeds once the PIDs are gone.
+    let mut proxy_sandboxes: Vec<Option<netguard::SandboxHandle>> = Vec::new();
 
     for (idx, grant) in manifest.secrets.iter().enumerate() {
         let (_, ref secret_token) = secret_tokens[idx];
 
         let proxy_info = match spawn_forward_proxy(&exe, args, grant, secret_token, &domain_addrs) {
-            Ok((child, info)) => {
+            Ok((child, info, sandbox)) => {
                 proxy_children.push(child);
+                proxy_sandboxes.push(sandbox);
                 info
             }
             Err(err) => {
@@ -165,16 +169,58 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
     // 10. Wait for child exit
     let status = child.wait().context("Failed to wait for child process")?;
 
-    // 11. Kill proxies
+    // 11. Kill proxies, then tear down their cgroups (now that the PIDs are
+    //     gone, the cgroup directories can actually be removed).
     cleanup_children(&mut proxy_children);
+    drop(proxy_sandboxes);
 
-    // Exit with child's exit code
+    // Exit with child's exit code. `std::process::exit` runs no destructors,
+    // so explicitly drop the child cgroup handle first — otherwise a nonzero
+    // exit (the common failing-build case) would leak the StepRunner cgroup
+    // directory. The child has already been waited on above.
     let code = status.code().unwrap_or(1);
+    drop(child_sandbox);
     if code != 0 {
         std::process::exit(code);
     }
 
     Ok(())
+}
+
+/// Resolve a grant's domains to `(flat IP list, per-domain map string)`.
+///
+/// The flat list feeds the BPF egress allowlist; the map string
+/// (`domain=addr1;addr2|domain2=addr3`) lets the proxy dial the IP that
+/// belongs to each requested host rather than whichever domain sorted first.
+fn build_grant_upstreams(
+    grant: &crate::manifest::SecretGrant,
+    domain_addrs: &[(String, Vec<SocketAddr>)],
+) -> (Vec<SocketAddr>, String) {
+    let upstream_pairs: Vec<&(String, Vec<SocketAddr>)> = grant
+        .domains
+        .iter()
+        .filter_map(|d| domain_addrs.iter().find(|(domain, _)| domain == d))
+        .collect();
+
+    let upstream_addrs: Vec<SocketAddr> = upstream_pairs
+        .iter()
+        .flat_map(|(_, addrs)| addrs.iter().copied())
+        .collect();
+
+    let map_str = upstream_pairs
+        .iter()
+        .map(|(domain, addrs)| {
+            let joined = addrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("{domain}={joined}")
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+
+    (upstream_addrs, map_str)
 }
 
 fn spawn_forward_proxy(
@@ -183,16 +229,12 @@ fn spawn_forward_proxy(
     grant: &crate::manifest::SecretGrant,
     secret_token: &token::SecureToken,
     domain_addrs: &[(String, Vec<SocketAddr>)],
-) -> Result<(Child, ProxyInfo)> {
+) -> Result<(Child, ProxyInfo, Option<netguard::SandboxHandle>)> {
     let mut proxy_auth = token::generate_ephemeral_secret_hex(32)?;
 
-    // Collect pre-resolved upstream IPs for this secret's domains
-    let upstream_addrs: Vec<SocketAddr> = grant
-        .domains
-        .iter()
-        .filter_map(|d| domain_addrs.iter().find(|(domain, _)| domain == d))
-        .flat_map(|(_, addrs)| addrs.iter().copied())
-        .collect();
+    // Flat list of allowed IPs (for the BPF egress allowlist) plus the
+    // per-domain map string the proxy uses to dial the right host's IP.
+    let (upstream_addrs, upstream_map_str) = build_grant_upstreams(grant, domain_addrs);
 
     let proxy_sandbox = netguard::maybe_prepare(
         netguard::SandboxMode::SecretProxy,
@@ -216,14 +258,6 @@ fn spawn_forward_proxy(
         crate::manifest::InjectMode::None => "none",
     };
 
-    // Pass pre-resolved upstream addresses so the proxy never re-resolves DNS.
-    // Eliminates DNS rebinding window and avoids redundant lookups.
-    let upstream_addrs_str = upstream_addrs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-
     proxy_cmd.env_clear();
     // Secret is NOT passed via env var — /proc/PID/environ on Linux exposes
     // the initial environment forever, even after remove_var(). The secret
@@ -240,7 +274,7 @@ fn spawn_forward_proxy(
     );
     proxy_cmd.env(
         forward_proxy::FORWARD_PROXY_UPSTREAM_ADDRS_ENV,
-        &upstream_addrs_str,
+        &upstream_map_str,
     );
 
     // Forward proxy is hasp itself (`--internal-forward-proxy`) — use
@@ -303,7 +337,10 @@ fn spawn_forward_proxy(
         auth: proxy_auth,
     };
 
-    Ok((proxy_child, info))
+    // Return the sandbox handle so the caller keeps it alive until *after* the
+    // proxy is killed. Dropping it here (while the proxy PID is still in the
+    // cgroup) would fail `remove_dir` with EBUSY and leak the cgroup directory.
+    Ok((proxy_child, info, proxy_sandbox))
 }
 
 fn pre_resolve_domains(domains: &[String]) -> Result<Vec<(String, Vec<SocketAddr>)>> {

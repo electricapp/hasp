@@ -19,30 +19,7 @@ use crate::error::Result;
 use std::path::Path;
 use yaml_rust2::Yaml;
 
-use super::{OidcAcceptance, OidcProvider, SubPattern};
-
-const GH_ISSUER_HOST: &str = "token.actions.githubusercontent.com";
-
-/// True iff `issuer` is exactly GitHub's OIDC issuer URL. Tight host match —
-/// rejects look-alikes like `https://token.actions.githubusercontent.com.attacker.com`.
-fn is_github_issuer(issuer: &str) -> bool {
-    let after_scheme = issuer
-        .strip_prefix("https://")
-        .or_else(|| issuer.strip_prefix("http://"))
-        .unwrap_or(issuer);
-    let authority_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..authority_end];
-    let host = authority.rsplit_once(':').map_or(authority, |(h, p)| {
-        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
-            h
-        } else {
-            authority
-        }
-    });
-    host.eq_ignore_ascii_case(GH_ISSUER_HOST)
-}
+use super::{OidcAcceptance, OidcProvider, SubPattern, is_github_issuer};
 
 #[allow(clippy::unnecessary_wraps)] // uniform signature with aws/gcp
 pub(crate) fn parse(doc: &Yaml, path: &Path) -> Result<Vec<OidcAcceptance>> {

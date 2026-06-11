@@ -12,7 +12,7 @@ use std::path::Path;
 /// git repository — this is a defense-in-depth measure, not a hard requirement.
 ///
 /// However, if a `.git` directory exists (indicating this *is* a repo) but
-/// `git ls-files` fails, that is suspicious and we fail closed rather than
+/// `git ls-tree` fails, that is suspicious and we fail closed rather than
 /// silently passing.
 pub(crate) fn check_workflow_integrity(dir: &Path) -> Result<()> {
     let entries = match git_ls_files_stage(dir) {
@@ -91,13 +91,19 @@ fn has_git_dir(dir: &Path) -> bool {
     }
 }
 
-/// A single entry from `git ls-files --stage`.
+/// A single blob entry from the committed `HEAD` tree.
 struct GitStageEntry {
     blob_hash: String,
     path: String,
 }
 
-/// Run `git ls-files --stage -- <dir>` and parse the output.
+/// Run `git ls-tree -r HEAD -- <dir>` and parse the output.
+///
+/// We compare against the committed tree (`HEAD`), *not* the staging index:
+/// an attacker-controlled CI step that tampers with a workflow file and then
+/// runs `git add` would update the index to match the tampered content,
+/// silently defeating the check. `ls-tree HEAD` reflects what was actually
+/// committed and cannot be masked by re-staging.
 ///
 /// Returns `Err` if git is not found or the command fails (e.g. not a repo).
 /// Only returns entries for `.yml` and `.yaml` files.
@@ -108,26 +114,27 @@ fn git_ls_files_stage(dir: &Path) -> Result<Vec<GitStageEntry>> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
-        .arg("ls-files")
-        .arg("--stage")
+        .arg("ls-tree")
+        .arg("-r")
+        .arg("HEAD")
         .arg("--")
         .arg(".")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
-        .context("Failed to run git ls-files")?;
+        .context("Failed to run git ls-tree")?;
 
     if !output.status.success() {
-        crate::error::bail!("git ls-files failed (not a git repository?)");
+        crate::error::bail!("git ls-tree failed (not a git repository or no commits?)");
     }
 
     let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| crate::error::Error::new("git ls-files produced non-UTF-8 output".into()))?;
+        .map_err(|_| crate::error::Error::new("git ls-tree produced non-UTF-8 output".into()))?;
 
     let mut entries = Vec::new();
 
     for line in stdout.lines() {
-        // Format: "<mode> <hash> <stage>\t<path>"
+        // Format: "<mode> <type> <hash>\t<path>"
         let Some((meta, path)) = line.split_once('\t') else {
             continue;
         };
@@ -141,14 +148,16 @@ fn git_ls_files_stage(dir: &Path) -> Result<Vec<GitStageEntry>> {
         }
 
         let parts: Vec<&str> = meta.split(' ').collect();
-        if parts.len() < 3 {
+        // Expect "<mode> <type> <hash>"; only consider blobs (skip submodules,
+        // trees, etc.).
+        if parts.len() < 3 || parts[1] != "blob" {
             continue;
         }
 
         entries.push(GitStageEntry {
-            blob_hash: parts[1].to_string(),
-            // Paths are now relative to `dir` thanks to `git -C <dir>`,
-            // so the caller can join directly: `dir.join(&entry.path)`.
+            blob_hash: parts[2].to_string(),
+            // Paths are relative to `dir` thanks to `git -C <dir>`, so the
+            // caller can join directly: `dir.join(&entry.path)`.
             path: path.to_string(),
         });
     }
@@ -172,6 +181,71 @@ fn git_blob_hash(content: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("hasp-integrity-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(path.join(".github/workflows")).expect("mkdir temp repo");
+        git(&path, &["init", "-q"]);
+        path
+    }
+
+    #[test]
+    fn staged_tamper_is_still_detected() {
+        // Regression: comparing against the staging index (old behavior) let an
+        // attacker mask a tampered workflow by running `git add`. We compare
+        // against the committed HEAD tree, so re-staging cannot hide it.
+        let repo = temp_repo("staged");
+        let wf = repo.join(".github/workflows/ci.yml");
+        std::fs::write(&wf, "name: clean\n").expect("write clean");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "clean"]);
+
+        // Tamper the file AND stage it — index now matches the tampered disk.
+        std::fs::write(&wf, "name: tampered\n").expect("write tamper");
+        git(&repo, &["add", "."]);
+
+        let result = check_workflow_integrity(&repo.join(".github/workflows"));
+        assert!(
+            result.is_err(),
+            "staged tamper must be detected via HEAD comparison"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn clean_committed_tree_passes() {
+        let repo = temp_repo("clean");
+        std::fs::write(repo.join(".github/workflows/ci.yml"), "name: clean\n")
+            .expect("write clean");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "clean"]);
+
+        check_workflow_integrity(&repo.join(".github/workflows"))
+            .expect("untampered committed tree should pass");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     #[test]
     fn git_blob_hash_matches_known_value() {
