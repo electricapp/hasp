@@ -1,16 +1,12 @@
 name: Security
+# `cargo-audit` and `self-scan` are required PR status checks; no
+# `paths-ignore` here, because a workflow skipped by a path filter never
+# reports its checks and a docs-only PR then hangs on "Expected — waiting
+# for status".
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
   pull_request:
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
   schedule:
     - cron: '0 6 * * 1'  # Weekly Monday 6am UTC
 
@@ -20,9 +16,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   cargo-audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -33,14 +33,21 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - name: Install cargo-audit + cargo-deny
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny@0.19.5 --locked
 
       - name: Audit dependencies
         run: cargo audit
 
+      # License / bans / advisories / sources policy from deny.toml.
+      - name: cargo deny check
+        run: cargo deny check --config deny.toml
+
   self-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:

@@ -1,0 +1,48 @@
+name: Supply chain
+# Re-audit the *committed* lockfile on a schedule (not just at release):
+# a RustSec advisory or a yanked crate can be disclosed against a dep we
+# already ship, with no version bump to trigger CI. Dependabot alerts
+# cover advisory *detection* passively; this adds a hard, reproducible
+# gate plus the license/bans/sources policy from deny.toml.
+on:
+  schedule:
+    # Mondays 07:17 UTC. Offset minute so it isn't on the busy top-of-hour.
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.94.0"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install cargo-audit + cargo-deny
+        run: |
+          cargo install cargo-audit@0.21.2 --locked
+          cargo install cargo-deny@0.19.5 --locked
+
+      - name: Advisory + yanked audit (committed lockfile)
+        run: |
+          cargo audit --deny warnings
+          cargo audit --deny yanked
+
+      - name: License / bans / sources policy
+        run: cargo deny check --config deny.toml
