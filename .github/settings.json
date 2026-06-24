@@ -7,7 +7,8 @@
         "test (macos-latest, false)",
         "cargo-audit",
         "self-scan",
-        "actionlint"
+        "actionlint",
+        "unused-deps"
       ],
       "required_status_checks_strict": true,
       "enforce_admins": false,

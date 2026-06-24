@@ -132,3 +132,32 @@ jobs:
           tar -xzf actionlint.tgz actionlint
           ./actionlint
 
+  # ── Flag dependencies declared in Cargo.toml but never used ──
+  # cargo-machete catches deps that linger after a refactor — dead weight
+  # in the build graph and extra supply-chain surface. hasp is clean today.
+  #
+  # cargo-machete is installed via `cargo install` rather than
+  # taiki-e/install-action: hasp's own --paranoid self-scan (security.yml)
+  # denies that action because it isn't from a GitHub-verified publisher and
+  # ships no SLSA attestation. Building the tool from a pinned crate keeps the
+  # dogfooded scan green without weakening hasp's provenance policy, and
+  # matches how the repo already installs cargo-audit/cargo-deny/cargo-sbom.
+  unused-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+
+      - name: Check for unused dependencies
+        run: cargo machete
+
