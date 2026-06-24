@@ -1,16 +1,12 @@
 name: CI
+# `lint` and the `test` matrix variants are required PR status checks; no
+# `paths-ignore` here, because a workflow skipped by a path filter never
+# reports its checks and a docs-only PR then hangs on "Expected — waiting
+# for status".
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
   pull_request:
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
 
 permissions: {}
 
@@ -18,9 +14,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -45,6 +45,7 @@ jobs:
           - os: macos-latest
             sandbox: false
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -105,4 +106,29 @@ jobs:
             echo "::error::hasp exited $code (expected 0 or 1)"
             exit 1
           fi
+
+  # ── Lint the workflow files themselves (YAML + embedded shell) ──
+  # shellcheck ships on the runner, so actionlint also checks the inline
+  # bash. Catches dead runner labels, quoting bugs, and bad expressions
+  # before they break a tag release (where failures are most expensive).
+  # hasp self-scans its workflows for *security* (pins/permissions) via
+  # security.yml; actionlint adds *correctness* (syntax/shell) on top.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint (SHA-pinned download + checksum)
+        run: |
+          VER="1.7.12"
+          SHA="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${VER}/actionlint_${VER}_linux_amd64.tar.gz" -o actionlint.tgz
+          echo "${SHA}  actionlint.tgz" | sha256sum -c -
+          tar -xzf actionlint.tgz actionlint
+          ./actionlint
 

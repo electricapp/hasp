@@ -37,10 +37,10 @@ jobs:
             old_ref=$(echo "$line" | cut -d'|' -f1)
             new_ref=$(echo "$line" | cut -d'|' -f2)
 
-            old_action=$(echo "$old_ref" | sed 's/@.*//')
-            new_action=$(echo "$new_ref" | sed 's/@.*//')
-            old_sha=$(echo "$old_ref" | sed 's/.*@//')
-            new_sha=$(echo "$new_ref" | sed 's/.*@//')
+            old_action="${old_ref%%@*}"
+            new_action="${new_ref%%@*}"
+            old_sha="${old_ref##*@}"
+            new_sha="${new_ref##*@}"
 
             # Skip if the action name changed (not a simple bump)
             [ "$old_action" != "$new_action" ] && continue
@@ -54,7 +54,10 @@ jobs:
 
             compare_url="https://github.com/${owner}/${repo}/compare/${old_sha}...${new_sha}"
 
-            # Fetch commit log between old and new SHA
+            # Fetch commit log between old and new SHA. The single-quoted
+            # string is a jq program (passed to gh --jq), not shell — its
+            # `\(...)` interpolations are jq's, so SC2016 is a false positive.
+            # shellcheck disable=SC2016
             commits=$(gh api "repos/${owner}/${repo}/compare/${old_sha}...${new_sha}" \
               --jq '.commits | .[:20] | .[] | "- [`\(.sha[0:7])`](\(.html_url)) \(.commit.message | split("\n") | .[0])"' \
               2>/dev/null) || commits="*(could not fetch commit log — repository may be private)*"
@@ -97,7 +100,9 @@ jobs:
           ---
           *Posted by [action-diff](../actions/workflows/action-diff.yml)*"
 
-          # Dedent the heredoc-style indentation
+          # Dedent the heredoc-style indentation (per-line strip; sed is the
+          # clearest tool for this — bash param-expansion can't do per-line).
+          # shellcheck disable=SC2001
           comment=$(echo "$comment" | sed 's/^          //')
 
           gh pr comment "$PR_NUMBER" --body "$comment"
