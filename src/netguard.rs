@@ -138,6 +138,38 @@ impl SandboxHandle {
     }
 }
 
+/// Poll a raw fd until it is readable or `timeout_secs` elapses. Returns
+/// `Ok(true)` if readable, `Ok(false)` on timeout. Bounds otherwise-unbounded
+/// blocking reads on the helper/proxy pipes so a child that wedges after
+/// authenticating (but before responding) can't hang the orchestrator forever.
+#[cfg(target_os = "linux")]
+fn wait_readable(fd: libc::c_int, timeout_secs: i32) -> Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout_secs.saturating_mul(1000);
+    loop {
+        // SAFETY: poll() with one valid pollfd and a scalar timeout; no aliasing.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            bail!("poll() failed waiting on helper pipe: {err}");
+        }
+        return Ok(r > 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+const HELPER_RESPONSE_TIMEOUT_SECS: i32 = 15;
+#[cfg(target_os = "linux")]
+const HELPER_READY_TIMEOUT_SECS: i32 = 30;
+
 #[cfg(target_os = "linux")]
 fn migrate_via_helper(helper: &mut HelperChannel, pid: u32) -> Result<()> {
     writeln!(helper.stdin, "{pid}").context("Failed to send PID to BPF helper")?;
@@ -145,6 +177,14 @@ fn migrate_via_helper(helper: &mut HelperChannel, pid: u32) -> Result<()> {
         .stdin
         .flush()
         .context("Failed to flush PID to BPF helper")?;
+    // Bound the response wait. Only poll when nothing is already buffered from a
+    // prior over-read (the protocol is lock-step, so normally the buffer is
+    // empty here).
+    if helper.stdout.buffer().is_empty()
+        && !wait_readable(helper.stdout.get_ref().as_raw_fd(), HELPER_RESPONSE_TIMEOUT_SECS)?
+    {
+        bail!("BPF helper did not respond to PID {pid} within {HELPER_RESPONSE_TIMEOUT_SECS}s");
+    }
     let mut response = String::new();
     let n = helper
         .stdout
@@ -178,6 +218,16 @@ impl Drop for SandboxHandle {
             // the child so we don't leave a zombie.
             drop(stdin);
             let _ = child.wait();
+        }
+        // Kill anything still living in the cgroup — daemons/grandchildren the
+        // step backgrounded (`nohup … &`) reparent to init and otherwise linger
+        // in an orphaned but still egress-filtered cgroup, and their presence
+        // makes remove_dir fail with EBUSY, leaking one cgroup dir per run.
+        // `cgroup.kill` needs kernel >= 5.14; best-effort (the sudo-helper's
+        // root-owned cgroup can't be written by the unprivileged parent).
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::fs::write(self.path.join("cgroup.kill"), "1\n");
         }
         let _ = std::fs::remove_dir(&self.path);
     }
@@ -302,6 +352,37 @@ pub(crate) fn spawn_command(
         cmd.env("HASP_AWAIT_SANDBOX", "1");
     }
 
+    // Close the exec→migration egress window: have the child join the BPF
+    // egress cgroup ITSELF, in a pre_exec hook that runs before execve, so an
+    // arbitrary binary never executes a single instruction outside the egress
+    // filter. Only possible when the parent owns the cgroup (unprivileged-BPF
+    // path); the sudo-helper path uses a root-owned cgroup the same-uid child
+    // cannot write, so it falls back to the parent's SIGSTOP+migrate below
+    // (which leaves a small post-exec window — the child is deny-listed against
+    // secret exfil by PR_SET_DUMPABLE regardless).
+    #[cfg(target_os = "linux")]
+    if let Some(sandbox) = sandbox
+        && sandbox.helper.is_none()
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        if let Ok(procs_path) =
+            std::ffi::CString::new(sandbox.path().join("cgroup.procs").as_os_str().as_bytes())
+        {
+            // SAFETY: the pre_exec closure runs post-fork/pre-exec and calls
+            // only async-signal-safe libc functions (open/write/close) on a
+            // preallocated CString and a constant buffer — no allocation, no
+            // locks, no Rust runtime interaction.
+            #[allow(unsafe_code)]
+            unsafe {
+                cmd.pre_exec(move || {
+                    join_cgroup_self(&procs_path);
+                    Ok(())
+                });
+            }
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = sandbox;
@@ -335,6 +416,38 @@ pub(crate) fn spawn_command(
     Ok(child)
 }
 
+/// Best-effort join of the calling (post-fork, pre-exec) process to the cgroup
+/// whose `cgroup.procs` file is at `procs_path`. Writing the literal `"0"`
+/// moves `current` (cgroup core treats pid 0 as the writing process), so no
+/// async-unsafe integer formatting is needed. Any failure is ignored — the
+/// parent's SIGSTOP+migrate below remains as a backstop.
+#[cfg(target_os = "linux")]
+fn join_cgroup_self(procs_path: &std::ffi::CStr) {
+    // SAFETY: open/write/close are async-signal-safe. `procs_path` is a valid
+    // NUL-terminated pointer owned by the closure for its whole lifetime, and
+    // `buf` is a constant local — no allocation, no locks, no Rust runtime.
+    #[allow(unsafe_code)]
+    unsafe {
+        let fd = libc::open(procs_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return;
+        }
+        let buf = b"0\n";
+        let _ = libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len());
+        libc::close(fd);
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum StopState {
+    /// Child is stopped and waitable — safe to migrate into the cgroup + resume.
+    Stopped,
+    /// Child already terminated before we could stop it. With the `pre_exec`
+    /// self-join it ran (and finished) *inside* the egress cgroup, so this is
+    /// not an escape; leave the zombie for the owning `Child::wait()` to reap.
+    Exited,
+}
+
 #[cfg(target_os = "linux")]
 fn stop_and_migrate(child: &Child, sandbox: &SandboxHandle, protocol: StopProtocol) -> Result<()> {
     let pid = child.id();
@@ -347,21 +460,29 @@ fn stop_and_migrate(child: &Child, sandbox: &SandboxHandle, protocol: StopProtoc
         #[allow(unsafe_code)]
         let ret = unsafe { libc::kill(pid_t, libc::SIGSTOP) };
         if ret != 0 {
-            bail!(
-                "Failed to SIGSTOP sandboxed child: {}",
-                std::io::Error::last_os_error()
-            );
+            let err = std::io::Error::last_os_error();
+            // ESRCH = the child already exited; wait_for_stop resolves that to
+            // StopState::Exited below, so it isn't fatal here.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                bail!("Failed to SIGSTOP sandboxed child: {err}");
+            }
         }
     }
     // SelfStop case: child raised SIGSTOP at top of main; just wait for it.
-    wait_for_stop(pid)?;
-    sandbox.move_pid(pid)?;
-    resume_process(pid)?;
+    match wait_for_stop(pid)? {
+        StopState::Stopped => {
+            sandbox.move_pid(pid)?;
+            resume_process(pid)?;
+        }
+        // Child finished before the stop landed. The pre_exec self-join means
+        // it never ran outside the cgroup; nothing to migrate or resume.
+        StopState::Exited => {}
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_stop(pid: u32) -> Result<()> {
+fn wait_for_stop(pid: u32) -> Result<StopState> {
     let pid_t = libc::pid_t::try_from(pid)
         .map_err(|_| crate::error::Error::new(format!("PID {pid} exceeds pid_t range")))?;
     let mut status: libc::c_int = 0;
@@ -369,10 +490,16 @@ fn wait_for_stop(pid: u32) -> Result<()> {
     // blocked. We don't install signal handlers in the launcher, but a
     // future change might — restart the call rather than failing.
     let ret = loop {
+        // WNOWAIT peeks the child's state WITHOUT consuming it, so the owning
+        // `std::process::Child::wait()` can still reap it. Without WNOWAIT we
+        // would reap the exit status of a fast-exiting child here, after which
+        // Child::wait() fails with ECHILD and any kill()/wait() on the (now
+        // freed, possibly recycled) pid could hit an unrelated process.
         // SAFETY: waitpid is a well-defined Linux syscall. `status` is a
         // valid mutable pointer to a stack-allocated c_int.
         #[allow(unsafe_code)]
-        let r = unsafe { libc::waitpid(pid_t, &raw mut status, libc::WUNTRACED) };
+        let r =
+            unsafe { libc::waitpid(pid_t, &raw mut status, libc::WUNTRACED | libc::WNOWAIT) };
         if r < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -382,17 +509,15 @@ fn wait_for_stop(pid: u32) -> Result<()> {
         }
         break r;
     };
-    // waitpid without WNOHANG never returns 0 for a valid pid, so a non-stopped
-    // result means the child terminated before we could stop it for cgroup
-    // migration. For an arbitrary ParentStop binary that's usually a
-    // fast-exiting/crashing command; for SelfStop the child died during runtime
-    // init before reaching its self-SIGSTOP. Either way it never ran user code
-    // inside the cgroup, so report a protocol-neutral error.
     let _ = ret;
-    if !libc::WIFSTOPPED(status) {
-        bail!("Sandboxed child terminated before it could be migrated into the egress cgroup");
+    if libc::WIFSTOPPED(status) {
+        Ok(StopState::Stopped)
+    } else {
+        // Terminated before we could stop it (fast-exiting/crashing ParentStop
+        // command, or a SelfStop child that died during runtime init). Not an
+        // escape — see StopState::Exited.
+        Ok(StopState::Exited)
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -662,24 +787,37 @@ fn current_cgroup_dir() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn unique_suffix() -> u128 {
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    // A process-global monotonic counter guarantees uniqueness even when two
+    // cgroups are created within the same clock tick (or across an NTP step) —
+    // wall-clock nanoseconds alone can repeat or regress, which would make two
+    // same-pid+same-label sandboxes collide onto one shared cgroup and let the
+    // second BPF attach clobber the first proxy's allowlist.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
+        .as_nanos();
+    format!("{nanos}-{seq}")
 }
 
 #[cfg(target_os = "linux")]
 fn open_dir_fd(path: &Path) -> Result<libc::c_int> {
     let file = File::open(path).context(format!("Failed to open {}", path.display()))?;
     let fd = file.as_raw_fd();
-    // SAFETY: dup() is a well-defined Linux syscall taking a valid fd.
+    // fcntl(F_DUPFD_CLOEXEC), not dup(): a plain dup() clears FD_CLOEXEC, so the
+    // duplicate would leak into any later-spawned child. This fd points at a
+    // cgroup directory; it must never be inherited across an execve.
+    // SAFETY: fcntl is a well-defined syscall taking a valid fd and a minimum
+    // target fd number (0). No pointer arguments.
     #[allow(unsafe_code)]
-    let dup_fd = unsafe { libc::dup(fd) };
+    let dup_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if dup_fd < 0 {
         bail!(
-            "dup() failed for {}: {}",
+            "fcntl(F_DUPFD_CLOEXEC) failed for {}: {}",
             path.display(),
             std::io::Error::last_os_error()
         );
@@ -1205,6 +1343,13 @@ fn prepare_linux_via_sudo(mode: SandboxMode, allowlist: &[SocketAddr]) -> Result
         .context("BPF helper stdout was not piped")?;
     let mut stdout_reader = BufReader::new(stdout);
 
+    // Bound the ready-line wait so a helper that authenticates via sudo but then
+    // wedges (e.g. stuck in prepare_linux) can't hang the orchestrator forever.
+    if !wait_readable(stdout_reader.get_ref().as_raw_fd(), HELPER_READY_TIMEOUT_SECS)? {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("sudo BPF helper did not announce ready within {HELPER_READY_TIMEOUT_SECS}s");
+    }
     let mut ready_line = String::new();
     let n = stdout_reader
         .read_line(&mut ready_line)

@@ -381,8 +381,19 @@ fn git_show_file(repo_root: &Path, sha: &str, rel_path: &Path) -> Result<Option<
         .output()
         .context("Failed to run `git show <sha>:<path>`")?;
     if !out.status.success() {
-        // File didn't exist at this commit.
-        return Ok(None);
+        // Distinguish a legitimately-absent path (the file didn't exist at this
+        // commit) from a real git failure (corrupt/missing object, etc.). The
+        // former is a normal `continue`; the latter must be surfaced, not
+        // silently treated as "deleted" and skipped — otherwise a deny-level
+        // historical state could be missed and `hasp replay` exit 0.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("does not exist in")
+            || stderr.contains("exists on disk, but not in")
+            || stderr.contains("path does not exist")
+        {
+            return Ok(None);
+        }
+        bail!("`git show {git_path}` failed: {}", stderr.trim());
     }
     let text = String::from_utf8(out.stdout).context(format!(
         "file content was not UTF-8: {}",

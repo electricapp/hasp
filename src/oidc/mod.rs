@@ -7,7 +7,6 @@
 
 use crate::error::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use yaml_rust2::YamlLoader;
 
 pub(crate) mod aws;
 pub(crate) mod azure;
@@ -206,8 +205,10 @@ pub(crate) fn load_trust_policy(
     let text = std::fs::read_to_string(path)
         .context(format!("Cannot read OIDC policy {}", path.display()))?;
 
-    // yaml-rust2 parses JSON as a degenerate YAML 1.2 flow document.
-    let docs = YamlLoader::load_from_str(&text)
+    // yaml-rust2 parses JSON as a degenerate YAML 1.2 flow document. Route
+    // through the alias-bomb guard so a "billion laughs" policy file can't
+    // OOM/hang the process at parse time (the size cap doesn't help there).
+    let docs = crate::scanner::load_yaml_guarded(&text)
         .context(format!("Invalid JSON/YAML in {}", path.display()))?;
     let doc = docs
         .into_iter()

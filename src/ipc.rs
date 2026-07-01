@@ -588,7 +588,26 @@ fn ensure_len(fields: &[&str], expected: usize, line_no: usize) -> Result<()> {
 // ─── Field encoding / decoding ────────────────────────────────────────────────
 
 fn decode_path(field: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(percent_decode(field)?))
+    let decoded = percent_decode(field)?;
+    // A compromised scanner/verifier subprocess controls this field. Paths the
+    // scanner actually emits are canonicalized (no `..`, no interior NUL), so
+    // reject a parent-directory traversal component or embedded NUL defensively
+    // — neither is ever valid here, and it would be a path-traversal sink if the
+    // parent later used the value for a filesystem operation.
+    if decoded.contains('\0') {
+        bail!("Rejected path containing NUL byte");
+    }
+    let path = PathBuf::from(decoded);
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!(
+            "Rejected path with parent-directory (`..`) component: {}",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 fn decode_optional_string(field: &str) -> Result<Option<String>> {
