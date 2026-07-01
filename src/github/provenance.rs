@@ -89,20 +89,19 @@ fn check_provenance_with_api_at(
                 )
                 .unwrap_or(ReachabilityStatus::Unreachable);
 
-            let signed = client
-                .is_commit_signed(
+            // One `/commits/{sha}` fetch yields both the signature and the
+            // authored date. Calling `is_commit_signed` + `get_commit_date`
+            // separately issued two identical requests, needlessly burning the
+            // API call budget and doubling rate-limit consumption.
+            let commit_signals = client
+                .get_commit_signals(
                     &result.action_ref.owner,
                     &result.action_ref.repo,
                     &result.action_ref.ref_str,
                 )
-                .unwrap_or(false);
-            let commit_date = client
-                .get_commit_date(
-                    &result.action_ref.owner,
-                    &result.action_ref.repo,
-                    &result.action_ref.ref_str,
-                )
-                .unwrap_or(None);
+                .unwrap_or_else(|_| super::client::CommitSignals::missing());
+            let signed = commit_signals.signed;
+            let commit_date = commit_signals.authored_date;
 
             let slsa = match client.get_attestation(
                 &result.action_ref.owner,
@@ -113,6 +112,8 @@ fn check_provenance_with_api_at(
                     match super::slsa::verify_attestation_response(
                         &body,
                         &result.action_ref.ref_str,
+                        &result.action_ref.owner,
+                        &result.action_ref.repo,
                     ) {
                         Ok(verdict) => SlsaCheckOutcome::Verdict(verdict),
                         Err(e) => SlsaCheckOutcome::ParseFailed(e.to_string()),
@@ -471,6 +472,19 @@ fn emit_slsa_finding(
             // Tampered binding always denies, regardless of policy level.
             slsa_subject_mismatch_finding(&file, target, short_sha, observed, false),
         ),
+        AttestationVerdict::Unsigned { reason } => {
+            findings.push(slsa_unsigned_finding(&file, target, short_sha, reason, is_warning));
+        }
+        AttestationVerdict::IdentityMismatch {
+            subject_uri,
+            expected_repo,
+        } => findings.push(slsa_identity_mismatch_finding(
+            &file,
+            target,
+            subject_uri,
+            expected_repo,
+            is_warning,
+        )),
         AttestationVerdict::UntrustedBuilder { builder_id } => findings.push(
             slsa_untrusted_builder_finding(&file, target, short_sha, builder_id, is_warning),
         ),
@@ -543,6 +557,51 @@ fn slsa_chain_invalid_finding(
              Sigstore public-good Fulcio CA. If this is from a private Fulcio \
              instance, extend hasp's bundled trust material (data/fulcio/). \
              Otherwise treat as a misissued or forged attestation."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_unsigned_finding(
+    file: &std::path::Path,
+    target: &str,
+    short_sha: &str,
+    reason: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::High,
+        title: format!("SLSA attestation for {target} is present but not cryptographically verified"),
+        detail: format!(
+            "An attestation exists for {short_sha} in {target} and binds the subject and \
+             builder, but {reason}. hasp will NOT report this as verified: an unsigned \
+             attestation proves nothing — anyone who can publish to the repo could assert \
+             an arbitrary subject SHA under a trusted builder id. Require a fully signed \
+             Sigstore bundle (DSSE signature + Fulcio cert chain)."
+        ),
+        is_warning,
+    }
+}
+
+fn slsa_identity_mismatch_finding(
+    file: &std::path::Path,
+    target: &str,
+    subject_uri: &str,
+    expected_repo: &str,
+    is_warning: bool,
+) -> AuditFinding {
+    AuditFinding {
+        file: file.to_path_buf(),
+        severity: Severity::High,
+        title: format!("SLSA attestation for {target} signed by an unexpected identity"),
+        detail: format!(
+            "The attestation's signing certificate names the workflow identity \
+             `{subject_uri}`, which does not belong to `{expected_repo}`. A valid Fulcio \
+             leaf minted for a different repository does not prove that repo's release \
+             pipeline built this artifact. If `{expected_repo}` legitimately builds via a \
+             reusable workflow in another repo, confirm that identity is expected; \
+             otherwise treat this as a forged or misattributed attestation."
         ),
         is_warning,
     }

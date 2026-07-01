@@ -301,7 +301,8 @@ pub(super) fn extract_credential_names(text: &str) -> BTreeSet<String> {
         if let Some(secret) = extract_context_name(trimmed, "secrets") {
             names.insert(secret);
         }
-        if trimmed.contains("github.token") {
+        // Normalize so `github['token']` / `GITHUB.TOKEN` are caught too.
+        if super::normalize_expr(trimmed).contains("github.token") {
             names.insert("GITHUB_TOKEN".to_string());
         }
     }
@@ -309,8 +310,13 @@ pub(super) fn extract_credential_names(text: &str) -> BTreeSet<String> {
 }
 
 pub(super) fn extract_context_name(expr: &str, context: &str) -> Option<String> {
+    // Match the context anchor case-insensitively (GitHub contexts are
+    // case-insensitive, so `SECRETS.X` is equivalent to `secrets.X`).
+    // ASCII-lowercasing preserves byte offsets, so we can still slice the
+    // ORIGINAL `expr` to preserve the referenced name's own casing.
+    let lower = expr.to_ascii_lowercase();
     let dotted = format!("{context}.");
-    if let Some(start) = expr.find(&dotted) {
+    if let Some(start) = lower.find(&dotted) {
         let name = &expr[start + dotted.len()..];
         let end = name
             .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -322,7 +328,7 @@ pub(super) fn extract_context_name(expr: &str, context: &str) -> Option<String> 
     }
 
     for opener in [format!("{context}['"), format!("{context}[\"")] {
-        if let Some(start) = expr.find(&opener) {
+        if let Some(start) = lower.find(&opener) {
             let rest = &expr[start + opener.len()..];
             let terminator = if opener.ends_with('\'') { '\'' } else { '"' };
             let end = rest.find(terminator)?;

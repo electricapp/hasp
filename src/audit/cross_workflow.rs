@@ -637,6 +637,13 @@ fn expr_is_conclusion_gate(s: &str) -> bool {
         .map_or(trimmed, str::trim);
     let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     let bytes = compact.as_bytes();
+    // A top-level `||` means another operand can satisfy the `if:` without the
+    // upstream having succeeded (e.g. `conclusion == 'success' ||
+    // head_branch == 'main'` with an attacker-controlled `head_branch`), so the
+    // success check is not actually gating. Reject the whole expression.
+    if has_top_level_or(bytes) {
+        return false;
+    }
     for pat in CONCLUSION_GATE_PATTERNS {
         let mut start = 0;
         while let Some(pos) = compact[start..].find(pat) {
@@ -646,6 +653,25 @@ fn expr_is_conclusion_gate(s: &str) -> bool {
             }
             start = abs + pat.len();
         }
+    }
+    false
+}
+
+/// True if the whitespace-stripped expression has a `||` at paren-depth 0.
+/// A top-level disjunction defeats a conclusion gate: satisfying any single
+/// operand runs the job, so the `conclusion == 'success'` operand can be
+/// bypassed.
+fn has_top_level_or(bytes: &[u8]) -> bool {
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'|' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'|' => return true,
+            _ => {}
+        }
+        i += 1;
     }
     false
 }
@@ -806,16 +832,21 @@ struct UploadIndex {
     /// Uploads whose name is `*` or contains a `${{ }}` expression — treated
     /// as matching any download name.
     wildcard: Vec<(usize, usize)>,
+    /// Every upload op, precomputed once so wildcard/glob downloads don't
+    /// rescan the whole graph per download.
+    all: Vec<(usize, usize)>,
 }
 
 fn build_upload_index(graph: &Graph) -> UploadIndex {
     let mut by_name: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     let mut wildcard: Vec<(usize, usize)> = Vec::new();
+    let mut all: Vec<(usize, usize)> = Vec::new();
     for (w_idx, w) in graph.workflows.iter().enumerate() {
         for (op_idx, op) in w.artifact_ops.iter().enumerate() {
             if !op.is_upload {
                 continue;
             }
+            all.push((w_idx, op_idx));
             if op.name == "*" || op.name.contains("${{") {
                 wildcard.push((w_idx, op_idx));
             } else {
@@ -826,7 +857,64 @@ fn build_upload_index(graph: &Graph) -> UploadIndex {
             }
         }
     }
-    UploadIndex { by_name, wildcard }
+    UploadIndex {
+        by_name,
+        wildcard,
+        all,
+    }
+}
+
+/// How a download op selects the uploads it could pull.
+enum DownloadMatch {
+    /// `*` / a `${{ }}` expression / a `[...]` char-class we don't expand —
+    /// conservatively matches every upload.
+    All,
+    /// A `download-artifact@v4` `pattern:` glob (`*` / `?`) — matches uploads
+    /// whose name satisfies the glob (plus expression-named uploads).
+    Glob,
+    /// A literal artifact name — exact match only.
+    Exact,
+}
+
+fn download_match(name: &str) -> DownloadMatch {
+    if name == "*" || name.contains("${{") || name.contains('[') {
+        DownloadMatch::All
+    } else if name.contains('*') || name.contains('?') {
+        DownloadMatch::Glob
+    } else {
+        DownloadMatch::Exact
+    }
+}
+
+/// Classic wildcard match supporting `*` (any run, incl. empty) and `?` (one
+/// char). Used to pair `download-artifact` `pattern:` globs against upload
+/// names — a literal `HashMap` lookup would miss `pattern: 'build-*'` against
+/// an upload literally named `build-output` (the tj-actions/Ultralytics shape).
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0_usize, 0_usize);
+    let (mut star, mut star_ni): (Option<usize>, usize) = (None, 0);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // ─── Checks ─────────────────────────────────────────────────────────────────
@@ -877,28 +965,32 @@ fn check_artifact_flow(graph: &Graph, findings: &mut Vec<AuditFinding>, is_warni
         };
 
         for download in sink.artifact_ops.iter().filter(|op| !op.is_upload) {
-            let download_is_wildcard = download.name == "*" || download.name.contains("${{");
-
-            // Candidate uploads: wildcard downloads see all uploads; exact
-            // downloads see same-name uploads plus any wildcard uploads.
-            let candidates: Vec<(usize, usize)> = if download_is_wildcard {
-                let mut all = Vec::new();
-                for (w_idx, w) in graph.workflows.iter().enumerate() {
-                    for (op_idx, op) in w.artifact_ops.iter().enumerate() {
-                        if op.is_upload {
-                            all.push((w_idx, op_idx));
-                        }
-                    }
+            // Candidate uploads: `*`/expression downloads see all uploads; a
+            // `pattern:` glob sees uploads whose name matches (plus
+            // expression-named uploads that could match anything); a literal
+            // name sees same-name uploads plus any wildcard uploads.
+            let candidates: Vec<(usize, usize)> = match download_match(&download.name) {
+                DownloadMatch::All => index.all.clone(),
+                DownloadMatch::Glob => index
+                    .all
+                    .iter()
+                    .copied()
+                    .filter(|&(w, o)| {
+                        let up = &graph.workflows[w].artifact_ops[o];
+                        up.name == "*"
+                            || up.name.contains("${{")
+                            || glob_matches(&download.name, &up.name)
+                    })
+                    .collect(),
+                DownloadMatch::Exact => {
+                    let mut hits = index
+                        .by_name
+                        .get(&download.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    hits.extend(index.wildcard.iter().copied());
+                    hits
                 }
-                all
-            } else {
-                let mut hits = index
-                    .by_name
-                    .get(&download.name)
-                    .cloned()
-                    .unwrap_or_default();
-                hits.extend(index.wildcard.iter().copied());
-                hits
             };
 
             for (source_idx, op_idx) in candidates {

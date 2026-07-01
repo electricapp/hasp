@@ -104,6 +104,21 @@ fn parse_attribute_condition(cond: &str) -> Vec<SubPattern> {
         return Vec::new();
     }
 
+    // A `||` disjunction accepts a token matching ANY branch. Our
+    // conjunction-of-equalities parser only understands `&&` and would shear a
+    // garbage pin out of the first branch (e.g. `repo=='o/r' || repo_owner=='o'`
+    // → the literal `o/r' || ...`) and report the provider as narrowly scoped
+    // while it actually accepts the whole org. Degrade to a wildcard, matching
+    // this module's documented conservative contract.
+    if cond.contains("||") {
+        return vec![SubPattern {
+            raw: cond.to_string(),
+            repo: GlobToken::new("*".to_string()),
+            kind: SubKind::Any,
+            value: None,
+        }];
+    }
+
     let mut repo: Option<String> = None;
     let mut ref_value: Option<String> = None;
     let mut env_value: Option<String> = None;
@@ -324,5 +339,21 @@ mod tests {
         );
         assert_eq!(sp.len(), 1);
         assert_eq!(sp[0].kind, SubKind::Any);
+    }
+
+    #[test]
+    fn or_condition_degrades_to_wildcard() {
+        // `||` means the condition accepts either branch — the org-wide
+        // `repository_owner` branch makes this NOT a narrow repo pin. It must
+        // degrade to a wildcard rather than parsing a garbage single-repo pin.
+        let sp = parse_one(
+            "assertion.repository=='o/r' || assertion.repository_owner=='o'",
+        );
+        assert_eq!(sp.len(), 1);
+        assert!(
+            sp[0].repo.is_wildcard(),
+            "|| condition must degrade to a wildcard repo, got {:?}",
+            sp[0].repo.raw
+        );
     }
 }

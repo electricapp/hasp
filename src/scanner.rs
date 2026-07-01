@@ -260,6 +260,9 @@ pub(crate) struct SkippedRef {
 pub(crate) struct ScanResult {
     pub(crate) action_refs: Vec<ActionRef>,
     pub(crate) workflow_docs: Vec<(PathBuf, Yaml)>,
+    /// Local composite-action `action.yml` docs (their `runs.steps` are audited
+    /// for injection / external downloads, which the workflow checks miss).
+    pub(crate) action_docs: Vec<(PathBuf, Yaml)>,
     pub(crate) skipped_refs: Vec<SkippedRef>,
     pub(crate) container_refs: Vec<ContainerRef>,
 }
@@ -268,6 +271,7 @@ pub(crate) struct ScanResult {
 struct ScanState {
     action_refs: Vec<ActionRef>,
     workflow_docs: Vec<(PathBuf, Yaml)>,
+    action_docs: Vec<(PathBuf, Yaml)>,
     skipped_refs: Vec<SkippedRef>,
     container_refs: Vec<ContainerRef>,
     visited_yaml_files: HashSet<PathBuf>,
@@ -331,6 +335,7 @@ pub(crate) fn scan_directory_with_integrity(
     Ok(ScanResult {
         action_refs: state.action_refs,
         workflow_docs: state.workflow_docs,
+        action_docs: state.action_docs,
         skipped_refs: state.skipped_refs,
         container_refs: state.container_refs,
     })
@@ -468,10 +473,13 @@ fn scan_yaml_file(
     extract_uses(&doc, path, repo_root, &comment_map, state)?;
     enforce_ref_limit(state)?;
 
-    // Move (don't clone) the parsed document into the workflow set now that
-    // both readers above are done with it — the AST can be up to 1 MiB.
-    if kind == DocumentKind::Workflow {
-        state.workflow_docs.push((path.to_path_buf(), doc));
+    // Move (don't clone) the parsed document into the right set now that both
+    // readers above are done with it — the AST can be up to 1 MiB. Local
+    // composite actions go into `action_docs` so their `runs.steps` get the
+    // run-block checks (the workflow-shaped checks only walk `jobs`).
+    match kind {
+        DocumentKind::Workflow => state.workflow_docs.push((path.to_path_buf(), doc)),
+        DocumentKind::ActionMetadata => state.action_docs.push((path.to_path_buf(), doc)),
     }
     Ok(())
 }

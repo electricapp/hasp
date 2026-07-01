@@ -16,7 +16,12 @@ const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024; // 16 KiB
 const MAX_REQUEST_HEADERS: usize = 128;
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 const MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
-const MAX_CONNECTIONS: u32 = 10_000;
+/// Connection RATE limit (not a lifetime cap). A large dependency install
+/// legitimately opens tens of thousands of `Connection: close` sockets over a
+/// step's life, so a lifetime ceiling would kill the proxy mid-build. We bound
+/// the rate instead and reject only bursts beyond it, recovering each window.
+const CONN_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_CONNS_PER_WINDOW: u32 = 20_000;
 const MAX_AUTH_FAILURES: u32 = 5;
 /// How long to wait per `poll` tick before re-checking liveness deadlines.
 const ACCEPT_TICK: std::time::Duration = std::time::Duration::from_secs(1);
@@ -38,6 +43,11 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
         crate::sandbox::NetworkPolicy::Allow,
         false,
     )?;
+
+    // Make the proxy non-dumpable before the secret enters our address space,
+    // so a same-uid sibling (the sandboxed step) can't scrape it out of
+    // /proc/<proxy>/mem. See sandbox::harden_process_dumpable.
+    crate::sandbox::harden_process_dumpable()?;
 
     // Read secret from stdin pipe — NOT from environment variables.
     // /proc/PID/environ on Linux exposes the initial exec-time environment
@@ -108,7 +118,8 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
     #[allow(unsafe_code)]
     let orig_ppid = unsafe { libc::getppid() };
 
-    let mut total_connections = 0_u32;
+    let mut window_start = std::time::Instant::now();
+    let mut window_conns = 0_u32;
     let mut auth_failures = 0_u32;
     let mut last_activity = std::time::Instant::now();
     loop {
@@ -150,25 +161,34 @@ pub(crate) fn run_internal(args: &crate::cli::Args) -> Result<()> {
                 continue;
             }
         };
-        // Switch accepted stream back to blocking for request handling.
+        // Switch accepted stream back to blocking, and set read/write timeouts
+        // BEFORE any response write — including the reject paths below — so a
+        // shutdown/reject write can never block on an unresponsive client.
         stream
             .set_nonblocking(false)
             .context("Failed to set stream blocking mode")?;
-        total_connections += 1;
-        if total_connections > MAX_CONNECTIONS {
-            let _ = write_http_error(&mut stream, 503, "Connection limit exceeded");
-            bail!("Forward proxy shutting down after {MAX_CONNECTIONS} connections");
-        }
-        if auth_failures >= MAX_AUTH_FAILURES {
-            let _ = write_http_error(&mut stream, 403, "Too many auth failures");
-            bail!("Forward proxy shutting down after {MAX_AUTH_FAILURES} auth failures");
-        }
         stream
             .set_read_timeout(Some(std::time::Duration::from_mins(1)))
             .context("Failed to set read timeout")?;
         stream
             .set_write_timeout(Some(std::time::Duration::from_mins(1)))
             .context("Failed to set write timeout")?;
+
+        // Rate-limit connections per rolling window instead of a lifetime cap,
+        // so a big install is throttled at worst — never fatally shut down.
+        if window_start.elapsed() >= CONN_RATE_WINDOW {
+            window_start = std::time::Instant::now();
+            window_conns = 0;
+        }
+        window_conns += 1;
+        if window_conns > MAX_CONNS_PER_WINDOW {
+            let _ = write_http_error(&mut stream, 503, "Connection rate limit exceeded");
+            continue;
+        }
+        if auth_failures >= MAX_AUTH_FAILURES {
+            let _ = write_http_error(&mut stream, 403, "Too many auth failures");
+            bail!("Forward proxy shutting down after {MAX_AUTH_FAILURES} auth failures");
+        }
 
         // Only accept loopback clients. A reset between accept and peer_addr
         // surfaces as an error here — skip the connection rather than abort.
@@ -252,6 +272,24 @@ pub(crate) fn read_ready_line(reader: impl Read) -> Result<SocketAddr> {
         .context("Invalid forward proxy ready address")
 }
 
+/// Copy exactly `remaining` bytes from `reader` to `writer` through a
+/// fixed-size buffer, so a large request body is never buffered whole (nor
+/// zero-allocated up front).
+fn stream_exact<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    mut remaining: usize,
+) -> std::io::Result<()> {
+    let mut buf = [0_u8; 16 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        reader.read_exact(&mut buf[..want])?;
+        writer.write_all(&buf[..want])?;
+        remaining -= want;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_request(
     client: &mut TcpStream,
@@ -304,19 +342,13 @@ fn handle_request(
         bail!("Blocked request to disallowed domain: {host_domain}");
     }
 
-    // Read request body if present
-    let body = if req.content_length > 0 {
-        if req.content_length > MAX_REQUEST_BODY_BYTES {
-            bail!("Request body too large: {} bytes", req.content_length);
-        }
-        let mut buf = vec![0_u8; req.content_length];
-        reader
-            .read_exact(&mut buf)
-            .context("Failed to read request body")?;
-        buf
-    } else {
-        Vec::new()
-    };
+    // The request body is streamed straight to the upstream after the headers
+    // (see below) rather than buffered here — a client could otherwise force a
+    // 64 MiB zero-filled allocation per request by declaring a large body.
+    // Validate the declared length up front.
+    if req.content_length > MAX_REQUEST_BODY_BYTES {
+        bail!("Request body too large: {} bytes", req.content_length);
+    }
 
     // Use the pre-resolved upstream addresses for the *requested* host — never
     // re-resolve DNS. Eliminates DNS rebinding between pre-resolution and
@@ -417,17 +449,18 @@ fn handle_request(
     // Emit Content-Length whenever there is a body, or when the client sent one
     // explicitly (including `Content-Length: 0` on a body-less POST/PUT, which
     // some upstreams require — dropping it yields a spurious 411 Length Required).
-    if !body.is_empty() || req.has_content_length {
-        write!(tls_stream, "Content-Length: {}\r\n", body.len())
+    if req.content_length > 0 || req.has_content_length {
+        write!(tls_stream, "Content-Length: {}\r\n", req.content_length)
             .context("Failed to write Content-Length")?;
     }
     write!(tls_stream, "Connection: close\r\n").context("Failed to write Connection header")?;
     write!(tls_stream, "\r\n").context("Failed to end upstream headers")?;
 
-    if !body.is_empty() {
-        tls_stream
-            .write_all(&body)
-            .context("Failed to write upstream body")?;
+    // Stream the body from the client to the upstream in fixed-size chunks
+    // rather than buffering it all in memory first.
+    if req.content_length > 0 {
+        stream_exact(&mut reader, &mut tls_stream, req.content_length)
+            .context("Failed to stream upstream body")?;
     }
     tls_stream.flush().context("Failed to flush upstream")?;
 
@@ -559,8 +592,14 @@ fn parse_request_line(
         bail!("HTTP path contains control characters");
     }
 
-    // Reject methods that could be used for tunneling or reflection attacks
-    if matches!(method.as_str(), "CONNECT" | "TRACE" | "TRACK") {
+    // Reject methods that could be used for tunneling or reflection attacks.
+    // Case-insensitive: a lenient upstream may honor lowercase `trace`, which
+    // would reflect the injected `Authorization: <secret>` header straight back
+    // to the child — so `trace`/`track`/`connect` must be blocked too.
+    if ["CONNECT", "TRACE", "TRACK"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m))
+    {
         bail!("Blocked forbidden HTTP method: {method}");
     }
 
@@ -735,6 +774,28 @@ mod tests {
         writeln!(buf, "{FORWARD_PROXY_READY_MAGIC}\t127.0.0.1:9999").unwrap();
         let addr = read_ready_line(buf.as_slice()).unwrap();
         assert_eq!(addr, "127.0.0.1:9999".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn stream_exact_copies_exact_bytes_across_chunks() {
+        // Larger than the 16 KiB internal buffer to exercise the chunk loop,
+        // and with trailing bytes that must NOT be copied.
+        let src: Vec<u8> = (0..40_000).map(|i| u8::try_from(i % 256).unwrap()).collect();
+        let mut reader = src.as_slice();
+        let mut out: Vec<u8> = Vec::new();
+        stream_exact(&mut reader, &mut out, 30_000).unwrap();
+        assert_eq!(out.len(), 30_000);
+        assert_eq!(out, &src[..30_000]);
+        // The remaining 10_000 bytes are still available in the reader.
+        assert_eq!(reader.len(), 10_000);
+    }
+
+    #[test]
+    fn stream_exact_errors_when_source_short() {
+        let src = [1_u8, 2, 3];
+        let mut reader = src.as_slice();
+        let mut out: Vec<u8> = Vec::new();
+        assert!(stream_exact(&mut reader, &mut out, 10).is_err());
     }
 
     #[test]

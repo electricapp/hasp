@@ -68,9 +68,10 @@ pub(super) fn check_privileged_triggers(
                 continue;
             };
 
-            // Check if this step uses actions/checkout
+            // Check if this step uses actions/checkout (case-insensitive: GitHub
+            // resolves `Actions/Checkout` to the same action).
             let uses_str = match step_map.get(key_uses()).and_then(|u| u.as_str()) {
-                Some(s) if s.starts_with("actions/checkout") => s,
+                Some(s) if super::is_checkout_action(s) => s,
                 _ => continue,
             };
 

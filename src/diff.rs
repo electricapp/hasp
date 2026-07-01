@@ -743,8 +743,30 @@ fn install_signal_cleanup_once() {
         let [read_fd, write_fd] = fds;
         SIGNAL_PIPE_WRITE.store(write_fd, Ordering::SeqCst);
 
+        // Block SIGINT/SIGTERM on THIS thread before spawning the worker, so
+        // the worker inherits the blocked mask and the async handler can NEVER
+        // run on the worker — which is the sole reader of the self-pipe. If it
+        // did (the kernel is free to pick any thread without the signal
+        // blocked), the handler would write the wake byte and then pause()
+        // forever with no one left to read it, so cleanup would never fire.
+        // The mask is restored on this thread right after the spawn so the main
+        // thread still delivers the signals to the handler.
+        // SAFETY: sigset_t is a plain bitset we own; sigemptyset/sigaddset/
+        // pthread_sigmask only read/write it and the thread's signal mask.
+        #[allow(unsafe_code)]
+        let old_set: libc::sigset_t = unsafe {
+            let mut block_set: libc::sigset_t = std::mem::zeroed();
+            let mut old_set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut block_set);
+            libc::sigaddset(&raw mut block_set, libc::SIGINT);
+            libc::sigaddset(&raw mut block_set, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block_set, &raw mut old_set);
+            old_set
+        };
+
         // Worker thread: blocks until the handler writes, then does the
         // allocating/process-spawning cleanup safely and exits the process.
+        // Inherits the SIGINT/SIGTERM-blocked mask set just above.
         std::thread::spawn(move || {
             let mut buf = [0_u8; 1];
             // SAFETY: read up to one byte into a buffer we own from our pipe.
@@ -764,6 +786,14 @@ fn install_signal_cleanup_once() {
             }
             std::process::exit(128 + sig);
         });
+
+        // Restore this thread's original signal mask so it (a non-reader
+        // thread) delivers SIGINT/SIGTERM to the handler.
+        // SAFETY: restoring a saved sigset_t we own.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old_set, std::ptr::null_mut());
+        }
 
         // The fn-pointer-to-usize cast is the only way to pass an
         // `extern "C" fn` to libc's untyped `sighandler_t`.

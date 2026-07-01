@@ -102,6 +102,21 @@ pub(super) fn check_permissions_value(
                 "write",
                 "publish packages under your org's name",
             ),
+            (
+                "id-token",
+                "write",
+                "mint OIDC tokens to assume cloud (AWS/GCP/Azure) roles",
+            ),
+            (
+                "security-events",
+                "write",
+                "write code-scanning results, masking real vulnerabilities",
+            ),
+            (
+                "deployments",
+                "write",
+                "create deployments and deployment statuses",
+            ),
         ];
         for (scope, bad_level, desc) in &dangerous {
             let key = Yaml::String(scope.to_string());
@@ -201,8 +216,8 @@ pub(super) fn check_checkout_persist_credentials(
                 continue;
             };
 
-            // Only check actions/checkout
-            if !uses_str.starts_with("actions/checkout") {
+            // Only check actions/checkout (case-insensitive; boundary-matched).
+            if !super::is_checkout_action(uses_str) {
                 continue;
             }
 

@@ -32,6 +32,12 @@ pub(crate) fn run_exec(args: &Args) -> Result<()> {
 
     crate::sandbox::platform_preflight(args.allow_unsandboxed, true)?;
 
+    // Make the orchestrator non-dumpable BEFORE capturing any secret, so a
+    // sandboxed child can never read our `/proc/<pid>/{environ,mem}` (the
+    // secret lives in our inherited environment and remove_var can't scrub the
+    // kernel's copy). See sandbox::harden_process_dumpable.
+    crate::sandbox::harden_process_dumpable()?;
+
     // 1. Parse manifest
     let manifest = if let Some(ref manifest_path) = exec_args.manifest {
         let canonical = manifest_path.canonicalize().context(format!(

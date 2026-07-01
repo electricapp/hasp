@@ -431,6 +431,13 @@ fn load_policy(args: &cli::Args, canonical_dir: &Path, announce: bool) -> Result
 /// warn loudly if any security checks were weakened.  This catches malicious
 /// PRs that weaken the policy file as part of the same change they're scanning.
 fn check_policy_drift(diff_base: &str, current: &policy::Policy, workflow_dir: &Path) {
+    // Validate the ref BEFORE it reaches `git show` — this runs before
+    // `compute_diff_base_changes` (which validates it too), so without this
+    // guard a `--diff-base=--output=…` style value would be interpreted by git
+    // as an option (argument injection) at this earlier, pre-sandbox call site.
+    if !git_util::is_sane_git_ref(diff_base) {
+        return;
+    }
     // Find repo root to locate .hasp.yml
     let repo_root = git_util::find_repo_root(workflow_dir);
     let policy_path = policy::Policy::policy_path(&repo_root);
@@ -705,6 +712,9 @@ fn run_internal_scan(args: &cli::Args) -> Result<()> {
             audit::builtin_trusted_owners(),
         );
         let mut findings = audit::run(&scan.workflow_docs, &scan.action_refs, &policy.checks);
+        // Local composite actions aren't workflows, so run their `runs.steps`
+        // through the run-block checks separately.
+        findings.extend(audit::run_composite(&scan.action_docs, &policy.checks));
         if !policy.checks.untrusted_sources.is_off() {
             audit::check_untrusted_sources(
                 &scan.action_refs,
