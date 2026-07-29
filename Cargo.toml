@@ -106,7 +106,7 @@ redundant_pub_crate = "allow"   # conflicts with rust::unreachable_pub
 #
 # One intentional C dependency (mimalloc). Zero proc macros. Zero async runtimes.
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 mimalloc = { version = "0.1", features = ["secure"] }
 ring = "0.17"                  # ECDSA P-256 for DSSE attestation signature verification
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
