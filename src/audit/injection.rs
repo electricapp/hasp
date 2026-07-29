@@ -82,10 +82,13 @@ pub(super) fn check_script_injection(
 ) {
     for expr in find_expressions(text) {
         let trimmed = expr.trim();
+        // Normalize away case + index-syntax (`['x']`) so equivalent spellings
+        // of an attacker-controlled context can't slip past the substring test.
+        let normalized = super::normalize_expr(trimmed);
         for ctx in injectable_contexts() {
             // Check both direct use (starts_with) and wrapped use via
             // format(), join(), fromJSON() etc. (contains).
-            if trimmed.contains(ctx) {
+            if normalized.contains(ctx) {
                 let kind = if severity == Severity::Critical {
                     "Script injection"
                 } else {
@@ -151,9 +154,12 @@ pub(super) fn check_github_env_writes(
             for target in &DANGEROUS_TARGETS {
                 if script.contains(target) {
                     // Check if the write includes attacker-controlled expressions
-                    let has_injection = find_expressions(script)
-                        .iter()
-                        .any(|expr| injectable_contexts().iter().any(|ctx| expr.contains(ctx)));
+                    let has_injection = find_expressions(script).iter().any(|expr| {
+                        let normalized = super::normalize_expr(expr);
+                        injectable_contexts()
+                            .iter()
+                            .any(|ctx| normalized.contains(ctx))
+                    });
 
                     let (severity, detail) = if has_injection {
                         (
@@ -212,6 +218,51 @@ jobs:
             findings
                 .iter()
                 .any(|f| f.severity == Severity::Critical && f.title.contains("GITHUB_ENV"))
+        );
+    }
+
+    #[test]
+    fn flags_bracket_index_injection_evasion() {
+        // `github.event.issue['title']` is equivalent to the dotted form and
+        // must not slip past the substring check via index syntax.
+        let findings = run_audit(
+            "
+on: issues
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo \"${{ github.event.issue['title'] }}\"
+",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Critical && f.title.contains("Script injection")),
+            "bracket-index injection should be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn flags_uppercase_context_injection_evasion() {
+        // GitHub contexts are case-insensitive; `.TITLE` must still be flagged.
+        let findings = run_audit(
+            "
+on: issues
+permissions: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo \"${{ github.event.issue.TITLE }}\"
+",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Critical && f.title.contains("Script injection")),
+            "uppercase-context injection should be flagged: {findings:?}"
         );
     }
 

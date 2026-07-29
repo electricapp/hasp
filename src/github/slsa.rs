@@ -74,6 +74,20 @@ pub(crate) enum AttestationVerdict {
         expected: String,
         observed: Vec<String>,
     },
+    /// Attestation exists and structurally binds the subject/builder, but it
+    /// carries NO verifiable cryptographic material (no cert, no signature, or
+    /// an unsupported key type). It is therefore unsigned and MUST NOT be
+    /// treated as verified — an attacker could otherwise publish an unsigned
+    /// attestation with an arbitrary subject SHA and a trusted builder id.
+    Unsigned { reason: String },
+    /// The DSSE signature and Fulcio chain verify, but the leaf cert's
+    /// Subject Alternative Name (the workflow identity that minted the
+    /// attestation) does not belong to the action's own `owner/repo`. Without
+    /// this binding a valid Fulcio leaf for *any* repo would be accepted.
+    IdentityMismatch {
+        subject_uri: String,
+        expected_repo: String,
+    },
     /// Attestation exists but the builder identity is not one we trust.
     UntrustedBuilder { builder_id: String },
     /// Attestation exists but the predicateType isn't SLSA v0.2 or v1.
@@ -101,6 +115,8 @@ pub(crate) enum AttestationVerdict {
 pub(crate) fn verify_attestation_response(
     body: &str,
     expected_sha: &str,
+    owner: &str,
+    repo: &str,
 ) -> Result<AttestationVerdict> {
     let doc = YamlLoader::load_from_str(body).context("Invalid attestation JSON envelope")?;
     let doc = doc.into_iter().next().unwrap_or(Yaml::Null);
@@ -125,7 +141,7 @@ pub(crate) fn verify_attestation_response(
     // MalformedAttestation (raw parse failure carries the least signal).
     let mut best_negative: Option<AttestationVerdict> = None;
     for attestation in attestations {
-        match verify_single_attestation(attestation, expected_sha) {
+        match verify_single_attestation(attestation, expected_sha, owner, repo) {
             Ok(verdict @ AttestationVerdict::Verified { .. }) => {
                 return Ok(verdict);
             }
@@ -148,10 +164,12 @@ pub(crate) fn verify_attestation_response(
 
 const fn verdict_rank(v: &AttestationVerdict) -> u8 {
     match v {
-        AttestationVerdict::SignatureInvalid { .. } => 7,
-        AttestationVerdict::ChainInvalid { .. } => 6,
-        AttestationVerdict::SubjectMismatch { .. } => 5,
-        AttestationVerdict::UntrustedIssuer { .. } => 4,
+        AttestationVerdict::SignatureInvalid { .. } => 9,
+        AttestationVerdict::ChainInvalid { .. } => 8,
+        AttestationVerdict::IdentityMismatch { .. } => 7,
+        AttestationVerdict::SubjectMismatch { .. } => 6,
+        AttestationVerdict::UntrustedIssuer { .. } => 5,
+        AttestationVerdict::Unsigned { .. } => 4,
         AttestationVerdict::UntrustedBuilder { .. } => 3,
         AttestationVerdict::UnknownPredicate { .. } => 2,
         AttestationVerdict::MalformedAttestation(_) => 1,
@@ -159,7 +177,12 @@ const fn verdict_rank(v: &AttestationVerdict) -> u8 {
     }
 }
 
-fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<AttestationVerdict> {
+fn verify_single_attestation(
+    attestation: &Yaml,
+    expected_sha: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<AttestationVerdict> {
     let statement = match extract_in_toto_statement(attestation)? {
         Ok(stmt) => stmt,
         Err(verdict) => return Ok(verdict),
@@ -207,39 +230,72 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
     }
 
     // DSSE signature verification (v2.2a) runs before chain validation so a
-    // tampered payload is flagged even when the chain is also bogus. Either
-    // failure short-circuits with the most specific verdict.
-    let signature_verified = match verify_dsse_signature(bundle) {
-        DsseResult::Verified => Some(true),
-        DsseResult::NotAttempted => None,
+    // tampered payload is flagged even when the chain is also bogus.
+    //
+    // FAIL CLOSED: absent crypto material (`NotAttempted`) is NOT a pass. An
+    // attestation whose bundle has a `dsseEnvelope.payload` but no certificate
+    // (or no signature, or an unsupported key type) is UNSIGNED — treating it
+    // as `Verified` let an attacker bind an arbitrary subject SHA to a trusted
+    // builder id with zero cryptographic proof.
+    match verify_dsse_signature(bundle) {
+        DsseResult::Verified => {}
         DsseResult::Invalid(reason) => {
             return Ok(AttestationVerdict::SignatureInvalid { reason });
         }
-    };
-
-    // Chain validation (v2.2b): verify leaf was signed by bundled Fulcio intermediate.
-    if let Some(bundle_map) = bundle {
-        match super::sigstore::verify_chain_to_fulcio(bundle_map) {
-            super::sigstore::ChainVerdict::VerifiedAgainstFulcio
-            | super::sigstore::ChainVerdict::NoMaterial => {}
-            super::sigstore::ChainVerdict::IssuerMismatch => {
-                return Ok(AttestationVerdict::ChainInvalid {
-                    reason: "leaf cert issuer does not match bundled Sigstore \
-                             public-good Fulcio intermediate"
-                        .to_string(),
-                });
-            }
-            super::sigstore::ChainVerdict::SignatureInvalid => {
-                return Ok(AttestationVerdict::ChainInvalid {
-                    reason: "leaf cert's signature does not verify against bundled \
-                             Sigstore public-good Fulcio intermediate"
-                        .to_string(),
-                });
-            }
-            super::sigstore::ChainVerdict::Malformed(msg) => {
-                return Ok(AttestationVerdict::MalformedAttestation(msg));
-            }
+        DsseResult::NotAttempted => {
+            return Ok(AttestationVerdict::Unsigned {
+                reason: "attestation bundle carries no verifiable DSSE signature \
+                         (missing certificate, signature, or unsupported key type)"
+                    .to_string(),
+            });
         }
+    }
+
+    // Chain validation (v2.2b): verify leaf was signed by bundled Fulcio
+    // intermediate. `NoMaterial` (no cert to chain) is likewise NOT a pass.
+    let Some(bundle_map) = bundle else {
+        return Ok(AttestationVerdict::Unsigned {
+            reason: "attestation has no Sigstore bundle to verify".to_string(),
+        });
+    };
+    match super::sigstore::verify_chain_to_fulcio(bundle_map) {
+        super::sigstore::ChainVerdict::VerifiedAgainstFulcio => {}
+        super::sigstore::ChainVerdict::NoMaterial => {
+            return Ok(AttestationVerdict::Unsigned {
+                reason: "attestation bundle has no certificate chain to verify".to_string(),
+            });
+        }
+        super::sigstore::ChainVerdict::IssuerMismatch => {
+            return Ok(AttestationVerdict::ChainInvalid {
+                reason: "leaf cert issuer does not match bundled Sigstore \
+                         public-good Fulcio intermediate"
+                    .to_string(),
+            });
+        }
+        super::sigstore::ChainVerdict::SignatureInvalid => {
+            return Ok(AttestationVerdict::ChainInvalid {
+                reason: "leaf cert's signature does not verify against bundled \
+                         Sigstore public-good Fulcio intermediate"
+                    .to_string(),
+            });
+        }
+        super::sigstore::ChainVerdict::Malformed(msg) => {
+            return Ok(AttestationVerdict::MalformedAttestation(msg));
+        }
+    }
+
+    // Identity binding: the leaf cert's SAN URI names the exact workflow that
+    // minted the attestation. Bind it to the action's own repo — otherwise a
+    // valid Fulcio leaf minted for ANY repo (an attacker's own workflow) would
+    // be accepted as proof for someone else's SHA.
+    if let Some(identity) = signer_identity.as_ref()
+        && let Some(uri) = identity.subject_uri.as_deref()
+        && !san_uri_matches_repo(uri, owner, repo)
+    {
+        return Ok(AttestationVerdict::IdentityMismatch {
+            subject_uri: uri.to_string(),
+            expected_repo: format!("{owner}/{repo}"),
+        });
     }
 
     let workflow_ref = extract_workflow_ref(statement_map);
@@ -247,8 +303,25 @@ fn verify_single_attestation(attestation: &Yaml, expected_sha: &str) -> Result<A
         workflow_ref,
         builder_id,
         signer_identity,
-        signature_verified,
+        // Reaching here means the DSSE signature verified AND the cert chained
+        // to Fulcio AND the identity bound to the repo.
+        signature_verified: Some(true),
     })
+}
+
+/// True when a Fulcio leaf's SAN URI belongs to `owner/repo`. GitHub Actions
+/// OIDC identities look like
+/// `https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref>`, so the
+/// repo is the first two path segments. A non-`github.com` URI never matches.
+fn san_uri_matches_repo(subject_uri: &str, owner: &str, repo: &str) -> bool {
+    let Some(rest) = subject_uri.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let mut segs = rest.split('/');
+    match (segs.next(), segs.next()) {
+        (Some(o), Some(r)) => o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo),
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
@@ -556,21 +629,17 @@ mod tests {
         }"#;
         let body = envelope_around(stmt);
         let verdict =
-            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
-        if let AttestationVerdict::Verified {
-            workflow_ref,
-            builder_id,
-            signer_identity: _,
-            signature_verified,
-        } = verdict
-        {
-            assert!(builder_id.starts_with("https://github.com/actions/runner/"));
-            assert_eq!(workflow_ref.as_deref(), Some("refs/tags/v4.2.2"));
-            // No cert material in this synthetic bundle -> NotAttempted -> None.
-            assert!(signature_verified.is_none());
-        } else {
-            panic!("expected Verified, got {verdict:?}");
-        }
+            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000", "a", "b")
+                .unwrap();
+        // This synthetic bundle has a dsseEnvelope but NO verificationMaterial /
+        // certificate, so there is nothing to cryptographically verify. It must
+        // be reported as Unsigned — NOT Verified. Trusting an unsigned
+        // attestation (the pre-fix behavior) let an attacker bind an arbitrary
+        // subject SHA to a trusted builder id with zero proof.
+        assert!(
+            matches!(verdict, AttestationVerdict::Unsigned { .. }),
+            "unsigned bundle must not be Verified, got {verdict:?}"
+        );
     }
 
     #[test]
@@ -583,7 +652,8 @@ mod tests {
         }"#;
         let body = envelope_around(stmt);
         let verdict =
-            verify_attestation_response(&body, "1111111111111111111111111111111111111111").unwrap();
+            verify_attestation_response(&body, "1111111111111111111111111111111111111111", "a", "b")
+                .unwrap();
         assert!(matches!(
             verdict,
             AttestationVerdict::SubjectMismatch { .. }
@@ -600,7 +670,8 @@ mod tests {
         }"#;
         let body = envelope_around(stmt);
         let verdict =
-            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
+            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000", "a", "b")
+                .unwrap();
         assert!(matches!(
             verdict,
             AttestationVerdict::UntrustedBuilder { .. }
@@ -611,7 +682,8 @@ mod tests {
     fn reports_missing_when_envelope_empty() {
         let body = "{\"attestations\": []}";
         let verdict =
-            verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
+            verify_attestation_response(body, "abcdef0000000000000000000000000000000000", "a", "b")
+                .unwrap();
         assert!(matches!(verdict, AttestationVerdict::Missing));
     }
 
@@ -619,7 +691,8 @@ mod tests {
     fn reports_missing_when_no_attestations_key() {
         let body = "{}";
         let verdict =
-            verify_attestation_response(body, "abcdef0000000000000000000000000000000000").unwrap();
+            verify_attestation_response(body, "abcdef0000000000000000000000000000000000", "a", "b")
+                .unwrap();
         assert!(matches!(verdict, AttestationVerdict::Missing));
     }
 
@@ -720,8 +793,13 @@ mod tests {
         // v2.2b layer; it correctly rejects self-signed / non-Fulcio certs
         // even when the DSSE signature is valid.
         let verdict =
-            verify_attestation_response(&bundle_text, "abcdef0000000000000000000000000000000000")
-                .unwrap();
+            verify_attestation_response(
+                &bundle_text,
+                "abcdef0000000000000000000000000000000000",
+                "a",
+                "b",
+            )
+            .unwrap();
         assert!(
             matches!(verdict, AttestationVerdict::ChainInvalid { .. }),
             "expected ChainInvalid for synthetic cert, got {verdict:?}"
@@ -784,7 +862,7 @@ mod tests {
         );
 
         let verdict =
-            verify_attestation_response(&bundle, "abcdef0000000000000000000000000000000000")
+            verify_attestation_response(&bundle, "abcdef0000000000000000000000000000000000", "a", "b")
                 .unwrap();
         assert!(
             matches!(verdict, AttestationVerdict::SignatureInvalid { .. }),
@@ -877,7 +955,8 @@ mod tests {
         }"#;
         let body = envelope_around(stmt);
         let verdict =
-            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000").unwrap();
+            verify_attestation_response(&body, "abcdef0000000000000000000000000000000000", "a", "b")
+                .unwrap();
         assert!(matches!(
             verdict,
             AttestationVerdict::UnknownPredicate { .. }

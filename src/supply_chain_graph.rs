@@ -675,7 +675,9 @@ fn collect_online_signals_with_api<A: crate::github::Api>(
             //              "publisher has no SLSA" and skew the score.
             signals.slsa_verified = match client.get_attestation(&key.owner, &key.repo, &key.sha) {
                 Ok(Some(body)) => {
-                    match crate::github::slsa::verify_attestation_response(&body, &key.sha) {
+                    match crate::github::slsa::verify_attestation_response(
+                        &body, &key.sha, &key.owner, &key.repo,
+                    ) {
                         Ok(crate::github::slsa::AttestationVerdict::Verified { .. }) => Some(true),
                         Ok(_) | Err(_) => Some(false),
                     }
@@ -1161,8 +1163,12 @@ mod tests {
     }
 
     #[test]
-    fn collect_online_signals_marks_slsa_verified_on_good_attestation() {
+    fn collect_online_signals_does_not_mark_unsigned_attestation_verified() {
         use base64::{Engine, engine::general_purpose::STANDARD};
+        // A structurally-valid attestation that binds the subject/builder but
+        // carries NO certificate (no verificationMaterial) is UNSIGNED. It must
+        // NOT count as slsa_verified — otherwise anyone able to publish to the
+        // repo could fabricate a "verified" provenance signal with zero crypto.
         let stmt = r#"{
           "_type": "https://in-toto.io/Statement/v1",
           "subject": [{"name": "git", "digest": {"sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],
@@ -1186,7 +1192,7 @@ mod tests {
         )];
         let signals_map = collect_online_signals_with_api(&refs, &api, 0);
         let signals = signals_map.values().next().unwrap();
-        assert_eq!(signals.slsa_verified, Some(true));
+        assert_eq!(signals.slsa_verified, Some(false));
     }
 
     #[test]

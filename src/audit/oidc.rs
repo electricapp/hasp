@@ -198,18 +198,27 @@ fn check_missing_audience(
     is_warning: bool,
 ) {
     for acc in acceptances {
-        if acc.audiences.is_empty() {
+        // A wildcard `aud` (e.g. `StringLike` with `"*"` or `"sts.*"`) is
+        // functionally identical to having no `aud` pin at all — anyone can
+        // mint a token whose audience matches — so treat it the same as absent.
+        let wildcard_aud = acc.audiences.iter().any(|a| a.contains('*'));
+        if acc.audiences.is_empty() || wildcard_aud {
             findings.push(AuditFinding {
                 file: acc.file.clone(),
                 severity: Severity::Medium,
                 title: format!("OIDC trust policy ({}) accepts any audience", acc.provider),
                 detail: format!(
-                    "The trust policy at {} ({}) does not constrain the `aud` \
-                     claim of GitHub OIDC tokens. Any GitHub Actions workflow that \
-                     declares `id-token: write` can mint a matching token. Pin \
-                     `aud` to a provider-specific audience string.",
+                    "The trust policy at {} ({}) does not meaningfully constrain the \
+                     `aud` claim of GitHub OIDC tokens ({}). Any GitHub Actions workflow \
+                     that declares `id-token: write` can mint a matching token. Pin \
+                     `aud` to an exact provider-specific audience string.",
                     acc.file.display(),
                     acc.location,
+                    if wildcard_aud {
+                        "the pinned value is a wildcard"
+                    } else {
+                        "no `aud` pin"
+                    },
                 ),
                 is_warning,
             });

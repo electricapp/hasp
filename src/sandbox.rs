@@ -46,6 +46,37 @@ pub(crate) fn platform_preflight(allow_unsandboxed: bool, emit_warning: bool) ->
     Ok(())
 }
 
+/// Make the current process non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`).
+///
+/// A same-uid child can otherwise read `/proc/<pid>/{environ,mem,maps}` of a
+/// parent or sibling. The `hasp exec` orchestrator captures each secret from
+/// its own environment (`SecureToken::from_env`), and `env::remove_var` does
+/// NOT scrub `/proc/self/environ` — the kernel keeps serving the original
+/// stack block — so without this a sandboxed step could recover the plaintext
+/// secret straight out of `/proc/<ppid>/environ`, defeating the proxy-mediated
+/// isolation entirely. dumpable=0 reparents those proc files to root and denies
+/// same-uid access (`PTRACE_MODE_READ_FSCREDS` fails). Applied to the
+/// orchestrator and to every secret-holding forward proxy before any child is
+/// spawned. On non-Linux this is a no-op (the exec path refuses to run
+/// unsandboxed there anyway).
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+pub(crate) fn harden_process_dumpable() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: prctl(PR_SET_DUMPABLE, 0) sets a boolean process attribute;
+        // it takes no pointer arguments and cannot corrupt memory.
+        #[allow(unsafe_code)]
+        let ret = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        if ret != 0 {
+            bail!(
+                "prctl(PR_SET_DUMPABLE, 0) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Human-facing summary of OS sandbox availability, for `hasp doctor`.
 pub(crate) struct SandboxReport {
     /// Whether the OS sandbox can be enforced on this platform/kernel.
@@ -331,9 +362,15 @@ fn apply_landlock_exec_child(
     Ok(())
 }
 
-/// Seccomp for exec child: deny `ptrace`/`process_vm`, keyring access,
-/// and namespace creation. Allows execve (the child IS an arbitrary
-/// command) and network (BPF cgroup handles network policy).
+/// Seccomp for exec child: deny `ptrace`/`process_vm` and keyring access.
+/// Allows execve (the child IS an arbitrary command) and network (BPF cgroup
+/// handles network policy).
+///
+/// Note: this does NOT deny namespace syscalls (`unshare`/`clone`/`setns`).
+/// A user namespace can't relax the sandbox — `NO_NEW_PRIVS` is set and the
+/// Landlock, seccomp, and cgroup-egress restrictions are all inherited across
+/// `unshare`/`clone` and can't be dropped — and blocking them outright would
+/// break legitimate rootless-container build steps.
 #[cfg(target_os = "linux")]
 fn apply_seccomp_exec_child() -> Result<()> {
     let denied: Vec<u32> = [

@@ -1,6 +1,6 @@
 use crate::error::{Context, Result, bail};
 use std::path::Path;
-use yaml_rust2::{Yaml, YamlLoader};
+use yaml_rust2::Yaml;
 
 const MAX_MANIFEST_SIZE: u64 = 256 * 1024; // 256 KiB
 
@@ -43,7 +43,11 @@ impl StepManifest {
     }
 
     pub(crate) fn parse_text(text: &str) -> Result<Self> {
-        let docs = YamlLoader::load_from_str(text).context("Invalid YAML in manifest")?;
+        // Route through the alias-bomb guard, not YamlLoader directly: a tiny
+        // "billion laughs" manifest expands exponentially at parse time
+        // regardless of the byte-size cap, so an operator-supplied manifest
+        // could otherwise OOM/hang the process.
+        let docs = crate::scanner::load_yaml_guarded(text).context("Invalid YAML in manifest")?;
         if docs.is_empty() {
             return Ok(Self::empty());
         }
