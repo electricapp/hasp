@@ -111,7 +111,7 @@ mimalloc = { version = "0.1", features = ["secure"] }
 ring = "0.17"                  # ECDSA P-256 for DSSE attestation signature verification
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0"
-yaml-rust2 = "0.11"
+yaml-rust2 = "0.12"
 # TODO: bump to ureq 3 — feature renamed (`tls` → `rustls`) and API overhauled
 # (`AgentBuilder`, `Resolver` trait, `Error::Status` removed). Also drops support
 # for custom `ServerCertVerifier`, so the SPKI-pinning logic in
